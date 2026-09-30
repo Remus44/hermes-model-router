@@ -4875,6 +4875,42 @@ def _opus5_response(result: Dict[str, Any]) -> Any:
     )
 
 
+def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]) -> Any:
+    """Attach final ordinary-provider evidence without treating the wire route as served-model proof."""
+    def field(name: str) -> Any:
+        return result.get(name) if isinstance(result, dict) else getattr(result, name, None)
+
+    model = str(field("model") or "").strip()
+    provider = str(field("provider") or "").strip()
+    executed = {
+        "model": model or "unknown",
+        "model_source": "ordinary_provider.response.model" if model else "not_observed",
+        "provider": provider or "unknown",
+        "provider_source": "ordinary_provider.response.provider" if provider else "not_observed",
+        "status": "observed" if model or provider else "unknown",
+    }
+    provenance = {"policy": replacement["policy"], "requested_review": replacement["requested_review"],
+                  "failure_kind": replacement["failure_kind"], "planned": replacement["planned"],
+                  "executed": executed}
+    route_reason = (
+        "Claude CLI review did not complete; actual replacement executed on "
+        f"{executed['model']} via {executed['provider']} "
+        f"(model evidence: {executed['model_source']}; provider evidence: {executed['provider_source']})."
+    )
+    if isinstance(result, dict):
+        result["replacement_provenance"] = provenance
+        result["route_reason"] = route_reason
+    else:
+        try:
+            setattr(result, "replacement_provenance", provenance)
+            setattr(result, "route_reason", route_reason)
+        except Exception:
+            # Host response objects are normally mutable; an immutable legacy
+            # value cannot carry a fabricated observation, so leave it unknown.
+            pass
+    return result
+
+
 def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> Optional[Any]:
     """Execute the first safe, non-design coding call through Claude Code OAuth."""
     coding_cfg = cfg.get("coding_agent") or {}
@@ -4894,6 +4930,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
     from .claude_opus_bridge import review_model_alias
     requested_alias = review_model_alias(routing_text) or "opus"
     adjustment = ""
+    admission_refusal = ""
 
     def ordinary_replacement(error: BaseException) -> Dict[str, Any]:
         message = str(error).casefold()
@@ -4905,12 +4942,18 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         model = str(request.get("model") or "")
         tier = next((name for name, candidate in (cfg.get("models") or {}).items()
                      if str(candidate) == model), "ordinary")
-        return {
-            "policy": "legacy_ordinary_provider_route",
+        planned = {
             "tier": tier,
             "model": model or "unknown",
             "provider": str(kwargs.get("provider") or cfg.get("provider") or "unknown"),
-            "reason": "attempted Claude CLI review failed; ordinary provider route is the configured legacy replacement",
+            "source": "ordinary_provider.request_configuration",
+        }
+        return {
+            "policy": "legacy_ordinary_provider_route",
+            "requested_review": {"tier": requested_alias, "transport": "claude_cli"},
+            "tier": planned["tier"], "model": planned["model"], "provider": planned["provider"],
+            "planned": planned,
+            "reason": "attempted Claude CLI review failed; an ordinary provider replacement is planned, not observed",
             "failure_kind": failure_kind,
         }
 
@@ -4920,25 +4963,28 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                          or turn_id.split(":", 1)[0])
         claude_delegation._log(cfg, {
             "event": "bridge_claude", "tier_requested": requested_alias,
-            "tier_used": requested_alias, "outcome": "refused", "message": message,
+            "tier_used": "none", "outcome": "refused", "message": message,
             "session_id": session_id, "turn_id": turn_id,
         })
 
     def admitted_alias() -> Optional[str]:
         """Check Claude only after a real bridge route has been established."""
-        nonlocal adjustment
+        nonlocal adjustment, admission_refusal
         target = {"opus": "opus5", "sonnet": "sonnet5"}[requested_alias]
         if not _is_callable_tier(target, cfg):
-            audit_refusal(f"Claude CLI tier {requested_alias} is disabled or cooling.")
+            admission_refusal = f"Claude CLI tier {requested_alias} is disabled or cooling."
+            audit_refusal(admission_refusal)
             return None
         if not usage_guard.guarded("anthropic", cfg):
             return requested_alias
         outcome = usage_guard.apply("anthropic", target, cfg, usage_guard.read("anthropic", cfg))
         if outcome.refused:
-            audit_refusal(outcome.refused)
+            admission_refusal = outcome.refused
+            audit_refusal(admission_refusal)
             return None
         if not _is_callable_tier(outcome.tier, cfg):
-            audit_refusal(f"Claude CLI substitution {outcome.tier} is disabled or cooling.")
+            admission_refusal = f"Claude CLI substitution {outcome.tier} is disabled or cooling."
+            audit_refusal(admission_refusal)
             return None
         adjustment = outcome.adjusted
         return {"opus5": "opus", "sonnet5": "sonnet"}.get(outcome.tier)
@@ -4986,17 +5032,30 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                 requested_model=requested_model, cfg=cfg,
             )
             if resolution.status != target_identity.RESOLVED:
-                audit_refusal("Claude CLI review route is unsupported: " + "; ".join(resolution.reasons))
-                return None
+                refusal = "Claude CLI review route is unsupported: " + "; ".join(resolution.reasons)
+                audit_refusal(refusal)
+                from .claude_opus_bridge import ClaudeBridgeFailure
+                raise ClaudeBridgeFailure(refusal, "capability", identity=resolution.identity, refused=True)
             identity = resolution.identity
             alias = admitted_alias()
             if alias is None:
+                if identity.selection_mode == "exact":
+                    refusal = admission_refusal or "exact Claude CLI review admission was refused"
+                    from .claude_opus_bridge import ClaudeBridgeFailure
+                    raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
                 return None
             if identity.selection_mode == "exact" and alias != requested_alias:
-                audit_refusal("exact Claude CLI review cannot substitute the requested tier")
-                return None
+                refusal = "exact Claude CLI review cannot substitute the requested tier"
+                audit_refusal(refusal)
+                from .claude_opus_bridge import ClaudeBridgeFailure
+                raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
             allowed = (coding_cfg.get("delegated_review") or {}).get("models")
             if isinstance(allowed, list) and alias not in allowed:
+                if identity.selection_mode == "exact":
+                    refusal = f"exact Claude CLI review tier {alias} is not enabled by delegated_review.models"
+                    audit_refusal(refusal)
+                    from .claude_opus_bridge import ClaudeBridgeFailure
+                    raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
                 return None
             return bridge_response(
                 review=True,
@@ -5145,23 +5204,27 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             raise
 
     opus_context = {key: value for key, value in kwargs.items() if key not in {"request", "next_call", "retry_call"}}
+    replacement_provenance = None
     try:
         opus_response = _maybe_run_opus5(request, cfg, **opus_context)
     except Exception as error:
+        if getattr(error, "refused", False):
+            raise
         # Failures before an attempt are not attributed to the CLI; attempted
         # reviews write a separate audit with the concrete reason.
         _logger.warning("Claude bridge did not complete; falling back to the normal route", exc_info=True)
         opus_response = None
         review_failure = getattr(error, "_bridge_review_failure", None)
         if review_failure:
-            replacement = review_failure["replacement"]
+            replacement_provenance = review_failure["replacement"]
             request = deepcopy(request)
             _append_user_instruction(
                 request,
                 "Claude CLI review did not complete "
                 f"({review_failure['failure_kind']}: {review_failure['message']}). "
-                f"This response is the explicit legacy substitution on {replacement['tier']} "
-                f"({replacement['model']}); it is not the requested Claude review.",
+                f"This response is an explicit legacy substitution attempt planned for {replacement_provenance['tier']} "
+                f"({replacement_provenance['model']}); it is not the requested Claude review. "
+                "Its actual provider/model, if observed in the response, is recorded as replacement provenance.",
             )
     if opus_response is not None:
         return opus_response
@@ -5171,7 +5234,9 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
         return stopped
 
     try:
-        return next_call(request)
+        ordinary_response = next_call(request)
+        return (_record_ordinary_replacement_result(ordinary_response, replacement_provenance)
+                if replacement_provenance else ordinary_response)
     except Exception as error:
         active_model = str(request.get("model", ""))
         quota_exhausted = _is_quota_exhaustion(error)
@@ -5236,7 +5301,9 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             {**kwargs, "request": fallback_request},
             cfg,
         )
-        return retry_call(fallback_request)
+        retry_response = retry_call(fallback_request)
+        return (_record_ordinary_replacement_result(retry_response, replacement_provenance)
+                if replacement_provenance else retry_response)
 
 
 def on_post_llm_call(**kwargs: Any) -> None:

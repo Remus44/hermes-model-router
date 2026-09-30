@@ -242,6 +242,64 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
 
     @patch("claude_opus_bridge._log_decision")
     @patch("claude_opus_bridge.subprocess.run")
+    def test_preferred_step_down_validates_the_admitted_tier_and_keeps_requested_identity(self, run, log):
+        from model_router.target_identity import resolve_target
+
+        cfg = {"models": {"opus5": "claude-opus-5-5", "sonnet5": "claude-sonnet-5-5"}}
+        identity = resolve_target("opus", transport="claude_cli", cfg=cfg).identity
+        run.return_value.returncode = 0
+        run.return_value.stderr = ""
+        run.return_value.stdout = json.dumps({"modelUsage": {"claude-sonnet-5-5": {}}, "result": "ok"})
+        with tempfile.TemporaryDirectory() as directory:
+            result = dispatch("[opus-review] Review parser", Path(directory), review=True,
+                              model="sonnet", requested_alias="opus", identity=identity)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], "sonnet")
+        self.assertEqual(result["effective_model"], "claude-sonnet-5-5")
+        self.assertEqual(result["identity"]["requested"]["value"], "claude-opus-5-5")
+        self.assertEqual(result["substitution"]["observed"], "claude-sonnet-5-5")
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
+    def test_conflicting_top_level_model_cannot_override_model_usage_evidence(self, run, log):
+        run.return_value.returncode = 0
+        run.return_value.stderr = ""
+        run.return_value.stdout = json.dumps({
+            "model": CANONICAL_OPUS_MODEL,
+            "modelUsage": {"claude-sonnet-5-5": {}},
+            "result": "wrong tier",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ClaudeBridgeFailure) as raised:
+                dispatch("[opus-review] Review parser", Path(directory), review=True)
+        self.assertEqual(raised.exception.failure_kind, "model-mismatch")
+        log.assert_not_called()
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
+    def test_exact_canonical_review_requests_and_accepts_the_canonical_model(self, run, log):
+        from model_router.target_identity import resolve_target
+        from model_router import runtime_capabilities as runtime
+
+        caps = (runtime.Capability("exact_model", "supported", reason="fixture capability evidence"),)
+        snapshot = runtime.RuntimeSnapshot(
+            1, "fixture", runtime.Fact("unknown"), runtime.Fact("unknown"),
+            runtime.Fact("unknown"), (), (runtime.AdapterCapabilities("claude_cli", caps),), (),
+        )
+        cfg = {"models": {"opus5": CANONICAL_OPUS_MODEL}}
+        identity = resolve_target("opus", transport="claude_cli", selection_mode="exact",
+                                  requested_model=CANONICAL_OPUS_MODEL, cfg=cfg, snapshot=snapshot).identity
+        run.return_value.returncode = 0
+        run.return_value.stderr = ""
+        run.return_value.stdout = json.dumps({"modelUsage": {CANONICAL_OPUS_MODEL: {}}, "result": "ok"})
+        with tempfile.TemporaryDirectory() as directory:
+            result = dispatch("[opus-review] Review parser", Path(directory), review=True, identity=identity)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], CANONICAL_OPUS_MODEL)
+        self.assertEqual(result["effective_model"], CANONICAL_OPUS_MODEL)
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
     def test_the_review_label_selects_the_claude_tier(self, run, log):
         """Two tiers exist so routine review can spend the cheaper one; a single
         tier would burn the separate quota that is the reason to reach Claude."""

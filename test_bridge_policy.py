@@ -37,6 +37,23 @@ class BridgePolicyTests(unittest.TestCase):
         self.assertIn("opus5→sonnet5", bridge.call_args.kwargs["adjustment"])
         self.run_bridge("opus", {"sonnet5": False, "opus5": True}, weekly=75).assert_not_called()
 
+    def test_append_user_instruction_preserves_supported_wire_shapes(self):
+        cases = (
+            ({"messages": [{"role": "user", "content": "review"}]}, "messages", "text"),
+            ({"input": [{"role": "user", "content": [{"type": "input_text", "text": "review"}]}]},
+             "input", "input_text"),
+            ({"messages": [{"role": "user", "content": [{"type": "text", "text": "review"}]}]},
+             "messages", "text"),
+        )
+        for request, key, expected_type in cases:
+            with self.subTest(key=key, expected_type=expected_type):
+                router._append_user_instruction(request, " replacement provenance")
+                content = request[key][-1]["content"]
+                if isinstance(content, str):
+                    self.assertEqual(content, "review replacement provenance")
+                else:
+                    self.assertEqual(content[-1], {"type": expected_type, "text": " replacement provenance"})
+
 
 class DelegatedReviewRepositoryTests(unittest.TestCase):
     def setUp(self):
@@ -458,7 +475,9 @@ class AccountOfExecutionTests(unittest.TestCase):
             codex.assert_not_called()
             self.assertEqual(bridge.call_count, 0 if claude == 95 else 1)
 
-    def test_exact_cli_route_without_capability_evidence_is_refused_before_bridge_attempt(self):
+    def test_exact_cli_route_without_capability_evidence_refuses_without_ordinary_provider_fallback(self):
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
         cfg = {
             'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
             'callable': {'opus5': True, 'sonnet5': True},
@@ -474,13 +493,85 @@ class AccountOfExecutionTests(unittest.TestCase):
              patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
              patch('model_router._run_opus5_bridge') as bridge, \
              patch('model_router.claude_delegation._log') as audit:
-            result = router.run_llm_with_transient_failover(
-                request=request, original_request=request, next_call=downstream,
-                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
-        self.assertEqual(result, 'Codex ran')
+            with self.assertRaises(ClaudeBridgeFailure) as raised:
+                router.run_llm_with_transient_failover(
+                    request=request, original_request=request, next_call=downstream,
+                    provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
         bridge.assert_not_called()
+        downstream.assert_not_called()
+        self.assertEqual(raised.exception.failure_kind, 'capability')
+        self.assertTrue(raised.exception.refused)
+        self.assertIn('exact canonical CLI selection needs exact_model evidence', raised.exception.route_reason)
         self.assertEqual(audit.call_args.args[1]['outcome'], 'refused')
+        self.assertEqual(audit.call_args.args[1]['tier_used'], 'none')
         self.assertIn('exact canonical CLI selection needs exact_model evidence', audit.call_args.args[1]['message'])
+
+    def test_exact_cli_route_refuses_a_usage_step_down_without_ordinary_provider_fallback(self):
+        from types import SimpleNamespace
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        from model_router.target_identity import RESOLVED
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        identity = TargetIdentity(
+            provider='anthropic', account='unknown', transport='claude_cli', alias='opus', selection_mode='exact',
+            requested=ModelFact('claude-opus-5-5', 'fixture'),
+        )
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'opus5': True, 'sonnet5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {
+                'enabled': True, 'selection_mode': 'exact', 'requested_model': 'claude-opus-5-5',
+            }},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[opus-review] Review parser'}]}
+        downstream = Mock(return_value='Codex ran')
+        with patch('model_router._load_config', return_value=cfg), \
+             patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'opus')), \
+             patch('model_router.target_identity.resolve_target', return_value=SimpleNamespace(
+                 status=RESOLVED, identity=identity, reasons=())), \
+             patch('model_router.usage_guard.guarded', return_value=True), \
+             patch('model_router.usage_guard.apply', return_value=SimpleNamespace(
+                 refused='', tier='sonnet5', adjusted='opus5→sonnet5')):
+            with self.assertRaises(ClaudeBridgeFailure) as raised:
+                router.run_llm_with_transient_failover(
+                    request=request, original_request=request, next_call=downstream,
+                    provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        self.assertTrue(raised.exception.refused)
+        self.assertIn('cannot substitute', raised.exception.route_reason)
+        downstream.assert_not_called()
+
+    def test_failed_review_records_actual_replacement_result_after_transient_failover(self):
+        from types import SimpleNamespace
+        from claude_opus_bridge import ClaudeBridgeFailure
+
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex',
+            'models': {'terra': 'gpt-terra', 'spark': 'gpt-spark'},
+            'callable': {'opus5': True, 'sonnet5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[sonnet-review] Review parser'}]}
+        response = SimpleNamespace(model='gpt-spark', provider='openai-codex')
+        downstream = Mock(side_effect=RuntimeError('temporary provider failure'))
+        retry = Mock(return_value=response)
+        failure = ClaudeBridgeFailure('Claude Code reached max turns', 'max-turn')
+        with patch('model_router._load_config', return_value=cfg), \
+             patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
+             patch('model_router._run_opus5_bridge', side_effect=failure), \
+             patch('model_router._is_transient_provider_failure', return_value=True), \
+             patch('model_router._transient_fallback_model', return_value='gpt-spark'):
+            result = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=downstream, retry_call=retry,
+                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        self.assertIs(result, response)
+        self.assertEqual(result.replacement_provenance['planned']['model'], 'gpt-terra')
+        self.assertEqual(result.replacement_provenance['executed']['model'], 'gpt-spark')
+        self.assertEqual(result.replacement_provenance['executed']['model_source'], 'ordinary_provider.response.model')
+        self.assertEqual(result.replacement_provenance['executed']['provider'], 'openai-codex')
+        self.assertIn('actual replacement executed on gpt-spark', result.route_reason)
+        retry.assert_called_once()
 
     def test_failed_review_bridge_keeps_one_route_call_and_records_visible_failure_audit(self):
         with patch('model_router._log_decision') as route_log, \
@@ -503,6 +594,22 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(event['turn_id'], 's:sa-1')
         self.assertIn('Claude Code reached max turns', event['message'])
         self.assertIn('CLI review did not complete', codex.call_args.args[0]['messages'][-1]['content'])
+
+    def test_typed_bridge_failure_preserves_identity_and_failure_class_in_audit(self):
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        identity = {"requested": "claude-sonnet-5-5", "observed": "claude-opus-5-5"}
+        failure = ClaudeBridgeFailure("served a different model", "model-mismatch", identity=identity)
+        with patch('model_router.claude_delegation._log') as audit:
+            result, codex, bridge, _ = self._route(codex=10, claude=10, bridge_error=failure)
+        self.assertEqual(result, 'Codex ran')
+        bridge.assert_called_once()
+        codex.assert_called_once()
+        event = audit.call_args.args[1]
+        self.assertEqual(event['failure_kind'], 'model-mismatch')
+        self.assertEqual(event['failure_class'], 'exact-route-mismatch')
+        self.assertEqual(event['tier_used'], 'sonnet')
+        self.assertEqual(event['substitution']['planned']['model'], 'gpt-terra')
 
     def test_pre_bridge_review_exception_is_not_audited_as_a_claude_failure(self):
         with patch('model_router.claude_delegation._log') as audit:

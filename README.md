@@ -298,7 +298,11 @@ An `exact` review requires recorded `exact_model` capability evidence and is
 refused before the CLI starts when that evidence is absent. The default
 `profile_preferred` review may use the configured ordinary provider route after
 an attempted CLI failure, but its child prompt and Claude audit record the typed
-failure and replacement tier/model; that response is not a Claude review.
+failure and planned replacement tier/model; the returned child response records
+the final replacement provider/model only when that response supplies observed
+evidence (otherwise those fields are explicitly `unknown`). An exact route that
+cannot be admitted propagates a typed refusal instead of silently continuing on
+the ordinary provider. Neither response counts as a Claude review.
 
 ### A parent on a fallback account still orchestrates
 

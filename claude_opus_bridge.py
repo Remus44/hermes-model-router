@@ -64,14 +64,18 @@ class ClaudeBridgeFailure(RuntimeError):
     """A terminal CLI outcome with typed failure evidence for the caller."""
 
     def __init__(self, message: str, failure_kind: str, *, identity: Any = None,
-                 mismatch: Any = None) -> None:
+                 mismatch: Any = None, refused: bool = False) -> None:
         super().__init__(message)
         self.failure_kind = failure_kind
-        self.failure_class = "exact-route-mismatch" if failure_kind == "model-mismatch" else (
+        self.failure_class = (
+            "exact-route-mismatch" if failure_kind == "model-mismatch" else
+            "capability" if failure_kind == "capability" else
             "timeout" if failure_kind == "timeout" else "execution-error"
         )
         self.identity = identity
         self.mismatch = mismatch
+        self.refused = refused
+        self.route_reason = message
 
 
 CODING_SIGNAL = re.compile(
@@ -123,10 +127,7 @@ def classify_review_dispatch(task: str) -> tuple[bool, str]:
 
 
 def _effective_model(payload: dict[str, Any], expected: str = CANONICAL_OPUS_MODEL) -> str:
-    """Return Claude Code's actual served model, never the requested alias."""
-    reported = payload.get("model")
-    if isinstance(reported, str) and reported.strip():
-        return reported.strip()
+    """Return Claude Code's served model from per-model usage evidence only."""
     usage = payload.get("modelUsage") or {}
     if isinstance(usage, dict):
         # Claude Code can report small internal/helper usage alongside the main
@@ -208,7 +209,12 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     if requested_alias not in CLAUDE_REVIEW_MODELS:
         raise ValueError(f"unknown requested Claude tier {requested_alias!r}")
     expected_model = CLAUDE_REVIEW_MODELS[alias]
-    if identity is not None and getattr(getattr(identity, "requested", None), "known", False):
+    # A preferred admission may step Opus down to Sonnet. Validate the model the
+    # admitted tier was asked to serve, while ``identity`` still records the
+    # original requested tier for substitution provenance. Exact mode is the one
+    # that must enforce its canonical requested identity on the wire.
+    if (getattr(identity, "selection_mode", "") == "exact"
+            and getattr(getattr(identity, "requested", None), "known", False)):
         expected_model = str(identity.requested.value)
     model_argument = expected_model if getattr(identity, "selection_mode", "") == "exact" else alias
     if not repo.is_dir():
@@ -298,7 +304,10 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     })
     observed_identity, mismatch, substitution = identity, None, None
     if identity is not None:
-        from .target_identity import verify_observed
+        if __package__:
+            from .target_identity import verify_observed
+        else:
+            from model_router.target_identity import verify_observed
         observed_identity, mismatch, substitution = verify_observed(
             identity, effective_model, "claude_cli.result.modelUsage",
         )

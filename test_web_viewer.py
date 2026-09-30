@@ -2227,7 +2227,7 @@ class DelegationChipTests(DashboardProbeMixin, unittest.TestCase):
         out = self._run(self.ACCOUNTS_STATE,
                         'const box=delegationChips({scope:{nodes:[]}},' + json.dumps(audits)
                         + ');console.log(JSON.stringify(box.children.map(c=>({text:c.textContent,title:c.title}))));')
-        self.assertEqual(json.loads(out), [{'text':'Claude: sonnet ✕',
+        self.assertEqual(json.loads(out), [{'text':'Claude: none ✕',
                                             'title': audits[0]['message']}])
 
     def test_router_jsonl_and_bridge_lifecycle_render_both_step_downs(self):
