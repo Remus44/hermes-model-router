@@ -1279,7 +1279,35 @@ partial batches, capability refusal, observed-identity mismatch, unknown livenes
 and cancellation. They freeze the future adapter seam (`capabilities`,
 `can_execute`, `submit`, `result`, `cancel`) for S05 without wrapping production
 transports. TaskGraph construction (S08), event persistence/reconciliation (S06),
-production adapters (S05), scheduling and verification remain deferred.
+scheduling and verification remain deferred.
+
+### Transport adapters
+
+`execution_adapters.py` now translates the frozen request records onto the three
+existing transport seams: Hermes/Codex uses the host's batch-only `delegate_task`
+route with its existing goal-prefix selector; Hermes/Claude calls the existing
+`delegate_claude` handler one tier at a time; and Claude CLI calls the existing
+bridge. The adapters do not construct agents, invoke a provider or CLI directly,
+or mutate delegation/configuration state. Legacy entrypoints are passed into the
+adapter factory as raw callables, so an adapter does not intercept itself or apply
+admission twice.
+
+An exact request is accepted only when the transport both enforces the requested
+selection and supplies served-identity evidence. On the current batch-only Codex
+host, exact model/provider/effort selection is therefore typed `unsupported`;
+configured child metadata is not promoted to observed evidence. Claude's Haiku
+route accurately records effort as `not_applicable`; non-Haiku effort remains
+unknown unless its scoped legacy seam reports application. Claude CLI derives its
+observed model only from the bridge result and returns an `exact-route-mismatch`
+result when that evidence differs.
+
+Each submit performs fresh shared admission. Hermes child submissions also claim a
+locked, process-local host-slot reservation before dispatch, releasing it when the
+transport refuses before a handle; S06 owns completion reconciliation and release.
+The adapters preserve goal context, workspace/request records and existing tool
+boundaries, but they intentionally return `unknown` pending results for Hermes
+handles until lifecycle correlation lands. They do not add a scheduler, persistence,
+active-mode switch or live capability probe.
 
 ## Usage
 
