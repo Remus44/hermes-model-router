@@ -100,8 +100,8 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         self.assertEqual(adapter.capability("model_parameter").status, "unsupported")
         self.assertEqual(adapter.capability("cancellation").status, "supported")
         self.assertIn("cooperative", adapter.capability("cancellation").reason)
-        self.assertEqual(adapter.capability("async_delivery").status, "supported")
-        self.assertIn("on_subagent_stop", adapter.capability("async_delivery").reason)
+        self.assertEqual(adapter.capability("async_delivery").status, "unknown")
+        self.assertIn("S06", adapter.capability("async_delivery").reason)
         self.assertEqual(adapter.capability("workspace_isolation").status, "unknown")
 
     def test_matrix_unknown_identity_effort_permissions_and_cli(self):
@@ -168,15 +168,17 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             self.assertEqual(self.snapshot().adapter("hermes_codex").capability("cancellation").status, "unknown")
 
     def test_codex_async_delivery_needs_getter_and_stop_hook_both_present_and_missing(self):
-        self.assertEqual(self.snapshot().adapter("hermes_codex").capability("async_delivery").status, "supported")
+        cap = self.snapshot().adapter("hermes_codex").capability("async_delivery")
+        self.assertEqual(cap.status, "unknown")
+        self.assertIn("S06", cap.reason)
         import tools.delegate_tool_config as host_cfg
         with patch.object(host_cfg, "_get_max_async_children", False):
             cap = self.snapshot().adapter("hermes_codex").capability("async_delivery")
-            self.assertEqual(cap.status, "unknown")
+            self.assertEqual(cap.status, "unsupported")
             self.assertIn("async child limit", cap.reason)
         with patch.object(router, "on_subagent_stop", None):
             cap = self.snapshot().adapter("hermes_codex").capability("async_delivery")
-            self.assertEqual(cap.status, "unknown")
+            self.assertEqual(cap.status, "unsupported")
             self.assertIn("on_subagent_stop", cap.reason)
 
     def _matrix(self, request=None, *, parallel=False):
@@ -223,7 +225,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             self.assertEqual(table["mixed_target_batch/claude_cli"], "unsupported")
             self.assertEqual(table["native_fallback/hermes_codex"], "unknown")
             self.assertEqual(table["native_fallback/hermes_claude"], "unknown")
-            self.assertEqual(table["background_completion/hermes_codex"], "supported")
+            self.assertEqual(table["background_completion/hermes_codex"], "unknown")
             self.assertEqual(table["background_completion/hermes_claude"], "unknown")
             self.assertEqual(table["failure_cancel_timeout/hermes_codex"], "supported")
             self.assertEqual(table["failure_cancel_timeout/hermes_claude"], "unknown")
@@ -236,7 +238,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         self.assertEqual(table[("submission", "hermes_codex")], "unsupported")
         self.assertEqual(table[("native_fallback", "hermes_codex")], "unsupported")
         self.assertEqual(table[("failure_cancel_timeout", "hermes_codex")], "unknown")
-        self.assertEqual(table[("background_completion", "hermes_codex")], "unknown")
+        self.assertEqual(table[("background_completion", "hermes_codex")], "unsupported")
         with host_delegation(depth=2), patch.object(claude_delegation, "is_active", return_value=True):
             request = delegate_task_request()
             request["tools"].extend({"name": n, "parameters": {}} for n in DEFERRED_CLAUDE_TOOLS if n != "delegate_task")

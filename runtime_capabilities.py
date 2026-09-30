@@ -250,12 +250,12 @@ def _build_adapters(g: Dict[str, Any]) -> Tuple[AdapterCapabilities, ...]:
     cancellation = (SUPPORTED, "cooperative interrupt via host interrupt_subagent; no forced kill") \
         if g["interrupt"] else (UNKNOWN, "host exposes no interrupt_subagent seam")
     if g["async_getter"] and g["stop_hook"]:
-        async_delivery = (SUPPORTED, "host background-child limit seam and router on_subagent_stop hook "
-                                     "are both callable; completion delivery itself is not observed")
+        async_delivery = (UNKNOWN, "async child limit seam and router on_subagent_stop hook exist, but they "
+                                   "do not prove completion delivery; observation is owned by S06")
     elif not g["stop_hook"]:
-        async_delivery = (UNKNOWN, "router on_subagent_stop lifecycle hook is not callable")
+        async_delivery = (UNSUPPORTED, "router on_subagent_stop lifecycle hook is not callable")
     else:
-        async_delivery = (UNKNOWN, "host exposes no async child limit seam")
+        async_delivery = (UNSUPPORTED, "host exposes no async child limit seam")
     claude_seam_reason = "delegate_claude is not shown to use the host interrupt/async seams (S05)"
     common_unknown = {
         "exact_model": "exact wire identity needs per-call observation, not a schema",
