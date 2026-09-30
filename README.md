@@ -1312,26 +1312,32 @@ synchronous fallback) are terminal execution evidence even without a top-level
 handle; they do not prove acceptance criteria or served native model identity.
 Claude tier-adjustment evidence is retained as resolved selection, not served model
 proof. CLI observed model evidence comes only from its validated bridge result.
-Malformed/partial responses, background acceptance and post-dispatch errors remain
-`unknown` and keep their reservations; a top-level error is not assumed to prove
-that no worker started.
+Malformed/partial responses, background acceptance and ambiguous exceptions remain
+`unknown` in the receipt; a top-level `{"error": ...}` payload and a typed
+`ClaudeBridgeFailure` are recorded as `failed` (`timed_out` for a CLI timeout).
+None of them keeps capacity after the call returns: the host exposes no completion
+signal correlated to an accepted background handle, so the legacy boundary never
+refuses a dispatch the unchanged host would accept.
 
 One locked reservation owner is shared by the native transports per active parent,
-with batch child counts charged against the host capacity seam. Missing capacity
-support refuses before launch. Full attempt keys prevent reuse across workflows;
-where the host supplies session/turn/tool-call IDs, the public boundary deduplicates
-that invocation and rejects changed payloads under the same IDs. A legacy call with
-no stable invocation IDs receives observation-only IDs: a later new call is not
-invented to be the same attempt. In-flight duplicates do not dispatch again, and
-terminal duplicate receipts do not re-run completed work. CLI runs use a conservative
-single process-local slot for the shared local credentials.
+with batch child counts charged against the host capacity seam only while a call is
+in flight (a batch wider than the host limit reaches the host's own refusal).
+Missing capacity support refuses before launch. Full attempt keys prevent reuse
+across workflows; where the host supplies session/turn/tool-call IDs, the public
+boundary deduplicates that invocation and rejects changed payloads under the same
+IDs. A legacy call with no stable invocation IDs receives observation-only IDs: a
+later new call is not invented to be the same attempt. In-flight duplicates do not
+dispatch again, and retained terminal duplicates replay instead of re-running. CLI
+runs keep their pre-S05 concurrency (no plugin cap).
 
-S06 owns persistence, background completion correlation, unknown-work reconciliation
-and eventual reservation release. Unknown work never expires automatically. The
-receipt journal is bounded to 4096 attempts and cached responses to 8192 characters;
-exhaustion or an uncached duplicate refuses new dispatch rather than forgetting an
-attempt. Until S06, background/ambiguous work can conservatively block capacity and
-receipts do not survive restart. Do not automatically replay unknown work after a
+S06 owns persistence, background completion correlation and unknown-work
+reconciliation. The receipt journal keeps in-flight records unconditionally and
+finished records (terminal, unknown, observation-only) for one hour, bounded to 4096
+by least-recently-used eviction; a full journal evicts, it never refuses. While a
+sealed session/turn/tool-call record is retained, an identical repeat replays its
+cached response (up to 8192 characters) and an uncached or changed repeat refuses;
+after eviction a repeat is treated as a new call. Receipts do not survive restart.
+Do not automatically replay unknown work after a
 restart. No production configuration/log write, provider probe or new routing-hot-path
 subprocess is introduced. Running Hermes/dashboard processes need their normal
 restart to load the changed boundaries.

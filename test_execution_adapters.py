@@ -227,15 +227,38 @@ class LegacyBoundaryTests(unittest.TestCase):
             delegate_claude=lambda args: None, claude_bridge=lambda **kw: None)
         self.assertTrue(all(adapter._reservations is self.book for adapter in registry.values()))
 
-    def test_terminal_journal_bound_refuses_new_work_without_forgetting_attempt(self):
+    def test_journal_bound_evicts_lru_finished_records_instead_of_refusing(self):
+        # Superseded (fix round 2, N1): a full journal used to refuse new work.
         calls = []
         payload = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
-        with patch.object(adapters, "_MAX_RECORDS", 1):
+        with patch.object(adapters, "_MAX_RECORDS", 2):
             self.dispatch(lambda: calls.append("first") or payload)
-            refused = self.dispatch(lambda: calls.append("second") or payload, key=("other", 1, "task", "attempt"))
-            self.assertIn("error", json.loads(refused))
-            self.assertIs(self.dispatch(lambda: calls.append("duplicate") or payload), payload)
-        self.assertEqual(calls, ["first"])
+            self.dispatch(lambda: calls.append("second") or payload, key=("second", 1, "task", "attempt"))
+            self.assertIs(self.dispatch(lambda: calls.append("duplicate") or payload), payload)  # retained: replay
+            self.dispatch(lambda: calls.append("third") or payload, key=("third", 1, "task", "attempt"))
+            self.assertIsNone(self.book.record(("second", 1, "task", "attempt")))  # least recently used
+            self.assertIsNotNone(self.book.record(("workflow", 1, "task", "attempt")))
+        self.assertEqual(calls, ["first", "second", "third"])
+
+    def test_journal_bound_never_evicts_in_flight_records(self):
+        started, finish = threading.Event(), threading.Event()
+        payload = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        def slow():
+            started.set()
+            self.assertTrue(finish.wait(5))
+            return payload
+        with patch.object(adapters, "_MAX_RECORDS", 1):
+            thread = threading.Thread(target=lambda: self.dispatch(slow, limit=5))
+            thread.start()
+            self.assertTrue(started.wait(5))
+            try:
+                self.assertIs(self.dispatch(lambda: payload, key=("other", 1, "t", "a"), limit=5), payload)
+                self.assertIsNotNone(self.book.record(("workflow", 1, "task", "attempt")))
+                duplicate = json.loads(self.dispatch(lambda: "SHOULD NOT START", limit=5))
+                self.assertIn("error", duplicate)  # in-flight duplicate still blocked
+            finally:
+                finish.set()
+                thread.join(5)
 
     def test_real_synchronous_shape_has_terminal_evidence_without_top_level_handle(self):
         payload = json.dumps({"results": [{"task_index": 0, "status": "completed", "result": "done",
@@ -253,8 +276,11 @@ class LegacyBoundaryTests(unittest.TestCase):
         self.assertIs(self.dispatch(lambda: payload), payload)
         self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, "succeeded")
 
-    def test_unknown_result_and_start_then_error_keep_reservation(self):
-        for mode in ("malformed", "exception", "error-after-start"):
+    def test_unknown_result_and_start_then_error_release_capacity_after_call(self):
+        # Superseded (fix round 2, C1/Minor): ambiguous outcomes stay traceable as
+        # unknown but release the slot when the synchronous call returns; a top-level
+        # host error payload is a failed outcome.
+        for mode, status in (("malformed", "unknown"), ("exception", "unknown"), ("error-after-start", "failed")):
             with self.subTest(mode=mode):
                 self.book = adapters.ReservationBook()
                 def raw():
@@ -266,9 +292,11 @@ class LegacyBoundaryTests(unittest.TestCase):
                         self.dispatch(raw)
                 else:
                     self.dispatch(raw)
-                self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, "unknown")
-                later = json.loads(self.dispatch(lambda: "SHOULD NOT START", key=("wf2", 1, "t", "a")))
-                self.assertIn("error", later)
+                self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, status)
+                self.assertEqual(self.dispatch(lambda: "later", key=("wf2", 1, "t", "a")), "later")
+                restarted = []
+                self.dispatch(lambda: restarted.append(1) or "SHOULD NOT START")  # same attempt: replay/refuse
+                self.assertEqual(restarted, [])
 
     def test_same_full_attempt_is_dispatched_only_once_even_after_terminal(self):
         calls = []
@@ -282,9 +310,12 @@ class LegacyBoundaryTests(unittest.TestCase):
         calls = []
         raw = lambda: calls.append("start") or json.dumps({"status": "dispatched", "delegation_id": "d"})
         self.dispatch(raw)
-        other = json.loads(self.dispatch(raw, key=("other-workflow", 1, "task", "attempt")))
-        self.assertIn("error", other)
-        self.assertEqual(len(calls), 1)
+        self.dispatch(raw, key=("other-workflow", 1, "task", "attempt"))
+        self.dispatch(raw)  # same full key: replayed, not re-dispatched
+        self.assertEqual(len(calls), 2)
+        self.assertIsNot(self.book.record(("workflow", 1, "task", "attempt")),
+                         self.book.record(("other-workflow", 1, "task", "attempt")))
+        self.assertEqual(len(self.book.records()), 2)
 
     def test_pending_same_attempt_is_blocked_during_dispatch(self):
         started, finish = threading.Event(), threading.Event()
@@ -306,29 +337,39 @@ class LegacyBoundaryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_shared_owner_last_slot_race_and_batch_weight(self):
+        # Capacity is contended only inside the synchronous in-flight window.
         barrier = threading.Barrier(3)
+        release = threading.Event()
         calls, responses = [], []
         def submit(transport, key):
             barrier.wait()
-            responses.append(self.dispatch(lambda: calls.append(transport) or json.dumps({"delegation_id": transport}),
-                transport=transport, key=key))
+            def raw():
+                calls.append(transport)
+                self.assertTrue(release.wait(5))
+                return json.dumps({"delegation_id": transport})
+            responses.append(self.dispatch(raw, transport=transport, key=key))
         threads = [threading.Thread(target=submit, args=(t, (t, 1, "task", "attempt")))
             for t in ("hermes_codex", "hermes_claude")]
         for thread in threads:
             thread.start()
         barrier.wait()
+        for _ in range(500):
+            if responses:
+                break
+            threading.Event().wait(0.01)
+        release.set()
         for thread in threads:
             thread.join(5)
         self.assertEqual(len(calls), 1)
         self.assertEqual(sum("error" in json.loads(r) for r in responses), 1)
-        self.assertIn("error", json.loads(self.dispatch(lambda: "no", weight=2)))
+        self.assertIn("error", json.loads(self.dispatch(lambda: "no", weight=2, key=("wide", 1, "t", "a"))))
 
-    def test_empty_and_ambiguous_partial_sync_results_do_not_free_capacity(self):
+    def test_empty_and_ambiguous_partial_sync_results_stay_unknown_without_holding_capacity(self):
         for results in ([], [{"status": "unknown", "result": "lost"}], [{"status": "completed"}, {"status": "running"}]):
             self.book = adapters.ReservationBook()
             self.dispatch(lambda: json.dumps({"results": results, "total_duration_seconds": 1}))
             self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, "unknown")
-            self.assertIn("error", json.loads(self.dispatch(lambda: "no", key=("w2", 1, "t", "a"))))
+            self.assertEqual(self.dispatch(lambda: "next", key=("w2", 1, "t", "a")), "next")
 
     def test_claude_adjustment_evidence_is_retained_not_served_identity(self):
         payload = json.dumps({"delegation_id": "d", "claude_tier": "sonnet", "tier_adjusted": "opus→sonnet (weekly usage 75.0)",
@@ -531,12 +572,166 @@ class LegacyBoundaryTests(unittest.TestCase):
         self.assertEqual(len(self.book.records()), 1)
         self.assertEqual(self.book.records()[0].observed_model, "claude-sonnet-5-5")
 
-    def test_cli_failure_keeps_unknown_receipt_and_propagates_typed_exception(self):
+    def test_cli_failure_records_terminal_receipt_and_propagates_typed_exception(self):
         with patch.object(cli, "dispatch", side_effect=cli.ClaudeBridgeFailure("model mismatch", "model-mismatch")):
             with self.assertRaises(cli.ClaudeBridgeFailure):
                 router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
         self.assertEqual(len(self.book.records()), 1)
+        self.assertEqual(self.book.records()[0].status, "failed")
+
+    def test_untyped_cli_exception_stays_unknown(self):
+        with patch.object(cli, "dispatch", side_effect=OSError("CLI missing")):
+            with self.assertRaises(OSError):
+                router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
         self.assertEqual(self.book.records()[0].status, "unknown")
+
+
+class UnchangedHostAdmissionTests(unittest.TestCase):
+    """Fix round 2: the legacy boundary never refuses what the unchanged host accepts."""
+    def setUp(self):
+        self.book = adapters.ReservationBook()
+        self.parent = SimpleNamespace(_delegate_depth=0, session_id="parent")
+        owner = patch.object(adapters, "RESERVATIONS", self.book)
+        owner.start()
+        self.addCleanup(owner.stop)
+
+    def background(self, index):
+        return json.dumps({"status": "dispatched", "delegation_id": f"deleg_{index}", "goals": ["g"]})
+
+    def test_background_dispatches_beyond_limit_across_time_are_admitted(self):
+        # C1: accepted background work has no usable completion correlation, so it must
+        # not keep the parent's slot after the synchronous dispatch window closes.
+        starts = []
+        with patch("tools.delegate_tool._get_max_concurrent_children", return_value=2):
+            for index in range(7):
+                transport = "hermes_claude" if index % 2 else "hermes_codex"
+                raw = adapters.native_legacy_dispatch(lambda i=index: starts.append(i) or self.background(i),
+                    parent=self.parent, tasks=[{"goal": "g"}], transport=transport)
+                self.assertNotIn("error", json.loads(raw))
+        self.assertEqual(starts, list(range(7)))
+        self.assertTrue(all(r.status == "unknown" for r in self.book.records()))  # accepted, not completed
+
+    def test_registered_codex_boundary_admits_background_calls_past_limit(self):
+        calls = []
+        with patch.object(router, "_load_config", return_value={"enabled": True}), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(router, "_delegated_claude_review_status", return_value=(None, "")), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(worker_admission, "refusal", return_value=""), \
+             patch("tools.delegate_tool._get_max_concurrent_children", return_value=1), \
+             patch("agent.subagent_lifecycle.get_active_subagent_parent", return_value=self.parent):
+            for index in range(4):
+                raw = lambda sent, i=index: calls.append(i) or self.background(i)
+                response = adapters.guard_legacy_tool_execution(tool_name="delegate_task",
+                    args={"goal": f"goal {index}", "background": True}, next_call=raw,
+                    session_id="s", turn_id=f"turn-{index}", tool_call_id=f"call-{index}")
+                self.assertNotIn("error", json.loads(response))
+        self.assertEqual(calls, [0, 1, 2, 3])
+
+    def test_journal_is_bounded_and_never_refuses_legacy_calls(self):
+        # N1: more calls than the journal bound, mixing terminal, background and error payloads.
+        payloads = (json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1}),
+            self.background(0), json.dumps({"error": "validation"}), "lost response")
+        starts = 0
+        with patch.object(adapters, "_MAX_RECORDS", 8):
+            for index in range(40):
+                def raw(i=index):
+                    nonlocal starts
+                    starts += 1
+                    return payloads[i % len(payloads)]
+                response = adapters.dispatch_legacy(raw, transport="hermes_codex", scope="parent:x", limit=1)
+                self.assertIs(response, payloads[index % len(payloads)])
+                self.assertLessEqual(len(self.book.records()), 8)
+        self.assertEqual(starts, 40)
+
+    def test_default_journal_bound_admits_4097_legacy_calls(self):
+        payload = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        starts = []
+        for index in range(adapters._MAX_RECORDS + 1):
+            self.assertIs(adapters.dispatch_legacy(lambda: starts.append(1) or payload, transport="hermes_codex",
+                scope="parent:x", limit=1), payload)
+        self.assertEqual(len(starts), adapters._MAX_RECORDS + 1)
+        self.assertLessEqual(len(self.book.records()), adapters._MAX_RECORDS)
+
+    def test_sealed_public_record_replays_while_retained_and_expires_after_ttl(self):
+        clock = [1000.0]
+        calls = []
+        payload = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        key = ("session", 0, "turn", "call")
+        with patch.object(adapters, "_now", lambda: clock[0], create=True):
+            first = adapters.dispatch_legacy(lambda: calls.append(1) or payload, transport="hermes_codex",
+                scope="p", limit=1, attempt_key=key, fingerprint="f")
+            clock[0] += 60
+            self.assertIs(adapters.dispatch_legacy(lambda: calls.append(2) or payload, transport="hermes_codex",
+                scope="p", limit=1, attempt_key=key, fingerprint="f"), first)
+            self.assertEqual(calls, [1])
+            clock[0] += getattr(adapters, "_RECORD_TTL_SECONDS", 3600) + 1
+            adapters.dispatch_legacy(lambda: calls.append(3) or payload, transport="hermes_codex",
+                scope="p", limit=1, attempt_key=key, fingerprint="f")
+        self.assertEqual(calls, [1, 3])
+
+    def test_cli_call_after_typed_bridge_failure_is_not_refused(self):
+        # N2: ClaudeBridgeFailure is a typed terminal outcome and releases capacity.
+        ok = {"bridge_run_id": "run-2", "effective_model": "claude-opus-5-5", "result": "ok"}
+        failures = (cli.ClaudeBridgeFailure("model mismatch", "model-mismatch"),
+                    cli.ClaudeBridgeFailure("timed out", "timeout"))
+        for failure in failures:
+            with self.subTest(kind=failure.failure_kind):
+                self.book = adapters.ReservationBook()
+                with patch.object(adapters, "RESERVATIONS", self.book), \
+                     patch.object(cli, "dispatch", side_effect=[failure, ok]) as dispatch:
+                    with self.assertRaises(cli.ClaudeBridgeFailure) as raised:
+                        router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
+                    self.assertIs(raised.exception, failure)
+                    self.assertEqual(router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={}), ok)
+                self.assertEqual(dispatch.call_count, 2)
+                statuses = [r.status for r in self.book.records()]
+                self.assertEqual(statuses, ["timed_out" if failure.failure_kind == "timeout" else "failed", "succeeded"])
+
+    def test_two_concurrent_cli_calls_are_not_refused(self):
+        entered, release = threading.Event(), threading.Event()
+        results, errors = [], []
+        def dispatch(*args, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return {"bridge_run_id": f"run-{len(results)}", "effective_model": "claude-opus-5-5"}
+        def call():
+            try:
+                results.append(router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={}))
+            except Exception as exc:  # pragma: no cover - failure path of the regression
+                errors.append(exc)
+        with patch.object(cli, "dispatch", side_effect=dispatch):
+            first = threading.Thread(target=call)
+            first.start()
+            self.assertTrue(entered.wait(5))
+            try:
+                call()  # while the first CLI call is still in flight
+            finally:
+                release.set()
+                first.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+
+    def test_error_payload_releases_and_records_failed_receipt(self):
+        calls = []
+        error = json.dumps({"error": "Too many tasks"})
+        self.assertIs(adapters.dispatch_legacy(lambda: calls.append(1) or error, transport="hermes_codex",
+            scope="parent:y", limit=1, attempt_key=("w", 1, "t", "a")), error)
+        self.assertEqual(self.book.record(("w", 1, "t", "a")).status, "failed")
+        ok = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        self.assertIs(adapters.dispatch_legacy(lambda: calls.append(2) or ok, transport="hermes_codex",
+            scope="parent:y", limit=1, attempt_key=("w2", 1, "t", "a")), ok)
+        self.assertEqual(calls, [1, 2])
+
+    def test_batch_wider_than_limit_reaches_host_for_its_own_refusal(self):
+        calls = []
+        host_error = json.dumps({"error": "Too many tasks: 3 provided, but max_concurrent_children is 2."})
+        with patch("tools.delegate_tool._get_max_concurrent_children", return_value=2):
+            raw = adapters.native_legacy_dispatch(lambda: calls.append(1) or host_error, parent=self.parent,
+                tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}], transport="hermes_codex")
+        self.assertIs(raw, host_error)
+        self.assertEqual(calls, [1])
 
 
 if __name__ == "__main__":
