@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
+import hashlib
+import math
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 SCHEMA_VERSION = 1
@@ -84,39 +87,87 @@ def _exact_keys(data: Mapping[str, Any], allowed: Sequence[str], record: str) ->
         raise ValueError(f"{record} is missing fields: {', '.join(sorted(missing))}")
 
 
-def _json_value(value: Any, *, depth: int = 0) -> Any:
-    if depth > 8:
-        raise ValueError("JSON metadata is too deeply nested")
+MAX_JSON_NODES = 1024
+MAX_JSON_CHARS = 32768
+
+
+def _version(value: Any) -> None:
+    _integer("schema_version", value)
+    if value != SCHEMA_VERSION:
+        raise ValueError("unsupported schema version")
+
+
+def _json_value(value: Any, *, depth: int = 0, budget=None, redact=False) -> Any:
+    # Shared traversal bounds the whole payload, not just each container.
+    if budget is None:
+        budget = [0, 0]
+    budget[0] += 1
+    if depth > 8 or budget[0] > MAX_JSON_NODES:
+        raise ValueError("JSON metadata exceeds depth or aggregate node bounds")
+    if isinstance(value, str):
+        _string("JSON string", value, MAX_EVIDENCE_CHARS, allow_empty=True)
+        budget[1] += len(value)
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("JSON numbers must be finite")
+    elif isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 64:
+        raise ValueError("JSON integer exceeds 64-bit bounds")
+    if budget[1] > MAX_JSON_CHARS:
+        raise ValueError("JSON metadata exceeds aggregate character bounds")
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, Mapping):
         if len(value) > MAX_USAGE_FIELDS:
             raise ValueError("JSON object has too many fields")
-        return { _string("JSON key", key, MAX_IDENTIFIER_CHARS): _json_value(item, depth=depth + 1)
-                 for key, item in value.items() }
+        result = {}
+        for key, item in value.items():
+            key = _string("JSON key", key, MAX_IDENTIFIER_CHARS)
+            budget[1] += len(key)
+            if redact and any(word in key.lower().replace("-", "_") for word in
+                    ("token", "secret", "password", "authorization", "credential", "api_key", "apikey", "cookie", "bearer")):
+                item = "[redacted]"
+            result[key] = _json_value(item, depth=depth + 1, budget=budget, redact=redact)
+        return result
     if isinstance(value, (tuple, list)):
         if len(value) > MAX_USAGE_FIELDS:
             raise ValueError("JSON sequence has too many items")
-        return [_json_value(item, depth=depth + 1) for item in value]
+        return [_json_value(item, depth=depth + 1, budget=budget, redact=redact) for item in value]
     raise TypeError("value must be JSON-compatible")
 
 
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _owned_mapping(value: Any, *, redact=False) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("usage/provider metadata must be an object")
+    return _freeze_json(_json_value(value, redact=redact))
+
+
 def _redact(value: Mapping[str, Any]) -> Dict[str, Any]:
-    result = {}
-    for key, item in value.items():
-        key = _string("metadata key", key, MAX_IDENTIFIER_CHARS)
-        if any(word in key.lower() for word in ("token", "secret", "password", "authorization", "credential")):
-            result[key] = "[redacted]"
-        else:
-            result[key] = _json_value(item)
-    return result
+    return _json_value(value, redact=True)
 
 
 @dataclass(frozen=True)
 class ModelFact:
+    """One model identity with its evidence source.
+
+    ``canonical`` is False for a value that is an alias handed to a tool (the
+    Claude CLI ``--model sonnet``): it names a request, not a served model.
+    """
     value: str = UNKNOWN
     source: str = SOURCE_NOT_OBSERVED
     canonical: bool = True
+
+    def __post_init__(self) -> None:
+        _string("model fact value", self.value, MAX_IDENTIFIER_CHARS)
+        _string("model fact source", self.source, MAX_IDENTIFIER_CHARS)
+        if not isinstance(self.canonical, bool):
+            raise TypeError("model fact canonical must be a boolean")
 
     @property
     def known(self) -> bool:
@@ -128,9 +179,14 @@ class ModelFact:
 
 @dataclass(frozen=True)
 class EffortFact:
+    """Requested versus applied effort; ``unknown``/``not_applicable`` are explicit."""
     requested: str = NOT_APPLICABLE
     applied: str = NOT_APPLICABLE
     source: str = SOURCE_NOT_OBSERVED
+
+    def __post_init__(self) -> None:
+        for name in ("requested", "applied", "source"):
+            _string("effort " + name, getattr(self, name), MAX_IDENTIFIER_CHARS)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"requested": self.requested, "applied": self.applied, "source": self.source}
@@ -150,6 +206,14 @@ class TargetIdentity:
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        _version(self.schema_version)
+        for name in ("provider", "account", "alias"):
+            _string(name, getattr(self, name), MAX_IDENTIFIER_CHARS)
+        for name in ("requested", "resolved", "observed"):
+            if not isinstance(getattr(self, name), ModelFact):
+                raise TypeError(name + " must be a ModelFact")
+        if not isinstance(self.effort, EffortFact):
+            raise TypeError("effort must be an EffortFact")
         if self.transport not in TRANSPORTS:
             raise ValueError(f"unknown transport {self.transport!r}")
         if self.selection_mode not in SELECTION_MODES:
@@ -164,7 +228,8 @@ class TargetIdentity:
 
 @dataclass(frozen=True)
 class ExactRouteMismatch:
-    stage: str
+    """Typed refusal of an exact request whose identity disagrees (I04)."""
+    stage: str  # "resolved" | "observed"
     alias: str
     transport: str
     requested: str
@@ -184,6 +249,12 @@ class ExactRouteMismatch:
 
 
 def check_exact(identity: TargetIdentity) -> Optional[ExactRouteMismatch]:
+    """The mismatch an exact identity carries, if any; always None for preferred.
+
+    The observed model is the strongest evidence, so it is checked first. A
+    resolved or observed value counts only when it is canonical: a CLI alias
+    argument is not evidence of the served model.
+    """
     if identity.selection_mode != SELECTION_EXACT or not identity.requested.known:
         return None
     wanted = identity.requested
@@ -216,8 +287,7 @@ def _identity(data: Any) -> TargetIdentity:
     keys = ("schema_version", "provider", "account", "transport", "alias", "selection_mode",
             "requested", "resolved", "observed", "effort")
     _exact_keys(data, keys, "target identity")
-    if data["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("unsupported target identity schema version")
+    _version(data["schema_version"])
     return TargetIdentity(_string("provider", data["provider"], MAX_IDENTIFIER_CHARS),
                           _string("account", data["account"], MAX_IDENTIFIER_CHARS), data["transport"],
                           _string("alias", data["alias"], MAX_IDENTIFIER_CHARS), data["selection_mode"],
@@ -255,6 +325,7 @@ class ExecutionRequest:
         _string("goal", self.goal, MAX_GOAL_CHARS)
         criteria = _string_tuple("acceptance_criteria", self.acceptance_criteria,
                                  MAX_ACCEPTANCE_CRITERIA, MAX_CRITERION_CHARS)
+        object.__setattr__(self, "acceptance_criteria", criteria)
         if not criteria:
             raise ValueError("acceptance_criteria must not be empty")
         for name in ("context_reference", "repository", "workspace", "verification_policy", "substitution_policy"):
@@ -262,14 +333,13 @@ class ExecutionRequest:
         if not isinstance(self.target, TargetIdentity):
             raise TypeError("target must be a TargetIdentity")
         for name in ("permissions", "tool_requirements", "write_scope"):
-            _string_tuple(name, getattr(self, name), MAX_EVIDENCE_ITEMS, MAX_ARTIFACT_REFERENCE_CHARS)
+            object.__setattr__(self, name, _string_tuple(name, getattr(self, name), MAX_EVIDENCE_ITEMS, MAX_ARTIFACT_REFERENCE_CHARS))
         if not isinstance(self.mutating, bool):
             raise TypeError("mutating must be a boolean")
         _integer("timeout_seconds", self.timeout_seconds, 1)
         _integer("deadline_epoch_ms", self.deadline_epoch_ms, 1)
         _integer("attempt_budget", self.attempt_budget, 1)
-        if self.schema_version != SCHEMA_VERSION:
-            raise ValueError("unsupported execution request schema version")
+        _version(self.schema_version)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"schema_version": self.schema_version, "workflow_id": self.workflow_id, "plan_version": self.plan_version,
@@ -293,12 +363,19 @@ class ExecutionRequest:
 
 
 def legacy_direct_tool_request(*, tool_invocation_id: str, goal: str, target: TargetIdentity,
-                               repository: str, workspace: str) -> ExecutionRequest:
+                               repository: str, workspace: str, acceptance_criteria: Tuple[str, ...],
+                               permissions: Tuple[str, ...], tool_requirements: Tuple[str, ...],
+                               mutating: bool, write_scope: Tuple[str, ...], timeout_seconds: int,
+                               deadline_epoch_ms: int, attempt_budget: int, verification_policy: str,
+                               substitution_policy: str) -> ExecutionRequest:
+    """Assign observation IDs, never invent tool authority or execution budgets."""
     tool = _string("tool_invocation_id", tool_invocation_id, MAX_IDENTIFIER_CHARS, identifier=True)
-    workflow = f"legacy:{tool}"
-    return ExecutionRequest(workflow, 0, f"{workflow}:task", f"{workflow}:attempt", goal, ("legacy tool completed",),
-                            f"legacy-tool:{tool}", target, repository, workspace, ("read",), (), False, (),
-                            300, 1, 1, "pending", "forbid")
+    suffix = tool if len(tool) <= MAX_IDENTIFIER_CHARS - len("legacy::attempt") else hashlib.sha256(tool.encode()).hexdigest()
+    workflow = f"legacy:{suffix}"
+    return ExecutionRequest(workflow, 0, f"{workflow}:task", f"{workflow}:attempt", goal, acceptance_criteria,
+                            f"legacy-tool:{tool}", target, repository, workspace, permissions,
+                            tool_requirements, mutating, write_scope, timeout_seconds, deadline_epoch_ms,
+                            attempt_budget, verification_policy, substitution_policy)
 
 
 @dataclass(frozen=True)
@@ -313,6 +390,19 @@ class OutputReference:
             _string("output artifact reference", self.artifact_reference, MAX_ARTIFACT_REFERENCE_CHARS)
         if not isinstance(self.truncated, bool):
             raise TypeError("output truncated must be a boolean")
+        if self.truncated and self.artifact_reference is None:
+            raise ValueError("truncated output requires an artifact reference")
+
+    @classmethod
+    def bounded(cls, text: str, *, artifact_reference: Optional[str] = None,
+                limit: int = MAX_OUTPUT_SUMMARY_CHARS) -> "OutputReference":
+        """Caller owns persistence of the full text; this helper does no I/O."""
+        _integer("summary limit", limit, 1)
+        if limit > MAX_OUTPUT_SUMMARY_CHARS:
+            raise ValueError("summary limit exceeds contract bound")
+        if not isinstance(text, str):
+            raise TypeError("output text must be a string")
+        return cls(text[:limit], artifact_reference, len(text) > limit)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"summary": self.summary, "artifact_reference": self.artifact_reference, "truncated": self.truncated}
@@ -323,11 +413,25 @@ class OutputReference:
         return cls(data["summary"], data["artifact_reference"], data["truncated"])
 
 
+def bounded_evidence(text: str, *, artifact_reference: Optional[str] = None) -> str:
+    """Retain short evidence or explicitly reference caller-persisted full detail."""
+    if not isinstance(text, str):
+        raise TypeError("evidence must be a string")
+    if len(text) <= MAX_EVIDENCE_CHARS:
+        return _string("evidence", text, MAX_EVIDENCE_CHARS)
+    if artifact_reference is None:
+        raise ValueError("oversized evidence requires an artifact reference")
+    _string("evidence artifact reference", artifact_reference, MAX_ARTIFACT_REFERENCE_CHARS)
+    return "artifact-reference:" + artifact_reference
+
+
 @dataclass(frozen=True)
 class FailureDetail:
     failure_class: str
     retryable: bool
     reset_hint: Optional[str] = None
+    message: Optional[OutputReference] = None
+    details: Optional[OutputReference] = None
 
     def __post_init__(self) -> None:
         if self.failure_class not in _FAILURE_CLASSES:
@@ -336,14 +440,21 @@ class FailureDetail:
             raise TypeError("retryable must be a boolean")
         if self.reset_hint is not None:
             _string("reset hint", self.reset_hint, MAX_EVIDENCE_CHARS)
+        for name in ("message", "details"):
+            if getattr(self, name) is not None and not isinstance(getattr(self, name), OutputReference):
+                raise TypeError(name + " must be an OutputReference")
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"failure_class": self.failure_class, "retryable": self.retryable, "reset_hint": self.reset_hint}
+        return {"failure_class": self.failure_class, "retryable": self.retryable, "reset_hint": self.reset_hint,
+                "message": None if self.message is None else self.message.as_dict(),
+                "details": None if self.details is None else self.details.as_dict()}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "FailureDetail":
-        _exact_keys(data, ("failure_class", "retryable", "reset_hint"), "failure detail")
-        return cls(data["failure_class"], data["retryable"], data["reset_hint"])
+        _exact_keys(data, tuple(cls.__dataclass_fields__), "failure detail")
+        return cls(data["failure_class"], data["retryable"], data["reset_hint"],
+                   None if data["message"] is None else OutputReference.from_dict(data["message"]),
+                   None if data["details"] is None else OutputReference.from_dict(data["details"]))
 
 
 @dataclass(frozen=True)
@@ -366,8 +477,12 @@ class WorkerResult:
     failure: Optional[FailureDetail] = None
     provider_metadata: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
+    plan_version: int = 0
+    changed_files: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        _integer("plan_version", self.plan_version)
+        object.__setattr__(self, "changed_files", _string_tuple("changed_files", self.changed_files, MAX_EVIDENCE_ITEMS, MAX_ARTIFACT_REFERENCE_CHARS))
         for name in ("workflow_id", "task_id", "attempt_id", "handle"):
             _string(name, getattr(self, name), MAX_IDENTIFIER_CHARS, identifier=True)
         if self.terminal_status not in _TERMINAL:
@@ -378,20 +493,36 @@ class WorkerResult:
         for name in ("requested_target", "resolved_target", "observed_target"):
             if not isinstance(getattr(self, name), TargetIdentity):
                 raise TypeError(f"{name} must be a TargetIdentity")
-        _json_value(self.usage)
-        _string_tuple("validation_evidence", self.validation_evidence, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_CHARS)
-        _string_tuple("artifacts", self.artifacts, MAX_EVIDENCE_ITEMS, MAX_ARTIFACT_REFERENCE_CHARS)
+        object.__setattr__(self, "usage", _owned_mapping(self.usage))
+        object.__setattr__(self, "validation_evidence", _string_tuple("validation_evidence", self.validation_evidence, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_CHARS))
+        object.__setattr__(self, "artifacts", _string_tuple("artifacts", self.artifacts, MAX_EVIDENCE_ITEMS, MAX_ARTIFACT_REFERENCE_CHARS))
         _string("workspace", self.workspace, MAX_ARTIFACT_REFERENCE_CHARS)
         _string("base_revision", self.base_revision, MAX_IDENTIFIER_CHARS)
         if self.failure is not None and not isinstance(self.failure, FailureDetail):
             raise TypeError("failure must be a FailureDetail")
-        if self.terminal_status == "failed" and self.failure is None:
-            raise ValueError("failed result requires failure detail")
+        if self.terminal_status != "succeeded" and self.failure is None:
+            raise ValueError("non-success result requires failure detail")
+        if self.terminal_status == "succeeded" and self.failure is not None:
+            raise ValueError("succeeded result cannot carry failure")
+        expected_class = {"cancelled": "cancelled", "timed_out": "timeout"}.get(self.terminal_status)
+        if expected_class is not None and self.failure.failure_class != expected_class:
+            raise ValueError("terminal status contradicts failure class")
+        if self.terminal_status == "succeeded" and self.requested_target.selection_mode == SELECTION_EXACT:
+            wanted = self.requested_target
+            # Evaluate the authoritative request against retained resolved/observed facts.
+            combined = TargetIdentity(wanted.provider, wanted.account, wanted.transport, wanted.alias,
+                                      wanted.selection_mode, wanted.requested, self.resolved_target.resolved,
+                                      self.observed_target.observed, self.observed_target.effort)
+            effort = self.observed_target.effort.applied
+            if (check_exact(combined) is not None
+                    or any(target.provider != wanted.provider for target in (self.resolved_target, self.observed_target))
+                    or (wanted.effort.requested not in (UNKNOWN, NOT_APPLICABLE)
+                        and effort not in (UNKNOWN, NOT_APPLICABLE) and effort != wanted.effort.requested)):
+                raise ValueError("exact route mismatch cannot be reported as success")
         if len(self.provider_metadata) > MAX_METADATA_FIELDS:
             raise ValueError("provider metadata has too many fields")
-        _redact(self.provider_metadata)
-        if self.schema_version != SCHEMA_VERSION:
-            raise ValueError("unsupported worker result schema version")
+        object.__setattr__(self, "provider_metadata", _owned_mapping(self.provider_metadata, redact=True))
+        _version(self.schema_version)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"schema_version": self.schema_version, "workflow_id": self.workflow_id, "task_id": self.task_id,
@@ -402,7 +533,8 @@ class WorkerResult:
                 "validation_evidence": list(self.validation_evidence), "artifacts": list(self.artifacts),
                 "workspace": self.workspace, "base_revision": self.base_revision,
                 "failure": None if self.failure is None else self.failure.as_dict(),
-                "provider_metadata": _redact(self.provider_metadata)}
+                "provider_metadata": _redact(self.provider_metadata),
+                "plan_version": self.plan_version, "changed_files": list(self.changed_files)}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "WorkerResult":
@@ -413,7 +545,7 @@ class WorkerResult:
                    data["summary"], OutputReference.from_dict(data["output"]), _identity(data["requested_target"]),
                    _identity(data["resolved_target"]), _identity(data["observed_target"]), data["usage"],
                    data["validation_evidence"], data["artifacts"], data["workspace"], data["base_revision"],
-                   failure, data["provider_metadata"], data["schema_version"])
+                   failure, data["provider_metadata"], data["schema_version"], data["plan_version"], data["changed_files"])
 
 
 @dataclass(frozen=True)
@@ -423,6 +555,7 @@ class AttemptLifecycle:
     attempt_id: str
     status: str = "created"
     handle: Optional[str] = None
+    plan_version: int = 0
 
     @classmethod
     def created(cls, workflow_id: str, task_id: str, attempt_id: str) -> "AttemptLifecycle":
@@ -435,31 +568,43 @@ class AttemptLifecycle:
             raise ValueError("unknown lifecycle status")
         if self.handle is not None:
             _string("handle", self.handle, MAX_IDENTIFIER_CHARS, identifier=True)
-        if self.status in ("submitted", "running") and self.handle is None:
+        _integer("plan_version", self.plan_version)
+        pre_submission = self.status in ("created", "unavailable", "unsupported")
+        if not pre_submission and self.handle is None:
             raise ValueError(f"{self.status} lifecycle requires a handle")
-        if self.status == "created" and self.handle is not None:
-            raise ValueError("created lifecycle cannot have a handle")
+        if pre_submission and self.handle is not None:
+            raise ValueError(f"{self.status} lifecycle cannot have a handle")
 
     def as_dict(self) -> Dict[str, Any]:
         return {"record_type": "attempt_lifecycle", "schema_version": SCHEMA_VERSION,
                 "workflow_id": self.workflow_id, "task_id": self.task_id, "attempt_id": self.attempt_id,
-                "status": self.status, "handle": self.handle}
+                "status": self.status, "handle": self.handle, "plan_version": self.plan_version}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AttemptLifecycle":
-        keys = ("record_type", "schema_version", "workflow_id", "task_id", "attempt_id", "status", "handle")
+        keys = ("record_type", "schema_version", "workflow_id", "task_id", "attempt_id", "status", "handle", "plan_version")
         _exact_keys(data, keys, "attempt lifecycle")
-        if data["record_type"] != "attempt_lifecycle" or data["schema_version"] != SCHEMA_VERSION:
+        _version(data["schema_version"])
+        if data["record_type"] != "attempt_lifecycle":
             raise ValueError("unsupported attempt lifecycle record")
-        return cls(data["workflow_id"], data["task_id"], data["attempt_id"], data["status"], data["handle"])
+        return cls(data["workflow_id"], data["task_id"], data["attempt_id"], data["status"], data["handle"], data["plan_version"])
 
     def transition(self, status: str, *, handle: Optional[str] = None) -> "AttemptLifecycle":
         if status not in _ALLOWED_TRANSITIONS[self.status]:
             raise ValueError(f"invalid lifecycle transition {self.status} -> {status}")
         if self.status == "created" and status == "submitted" and handle is None:
             raise ValueError("submitted lifecycle requires a handle")
+        if self.handle is not None and handle is not None and handle != self.handle:
+            raise ValueError("lifecycle handle cannot change")
         return AttemptLifecycle(self.workflow_id, self.task_id, self.attempt_id, status,
-                                handle if handle is not None else self.handle)
+                                handle if handle is not None else self.handle, self.plan_version)
+
+    def reconcile(self, status: str) -> "AttemptLifecycle":
+        """Explicit caller-attested reconciliation; no ownership release or I/O."""
+        if self.status != "unknown" or status not in ("running",) + _TERMINAL:
+            raise ValueError("reconciliation requires unknown -> running/terminal")
+        return AttemptLifecycle(self.workflow_id, self.task_id, self.attempt_id, status,
+                                self.handle, self.plan_version)
 
 
 @dataclass(frozen=True)
@@ -488,7 +633,7 @@ class Submission:
             if self.handle is None or self.rejection is not None:
                 raise ValueError("accepted submission requires only a handle")
             _string("handle", self.handle, MAX_IDENTIFIER_CHARS, identifier=True)
-        elif self.handle is not None or self.rejection is None:
+        elif self.handle is not None or not isinstance(self.rejection, FailureDetail):
             raise ValueError("rejected submission requires only a typed rejection")
 
     def as_dict(self) -> Dict[str, Any]:
@@ -501,7 +646,8 @@ class Submission:
     def from_dict(cls, data: Mapping[str, Any]) -> "Submission":
         keys = ("record_type", "schema_version", "workflow_id", "task_id", "attempt_id", "accepted", "handle", "rejection")
         _exact_keys(data, keys, "submission")
-        if data["record_type"] != "submission" or data["schema_version"] != SCHEMA_VERSION:
+        _version(data["schema_version"])
+        if data["record_type"] != "submission":
             raise ValueError("unsupported submission record")
         rejection = None if data["rejection"] is None else FailureDetail.from_dict(data["rejection"])
         return cls(data["workflow_id"], data["task_id"], data["attempt_id"], data["accepted"], data["handle"], rejection)
@@ -518,6 +664,15 @@ class PendingResult:
         _string("pending reason", self.reason, MAX_EVIDENCE_CHARS, allow_empty=True)
 
 
+    def as_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PendingResult":
+        _exact_keys(data, ("status", "reason"), "PendingResult")
+        return cls(data["status"], data["reason"])
+
+
 @dataclass(frozen=True)
 class Eligibility:
     status: str
@@ -526,7 +681,16 @@ class Eligibility:
     def __post_init__(self) -> None:
         if self.status not in ("yes", "unavailable", "unsupported"):
             raise ValueError("unknown eligibility status")
-        _string_tuple("eligibility reasons", self.reasons, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_CHARS)
+        object.__setattr__(self, "reasons", _string_tuple("eligibility reasons", self.reasons, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_CHARS))
+
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "reasons": list(self.reasons)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Eligibility":
+        _exact_keys(data, ("status", "reasons"), "Eligibility")
+        return cls(data["status"], data["reasons"])
 
 
 @dataclass(frozen=True)
@@ -540,18 +704,34 @@ class CancelOutcome:
         _string("cancel reason", self.reason, MAX_EVIDENCE_CHARS, allow_empty=True)
 
 
+    def as_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CancelOutcome":
+        _exact_keys(data, ("status", "reason"), "CancelOutcome")
+        return cls(data["status"], data["reason"])
+
+
 @dataclass(frozen=True)
 class AdapterCapabilities:
     """Versioned, offline description of an adapter's supported contract actions."""
     transport: str
     capabilities: Tuple[str, ...]
+    schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        _version(self.schema_version)
         _string("adapter transport", self.transport, MAX_IDENTIFIER_CHARS)
-        _string_tuple("adapter capabilities", self.capabilities, MAX_EVIDENCE_ITEMS, MAX_IDENTIFIER_CHARS)
+        object.__setattr__(self, "capabilities", _string_tuple("adapter capabilities", self.capabilities, MAX_EVIDENCE_ITEMS, MAX_IDENTIFIER_CHARS))
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"transport": self.transport, "capabilities": list(self.capabilities)}
+        return {"schema_version": self.schema_version, "transport": self.transport, "capabilities": list(self.capabilities)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AdapterCapabilities":
+        _exact_keys(data, tuple(cls.__dataclass_fields__), "adapter capabilities")
+        return cls(data["transport"], data["capabilities"], data["schema_version"])
 
 
 AdapterResult = Union[PendingResult, WorkerResult]

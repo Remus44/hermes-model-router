@@ -1235,8 +1235,9 @@ config owner's value per Claude tier and flags drift and observed mismatches.
 
 `execution_contracts.py` also freezes the scheduler-facing records without adding a
 scheduler or dispatch path: a bounded `ExecutionRequest`, an `AttemptLifecycle`, a
-non-terminal `Submission`, and a terminal-only `WorkerResult`. All records use an
-explicit schema version and strict `as_dict()`/`from_dict()` validation: unknown
+non-terminal `Submission`, and a terminal-only `WorkerResult`. The main records
+and adapter capability record carry explicit schema versions; boundary records
+have strict `as_dict()`/`from_dict()` validation: unknown
 routing fields, malformed IDs, invalid types, illegal lifecycle transitions and
 oversized inline payloads are rejected. A submission acceptance is only a handle;
 it cannot be consumed as a completed worker result. Execution success remains
@@ -1245,9 +1246,33 @@ separate from validation evidence and later parent acceptance.
 Unknown effort and provider usage remain explicit (`"unknown"`) and provider usage
 may carry bounded future meter fields. Inline output is bounded; callers retain a
 bounded artifact reference plus failure and validation evidence rather than silently
-dropping those records. `legacy_direct_tool_request()` gives existing direct tool
-invocations stable `legacy:<tool-id>` workflow/task/attempt identities without a
-TaskGraph.
+dropping those records. `OutputReference.bounded()` and `bounded_evidence()`
+require a caller-supplied full-content artifact reference when inline detail is
+oversized; they do not persist or verify the referenced artifact. Failure message
+and details have their own output references. Sequences are normalized to tuples,
+and nested usage/metadata are defensively copied into immutable collections.
+Usage/metadata have depth, finite-number, string and aggregate payload bounds;
+credential-named metadata fields (including nested API keys, cookies and bearer
+fields) are redacted before storage. This is key-based redaction, not a guarantee
+that arbitrary free text is secret-free; adapters must avoid supplying secrets.
+
+`legacy_direct_tool_request()` gives direct tools stable `legacy:<tool-id>`
+workflow/task/attempt identities without a TaskGraph (long IDs use a SHA-256
+suffix). Callers must explicitly supply permissions, mutation/write scope,
+acceptance criteria, tools, budgets/deadline and policies; the wrapper invents no
+authority or already-expired deadline.
+
+Lifecycles/results retain plan version, and results include changed-file paths.
+Post-submission states require the original handle; transitions cannot replace it.
+`unknown` cannot transition ordinarily: `reconcile()` explicitly records the
+caller's reconciled running/terminal observation without releasing workspace
+ownership or implementing reconciliation policy. Fake cancellation preserves
+terminal results and unknown liveness. Non-success results require typed failures,
+and success cannot carry failure or contradict a retained exact model/provider/
+effort constraint. Unknown observations are still unknown: execution success does
+not prove exact-route observability, verification or parent acceptance; production
+adapters/admission must enforce those requirements before accepting exact work.
+Retryability is a policy-owner input, not authorization inferred from model prose.
 
 `execution_test_doubles.py` supplies no-I/O scripted adapters for delayed completion,
 partial batches, capability refusal, observed-identity mismatch, unknown liveness

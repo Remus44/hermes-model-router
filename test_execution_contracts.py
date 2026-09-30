@@ -1,6 +1,7 @@
 """S04 execution-record and adapter-double contract tests (I03-I10)."""
 import json
 import unittest
+from dataclasses import replace
 
 from model_router import execution_contracts as contracts
 from model_router import execution_test_doubles as doubles
@@ -77,6 +78,9 @@ class RecordValidationTests(unittest.TestCase):
         legacy = contracts.legacy_direct_tool_request(
             tool_invocation_id="tool-abc", goal="Read one file.", target=IDENTITY,
             repository="repo:/work/router", workspace="workspace:/work/router",
+            acceptance_criteria=("file read",), permissions=("read",), tool_requirements=("read_file",),
+            mutating=False, write_scope=(), timeout_seconds=60, deadline_epoch_ms=2000000000000,
+            attempt_budget=1, verification_policy="required", substitution_policy="forbid",
         )
         self.assertEqual(legacy.workflow_id, "legacy:tool-abc")
         self.assertEqual(legacy.attempt_id, "legacy:tool-abc:attempt")
@@ -89,13 +93,13 @@ class RecordValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             contracts.WorkerResult(
                 workflow_id="wf-001", task_id="task-001", attempt_id="attempt-001", handle="handle-001",
-                terminal_status="failed", summary="failed", output=contracts.OutputReference("x"),
+                terminal_status="succeeded", summary="ok", output=contracts.OutputReference("x"),
                 requested_target=IDENTITY, resolved_target=IDENTITY, observed_target=IDENTITY,
                 artifacts=("artifact:" + "x" * contracts.MAX_ARTIFACT_REFERENCE_CHARS,),
             )
         result = contracts.WorkerResult(
             workflow_id="wf-001", task_id="task-001", attempt_id="attempt-001", handle="handle-001",
-            terminal_status="failed", summary="failed", output=contracts.OutputReference("x", truncated=True),
+            terminal_status="failed", summary="failed", output=contracts.OutputReference("x", "artifact:full-log", truncated=True),
             requested_target=IDENTITY, resolved_target=IDENTITY, observed_target=IDENTITY,
             failure=contracts.FailureDetail("execution-error", False, "inspect artifact"),
             validation_evidence=("verification failed",), artifacts=("artifact:full-log",),
@@ -176,6 +180,213 @@ class AdapterDoubleTests(unittest.TestCase):
         handle = cancellable.submit(request()).handle
         self.assertEqual(cancellable.cancel(handle).status, "acknowledged")
         self.assertEqual(cancellable.result(handle).terminal_status, "cancelled")
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def result(self, **changes):
+        return replace(doubles.succeeded_result(request(), "handle-review"), **changes)
+
+    def test_request_sequences_are_owned_and_round_trip_equal(self):
+        criteria = ["tests pass"]
+        original = request(acceptance_criteria=criteria, permissions=["read"],
+                           tool_requirements=["terminal"], write_scope=["file"])
+        criteria.append("unauthorized")
+        self.assertEqual(original.acceptance_criteria, ("tests pass",))
+        self.assertEqual(contracts.ExecutionRequest.from_dict(original.as_dict()), original)
+        self.assertEqual(hash(contracts.ExecutionRequest.from_dict(original.as_dict())), hash(original))
+
+    def test_result_nested_data_and_sequences_are_defensively_owned(self):
+        usage = {"meter": {"samples": [1, None]}}
+        evidence, artifacts = ["check"], ["artifact:log"]
+        result = self.result(usage=usage, validation_evidence=evidence, artifacts=artifacts)
+        usage["meter"]["samples"].append("x" * 10000)
+        evidence.append("forged")
+        artifacts.append("forged")
+        self.assertEqual(result.as_dict()["usage"], {"meter": {"samples": [1, None]}})
+        self.assertEqual(result.validation_evidence, ("check",))
+        self.assertEqual(result.artifacts, ("artifact:log",))
+        with self.assertRaises(TypeError):
+            result.usage["meter"]["samples"][0] = 2
+        wire = result.as_dict()
+        wire["usage"]["meter"]["samples"].append(2)
+        self.assertEqual(contracts.WorkerResult.from_dict(result.as_dict()), result)
+
+    def test_truncation_requires_reference(self):
+        with self.assertRaisesRegex(ValueError, "artifact"):
+            contracts.OutputReference("preview", truncated=True)
+
+    def test_oversized_details_are_explicit_references_not_dropped(self):
+        long = "x" * (contracts.MAX_EVIDENCE_CHARS + 1)
+        output = contracts.OutputReference.bounded("x" * 5000, artifact_reference="artifact:output")
+        self.assertTrue(output.truncated)
+        self.assertEqual(output.artifact_reference, "artifact:output")
+        evidence = contracts.bounded_evidence(long, artifact_reference="artifact:evidence")
+        self.assertIn("artifact:evidence", evidence)
+        failure = contracts.FailureDetail("execution-error", False,
+            message=contracts.OutputReference.bounded(long, artifact_reference="artifact:message", limit=2048),
+            details=contracts.OutputReference.bounded(long, artifact_reference="artifact:details", limit=2048),
+            reset_hint=contracts.bounded_evidence(long, artifact_reference="artifact:reset"))
+        result = self.result(terminal_status="failed", failure=failure, output=output,
+                             validation_evidence=[evidence])
+        self.assertEqual(contracts.WorkerResult.from_dict(result.as_dict()), result)
+        with self.assertRaisesRegex(ValueError, "artifact"):
+            contracts.bounded_evidence(long)
+
+    def test_artifact_limit_has_valid_control(self):
+        self.result(artifacts=("x" * contracts.MAX_ARTIFACT_REFERENCE_CHARS,))
+        with self.assertRaisesRegex(ValueError, "artifacts"):
+            self.result(artifacts=("x" * (contracts.MAX_ARTIFACT_REFERENCE_CHARS + 1),))
+
+    def test_cancel_terminal_and_unknown_preserves_outcome(self):
+        result = self.result()
+        adapter = doubles.FakeExecutionAdapter.delayed(result, pending_polls=0)
+        handle = adapter.submit(request()).handle
+        self.assertEqual(adapter.cancel(handle).status, "unsupported")
+        self.assertEqual(adapter.result(handle), result)
+        self.assertEqual(adapter.cancel(handle).status, "unsupported")
+        unknown = doubles.FakeExecutionAdapter.unknown_liveness(request())
+        handle = unknown.submit(request()).handle
+        self.assertEqual(unknown.cancel(handle).status, "unknown")
+        self.assertEqual(unknown.result(handle).status, "unknown")
+
+    def test_explicit_reconciliation_preserves_handle_and_version(self):
+        running = contracts.AttemptLifecycle("wf", "task", "attempt", "running", "handle", plan_version=7)
+        unknown = running.transition("unknown")
+        with self.assertRaises(ValueError):
+            unknown.transition("succeeded")
+        for status in ("running", "succeeded", "failed", "cancelled", "timed_out"):
+            reconciled = unknown.reconcile(status)
+            self.assertEqual((reconciled.handle, reconciled.plan_version), ("handle", 7))
+            self.assertEqual(contracts.AttemptLifecycle.from_dict(reconciled.as_dict()), reconciled)
+        with self.assertRaises(ValueError):
+            running.transition("unknown", handle="other")
+
+    def test_lifecycle_state_handle_consistency(self):
+        for status in ("submitted", "running", "unknown", "succeeded", "failed", "cancelled", "timed_out"):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                contracts.AttemptLifecycle("wf", "task", "attempt", status)
+        for status in ("created", "unavailable", "unsupported"):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                contracts.AttemptLifecycle("wf", "task", "attempt", status, "handle")
+
+    def test_direct_identity_and_fact_validation(self):
+        for changes in ({"provider": 4}, {"account": "x" * 129}, {"alias": ""},
+                        {"requested": "model"}, {"effort": None}, {"schema_version": True}):
+            with self.subTest(changes=changes), self.assertRaises((ValueError, TypeError)):
+                replace(IDENTITY, **changes)
+        for constructor, kwargs in ((contracts.ModelFact, {"value": []}),
+                                    (contracts.ModelFact, {"canonical": 1}),
+                                    (contracts.EffortFact, {"applied": "x" * 129})):
+            with self.assertRaises((ValueError, TypeError)):
+                constructor(**kwargs)
+
+    def test_exact_mismatch_is_not_success_but_verification_is_separate(self):
+        observed = replace(IDENTITY, observed=contracts.ModelFact("other", "result"))
+        with self.assertRaisesRegex(ValueError, "exact"):
+            self.result(observed_target=observed)
+        effort = replace(IDENTITY, effort=contracts.EffortFact("high", "low", "wire"))
+        with self.assertRaisesRegex(ValueError, "exact"):
+            self.result(observed_target=effort)
+        adapter = doubles.FakeExecutionAdapter.identity_mismatch(request(), "other")
+        outcome = adapter.result(adapter.submit(request()).handle)
+        self.assertEqual(outcome.terminal_status, "failed")
+        self.assertEqual(outcome.failure.failure_class, "exact-route-mismatch")
+        self.assertEqual(self.result(validation_evidence=("verification failed",)).terminal_status, "succeeded")
+
+    def test_exact_authoritative_request_checks_resolved_model_and_provider(self):
+        for changes in ({"resolved": contracts.ModelFact("other", "host")},
+                        {"provider": "anthropic"}):
+            target = replace(IDENTITY, selection_mode="profile_preferred", **changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "exact"):
+                self.result(resolved_target=target)
+        preferred = replace(IDENTITY, selection_mode="profile_preferred")
+        self.result(requested_target=preferred,
+                    observed_target=replace(preferred, observed=contracts.ModelFact("other", "result")))
+
+    def test_boundary_unknown_fields_and_boolean_schema_are_rejected(self):
+        records = [contracts.PendingResult("pending"), contracts.Eligibility("yes"),
+                   contracts.CancelOutcome("unknown"), contracts.AdapterCapabilities("fake", ("result",))]
+        for record in records:
+            wire = record.as_dict()
+            wire["invented_route"] = "other"
+            with self.assertRaises(ValueError):
+                type(record).from_dict(wire)
+        for record in (request(), self.result(), contracts.Submission.for_acceptance("wf", "task", "attempt", "handle")):
+            wire = record.as_dict()
+            wire["schema_version"] = True
+            with self.assertRaises((ValueError, TypeError)):
+                type(record).from_dict(wire)
+
+    def test_failure_status_consistency(self):
+        with self.assertRaises(ValueError):
+            self.result(failure=contracts.FailureDetail("execution-error", False))
+        for status, failure_class in (("failed", "execution-error"), ("cancelled", "cancelled"), ("timed_out", "timeout")):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                self.result(terminal_status=status)
+            self.result(terminal_status=status, failure=contracts.FailureDetail(failure_class, False))
+        with self.assertRaises(ValueError):
+            self.result(terminal_status="cancelled", failure=contracts.FailureDetail("timeout", False))
+
+    def test_legacy_requires_authority_and_supports_long_ids(self):
+        base = dict(tool_invocation_id="t" * 128, goal="Existing tool", target=IDENTITY,
+                    repository="repo", workspace="workspace")
+        with self.assertRaises(TypeError):
+            contracts.legacy_direct_tool_request(**base)
+        explicit = dict(acceptance_criteria=("explicit check",), permissions=("write",),
+                        tool_requirements=("terminal",), mutating=True, write_scope=("file",),
+                        timeout_seconds=60, deadline_epoch_ms=2000000000000, attempt_budget=1,
+                        verification_policy="required", substitution_policy="forbid")
+        legacy = contracts.legacy_direct_tool_request(**base, **explicit)
+        self.assertTrue(legacy.mutating)
+        self.assertEqual(legacy.permissions, ("write",))
+        self.assertEqual(legacy.deadline_epoch_ms, explicit["deadline_epoch_ms"])
+        self.assertEqual(contracts.legacy_direct_tool_request(**base, **explicit), legacy)
+        for value in (legacy.workflow_id, legacy.task_id, legacy.attempt_id):
+            self.assertLessEqual(len(value), 128)
+
+    def test_recursive_redaction_is_stored_and_immutable(self):
+        metadata = {"nested": [{"api_key": "synthetic-key", "Cookie": "synthetic-cookie",
+                                "bearer": "synthetic-bearer", "safe": "kept"}],
+                    "authorization": "synthetic-auth", "access_token": "synthetic-token"}
+        result = self.result(provider_metadata=metadata)
+        metadata["nested"][0]["safe"] = "changed"
+        self.assertEqual(result.provider_metadata["nested"][0]["api_key"], "[redacted]")
+        wire = result.as_dict()["provider_metadata"]
+        self.assertEqual(wire["nested"][0]["safe"], "kept")
+        self.assertNotIn("synthetic", json.dumps(wire))
+        with self.assertRaises(TypeError):
+            result.provider_metadata["nested"][0]["safe"] = "forged"
+
+    def test_json_finite_string_and_aggregate_bounds(self):
+        for usage in ({"bad": float("nan")}, {"bad": float("inf")}, {"bad": "x" * 10000},
+                      {str(i): list(range(64)) for i in range(64)}):
+            with self.subTest(usage_type=type(usage)), self.assertRaises(ValueError):
+                self.result(usage=usage)
+        with self.assertRaises(TypeError):
+            self.result(usage=[])
+
+    def test_versions_changed_files_and_boundary_round_trips(self):
+        result = self.result(plan_version=7, changed_files=["file.py"])
+        self.assertEqual(result.changed_files, ("file.py",))
+        self.assertEqual(contracts.WorkerResult.from_dict(result.as_dict()), result)
+        records = [contracts.PendingResult("unknown", "lost"), contracts.Eligibility("unavailable", ["quota"]),
+                   contracts.CancelOutcome("unsupported", "no seam"),
+                   contracts.AdapterCapabilities("fake", ["result"])]
+        for record in records:
+            self.assertEqual(type(record).from_dict(record.as_dict()), record)
+        for record in (request(), result, IDENTITY, records[-1]):
+            with self.assertRaises((ValueError, TypeError)):
+                replace(record, schema_version=True)
+        lifecycle = contracts.AttemptLifecycle.created("wf", "task", "attempt").as_dict()
+        lifecycle["schema_version"] = True
+        with self.assertRaises((ValueError, TypeError)):
+            contracts.AttemptLifecycle.from_dict(lifecycle)
+
+    def test_fake_unavailable_and_retryability_not_authorized(self):
+        adapter = doubles.FakeExecutionAdapter.unavailable("capacity unavailable")
+        self.assertEqual(adapter.can_execute(request(), {}).status, "unavailable")
+        self.assertFalse(adapter.submit(request()).accepted)
+        self.assertFalse(doubles.failed_result(request(), "handle", "provider-transient").failure.retryable)
 
 
 if __name__ == "__main__":

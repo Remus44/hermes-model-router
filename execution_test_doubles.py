@@ -31,11 +31,16 @@ class FakeExecutionAdapter:
         return cls(eligibility=contracts.Eligibility("unsupported", (reason,)))
 
     @classmethod
+    def unavailable(cls, reason: str) -> "FakeExecutionAdapter":
+        return cls(eligibility=contracts.Eligibility("unavailable", (reason,)))
+
+    @classmethod
     def identity_mismatch(cls, request: contracts.ExecutionRequest, observed_model: str) -> "FakeExecutionAdapter":
         result = succeeded_result(request, "handle-mismatch")
         observed = replace(result.observed_target,
                            observed=contracts.ModelFact(observed_model, "fake:result", canonical=True))
-        return cls(script={request.attempt_id: (result.handle, [replace(result, observed_target=observed)])})
+        return cls(script={request.attempt_id: (result.handle, [replace(result, observed_target=observed, terminal_status="failed",
+            failure=contracts.FailureDetail("exact-route-mismatch", False))])})
 
     @classmethod
     def unknown_liveness(cls, request: contracts.ExecutionRequest) -> "FakeExecutionAdapter":
@@ -85,24 +90,29 @@ class FakeExecutionAdapter:
             return contracts.CancelOutcome("unknown", "fake handle not observed")
         queued = self._handles[handle]
         result = next((item for item in queued if isinstance(item, contracts.WorkerResult)), None)
-        if result is None:
-            self._handles[handle] = [cancelled_result(self._requests[handle], handle)]
-        else:
-            self._handles[handle] = [replace(result, terminal_status="cancelled", summary="cancelled", failure=None)]
+        if result is not None:
+            return contracts.CancelOutcome("unsupported", "fake terminal result already recorded")
+        if any(item.status == "unknown" for item in queued):
+            return contracts.CancelOutcome("unknown", "fake lost observation; reconciliation required")
+        self._handles[handle] = [cancelled_result(self._requests[handle], handle)]
         return contracts.CancelOutcome("acknowledged")
 
 
 def succeeded_result(request: contracts.ExecutionRequest, handle: str) -> contracts.WorkerResult:
     return contracts.WorkerResult(request.workflow_id, request.task_id, request.attempt_id, handle, "succeeded", "completed",
-                                  contracts.OutputReference("completed"), request.target, request.target, request.target)
+                                  contracts.OutputReference("completed"), request.target, request.target, request.target,
+                                  plan_version=request.plan_version, workspace=request.workspace)
 
 
 def failed_result(request: contracts.ExecutionRequest, handle: str, failure_class: str) -> contracts.WorkerResult:
     return contracts.WorkerResult(request.workflow_id, request.task_id, request.attempt_id, handle, "failed", "failed",
                                   contracts.OutputReference("failed"), request.target, request.target, request.target,
-                                  failure=contracts.FailureDetail(failure_class, True, "retry fixture"))
+                                  failure=contracts.FailureDetail(failure_class, False, "policy authorization not supplied"),
+                                  plan_version=request.plan_version, workspace=request.workspace)
 
 
 def cancelled_result(request: contracts.ExecutionRequest, handle: str) -> contracts.WorkerResult:
     return contracts.WorkerResult(request.workflow_id, request.task_id, request.attempt_id, handle, "cancelled", "cancelled",
-                                  contracts.OutputReference("cancelled"), request.target, request.target, request.target)
+                                  contracts.OutputReference("cancelled"), request.target, request.target, request.target,
+                                  failure=contracts.FailureDetail("cancelled", False),
+                                  plan_version=request.plan_version, workspace=request.workspace)
