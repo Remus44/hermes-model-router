@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from model_router import claude_delegation
+from model_router.host_delegation_fixtures import host_delegation
 from model_router.claude_delegation import (
     TARGET_FOR_TIER,
     TIER_FOR_TARGET,
@@ -1477,7 +1478,8 @@ class RoutingNoteMiddlewareTests(unittest.TestCase):
                    orchestration={"enabled": orchestration, "max_tasks": 2,
                                   "path": str(Path(directory.name) / "orchestration.jsonl")},
                    logging={"enabled": False}, shadow={"enabled": False})
-        with patch.object(claude_delegation, "_ACTIVE", True), \
+        with host_delegation(depth=2), \
+             patch.object(claude_delegation, "_ACTIVE", True), \
              patch.object(usage_guard, "peek", side_effect=lambda account, cfg: _reading(40) if account == "anthropic" else None), \
              patch("model_router._load_config", return_value=cfg), \
              patch("model_router._log_decision"), \

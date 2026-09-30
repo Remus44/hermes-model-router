@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from model_router import _conductor_tier, claude_delegation, route_llm_request
+from model_router.host_delegation_fixtures import host_delegation
 from model_router.test_model_router import CALLABLE, MODELS, chat_request
 
 ACTIONABLE = (
@@ -49,7 +50,8 @@ def _delegating_request(model="claude-sonnet-5-5", tool_name="delegate_task", te
 
 class ExternalParentOrchestrationTests(unittest.TestCase):
     def _route(self, model, cfg, tool_name="delegate_task"):
-        with patch("model_router._load_config", return_value=cfg), \
+        with host_delegation(depth=2), \
+             patch("model_router._load_config", return_value=cfg), \
              patch("model_router._log_decision"), \
              patch("model_router._delegation_target_names", return_value=("sonnet5", "opus5", "qwen")):
             return route_llm_request(
@@ -74,7 +76,7 @@ class ExternalParentOrchestrationTests(unittest.TestCase):
         request = _delegating_request("claude-opus-5-5", "mcp__delegate_task")
         request["tools"] = [{"name": "mcp__delegate_task",
                              "input_schema": request["tools"][0]["parameters"]}]
-        with tempfile.TemporaryDirectory() as d, \
+        with tempfile.TemporaryDirectory() as d, host_delegation(depth=2), \
              patch("model_router._load_config", return_value=_cfg(d)), \
              patch("model_router._log_decision"), \
              patch("model_router._delegation_target_names", return_value=("sonnet5", "opus5", "qwen")):
@@ -183,7 +185,7 @@ class ExplicitDelegationMentionTests(unittest.TestCase):
         # delegate_task, and the router offers it only then.
         request["tools"].append({"type": "function", "name": "delegate_claude",
                                  "parameters": {"type": "object", "properties": {}}})
-        with tempfile.TemporaryDirectory() as d, \
+        with tempfile.TemporaryDirectory() as d, host_delegation(depth=2), \
              patch("model_router._load_config", return_value=_cfg(
                  d, claude_delegation={"enabled": True}, callable={**CALLABLE, "haiku": True})), \
              patch("model_router._log_decision"), \

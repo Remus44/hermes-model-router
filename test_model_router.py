@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from model_router.host_delegation_fixtures import host_delegation
 from model_router import (
     RouteDecision,
     _is_callable_tier,
@@ -114,8 +115,11 @@ class ModelRouterTests(unittest.TestCase):
         self._route_log_patch.start()
         self._config_patch = patch("model_router._load_config", side_effect=default_test_config)
         self._config_patch.start()
+        self._host_delegation = host_delegation(depth=2)
+        self._host_delegation.__enter__()
 
     def tearDown(self):
+        self._host_delegation.__exit__(None, None, None)
         self._config_patch.stop()
         self._route_log_patch.stop()
 

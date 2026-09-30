@@ -1406,26 +1406,34 @@ soft-limit policy, never a remedy for an account's hard limit.
 Usage step-down applies to workers only; it cannot change the parent model.
 
 The tests import the plugin as the `model_router` package (and a few modules by
-their bare name), and the Hermes venv ships neither pytest nor pip, so they run
-under `unittest` from a directory where the repo is linked as `model_router`.
-The full-page dashboard test requires Node.js and `jsdom`; CI must install them
-and expose `jsdom` through `NODE_PATH` before running the suite. Missing either
-dependency fails the test instead of silently skipping the visible-filter check.
-`HOME` and `HERMES_HOME` point at a scratch directory so the run never writes to
-the real Hermes logs; a copy of the Hermes config goes there because some tests
-read it. Both are needed: the plugin resolves `~/.hermes/...` through Hermes's
-home, so with `HOME` alone a machine that sets `HERMES_HOME` — every Windows
-install — would write the test run into the real one.
+bare name), and the Hermes venv ships neither pytest nor pip, so they run under
+`unittest` in a fresh scratch directory. Use the tracked harness rather than
+copying a live Hermes configuration: it writes only a sanitized `delegation`
+section, links the checkout locally, exports `PYTHONDONTWRITEBYTECODE=1`, and
+passes the Python process exit status through unchanged. It resolves the default
+Hermes venv relative to `ROUTER_TEST_PYTHON`; set that variable when the local
+validated interpreter lives elsewhere.
 
 ```bash
-AGENT=~/.hermes/hermes-agent
-RUN=$(mktemp -d)
-mkdir -p "$RUN/home/.hermes" && cp ~/.hermes/config.yaml "$RUN/home/.hermes/"
-ln -s ~/Repositories/hermes-model-router "$RUN/model_router"
-cd "$RUN" && HOME="$RUN/home" HERMES_HOME="$RUN/home/.hermes" \
-  PYTHONPATH="$RUN:$RUN/model_router:$AGENT" \
-  "$AGENT/venv/bin/python" -m unittest discover -s model_router -t . -p 'test_*.py'
+# Full suite
+ROUTER_TEST_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python" \
+  scripts/run_suite.sh --full
+
+# The execution-routing compatibility modules
+ROUTER_TEST_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python" \
+  scripts/run_suite.sh --focused
+
+# Prove user delegation depth does not change the result
+ROUTER_TEST_MAX_SPAWN_DEPTH=2 \
+ROUTER_TEST_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python" \
+  scripts/run_suite.sh --full
 ```
+
+The full-page dashboard test requires Node.js and `jsdom`; the harness exposes a
+nearby Hermes checkout's `node_modules` through `NODE_PATH`. Missing either
+dependency fails the test instead of silently skipping the visible-filter check.
+Test fixtures declare whether they require a depth-one direct-worker topology or
+a depth-two nested conductor, so no test needs the user's `~/.hermes/config.yaml`.
 
 Use a fresh `RUN` for every run. Some tests still write the default orchestration
 log inside that home, and `test_root_parent_is_pinned_when_classifier_wants_sol_worker`

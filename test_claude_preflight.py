@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from model_router import _routing_note, claude_delegation, route_llm_request, usage_guard
+from model_router.host_delegation_fixtures import host_delegation
 from model_router.test_model_router import CALLABLE, MODELS, chat_request
 
 REVIEW = "Review the last commit in ~/Repositories/hermes-model-router for correctness bugs and give me the top 3 findings."
@@ -61,7 +62,7 @@ def _names(request):
 
 class ForcedPreflightTests(unittest.TestCase):
     def _route(self, request, claude=True, model="claude-opus-5-5", provider="anthropic"):
-        with tempfile.TemporaryDirectory() as d, \
+        with tempfile.TemporaryDirectory() as d, host_delegation(depth=2), \
              patch("model_router._load_config", return_value=_cfg(d, claude)), \
              patch("model_router._log_decision"), \
              patch("model_router._hermes_delegation_target_names", return_value=("sonnet5", "opus5")), \

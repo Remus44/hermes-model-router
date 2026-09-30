@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from model_router import RouteDecision, _log_decision, route_llm_request, run_llm_with_transient_failover
+from model_router.host_delegation_fixtures import host_delegation
 
 
 MODELS = {
@@ -39,6 +40,9 @@ class CallableGuardTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.tmp_path = Path(directory.name)
+        self._host_delegation = host_delegation(depth=2)
+        self._host_delegation.__enter__()
+        self.addCleanup(self._host_delegation.__exit__, None, None, None)
 
     def test_disabled_opus5_skips_bridge_before_import_or_auth(self):
         cfg = config(
@@ -302,6 +306,9 @@ class QwenOrchestratorPreflightTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.tmp_path = Path(directory.name)
+        self._host_delegation = host_delegation(depth=2)
+        self._host_delegation.__enter__()
+        self.addCleanup(self._host_delegation.__exit__, None, None, None)
 
     def test_qwen_preflight_keeps_the_full_toolset(self):
         """TokenPlan rejects ``tool_choice`` entirely, so the preflight cannot be
