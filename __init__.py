@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - Hermes includes PyYAML
 
 from . import claude_delegation
 from . import runtime_capabilities
+from . import target_identity
 from . import usage_guard
 from . import worker_admission
 from .hermes_paths import hermes_path
@@ -3401,6 +3402,32 @@ def runtime_diagnostic(
     cfg = _load_config() if cfg is None else cfg
     snap = runtime_capabilities.snapshot(request, cfg)
     return runtime_capabilities.diagnostic(snap, topology, transport)
+
+
+def _read_host_config() -> Dict[str, Any]:
+    """The host's config.yaml as a dict, read-only; ``{}`` when absent or unreadable."""
+    if yaml is None:
+        return {}
+    try:
+        raw = yaml.safe_load(_HERMES_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def identity_diagnostic(
+    cfg: Optional[Dict[str, Any]] = None,
+    observed: Optional[Dict[str, Any]] = None,
+    request: Any = None,
+) -> Dict[str, Any]:
+    """Read-only S02 view: which config owner names which Claude model, per tier.
+
+    Reads router config and the host config file; no network, subprocess, model
+    call or write, and it is not on the routing hot path.
+    """
+    cfg = _load_config() if cfg is None else cfg
+    snap = runtime_capabilities.snapshot(request, cfg)
+    return target_identity.drift_diagnostic(cfg, _read_host_config(), observed, snap)
 
 
 def _orchestration_skip_reason(

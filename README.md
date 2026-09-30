@@ -1202,6 +1202,25 @@ config, so any change invalidates them. A snapshot is evidence, not admission:
 fresh admission is still required immediately before execution. The diagnostic
 is not called on the routing path, so existing routing decisions are unchanged.
 
+### Target identity and configuration drift
+
+`execution_contracts.py` holds the frozen target-identity record: provider/account,
+transport, operator alias, requested/resolved/observed model (each with its evidence
+source), selection mode (`exact` or `profile_preferred`) and effort (requested/applied,
+with explicit `unknown`/`not_applicable`). `exact` is never substituted silently: a
+disagreement is a typed `ExactRouteMismatch` (failure class `exact-route-mismatch`);
+`profile_preferred` records the substitution. `target_identity.resolve_target()` builds
+the record from router config, `claude_delegation.tiers`, the host's named targets and
+the CLI alias map, cached by a fingerprint (30 s, 16 entries, locked) so a changed
+alias, tier or capability invalidates it. The Claude CLI is invoked with an alias, so
+its resolved identity is that alias; exact canonical CLI selection is `unsupported`
+unless `runtime_capabilities` reports `exact_model` as `supported`.
+
+`model_router.identity_diagnostic()` is a read-only, no-network view that lists each
+config owner's value per Claude tier and flags drift and observed mismatches.
+`target_identity.propose_host_migration()` returns an optional unified diff for
+`~/.hermes/config.yaml`; nothing is ever applied. No routing behaviour changes.
+
 ## Usage
 
 ### Explicit Model Override
