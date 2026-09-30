@@ -1,5 +1,6 @@
 """Shared host-delegation fixtures declare topology and schema assumptions."""
 
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -15,20 +16,33 @@ class HostDelegationFixtureTests(unittest.TestCase):
         self.assertEqual(limits["max_spawn_depth"], 1)
         self.assertFalse(limits["conductor_available"])
 
-    def test_depth_one_still_permits_a_direct_worker_call(self):
+    def test_depth_one_records_parent_direct_worker_topology(self):
         from model_router.host_delegation_fixtures import host_delegation
+        from model_router.test_external_orchestrator import _cfg, _delegating_request
 
-        cfg = {"callable": {"terra": True}}
-        direct_worker = {"tasks": [{"goal": "Inspect the parser.", "context": "Read-only evidence."}]}
-        with host_delegation(depth=1), patch("model_router._load_config", return_value=cfg):
-            self.assertIsNone(router.on_pre_tool_call(tool_name="delegate_task", args=direct_worker))
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = _cfg(directory)
+            cfg["orchestration"]["min_chars"] = 1
+            kwargs = {"request": _delegating_request(), "api_call_count": 1, "turn_id": "root"}
+            decision = router.RouteDecision("terra", cfg["models"]["terra"], "test", "test")
+            with host_delegation(depth=1), patch("model_router._delegation_target_names", return_value=("terra",)):
+                reason = router._orchestration_skip_reason(kwargs, cfg, decision)
 
-    def test_depth_two_exposes_a_conductor(self):
+        self.assertEqual(reason, "host_has_no_conductor_depth; parent_delegates_direct_workers")
+
+    def test_depth_two_makes_the_same_parent_eligible_for_a_conductor(self):
         from model_router.host_delegation_fixtures import host_delegation
+        from model_router.test_external_orchestrator import _cfg, _delegating_request
 
-        with host_delegation(depth=2):
-            limits = router._host_delegation_limits()
-        self.assertTrue(limits["conductor_available"])
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = _cfg(directory)
+            cfg["orchestration"]["min_chars"] = 1
+            kwargs = {"request": _delegating_request(), "api_call_count": 1, "turn_id": "root"}
+            decision = router.RouteDecision("terra", cfg["models"]["terra"], "test", "test")
+            with host_delegation(depth=2), patch("model_router._delegation_target_names", return_value=("terra",)):
+                reason = router._orchestration_skip_reason(kwargs, cfg, decision)
+
+        self.assertIsNone(reason)
 
     def test_batch_only_and_model_param_schemas_are_distinct_capabilities(self):
         from model_router.host_delegation_fixtures import delegate_task_request
