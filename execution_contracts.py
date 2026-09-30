@@ -117,13 +117,13 @@ def check_exact(identity: TargetIdentity) -> Optional[ExactRouteMismatch]:
     """The mismatch an exact identity carries, if any; always None for preferred.
 
     The observed model is the strongest evidence, so it is checked first. A
-    resolved value counts only when it is canonical: a CLI alias argument is not
-    evidence of the served model.
+    resolved or observed value counts only when it is canonical: a CLI alias
+    argument is not evidence of the served model.
     """
     if identity.selection_mode != SELECTION_EXACT or not identity.requested.known:
         return None
     wanted = identity.requested
-    if identity.observed.known and identity.observed.value != wanted.value:
+    if identity.observed.known and identity.observed.canonical and identity.observed.value != wanted.value:
         actual, stage = identity.observed, "observed"
     elif identity.resolved.known and identity.resolved.canonical and identity.resolved.value != wanted.value:
         actual, stage = identity.resolved, "resolved"

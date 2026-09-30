@@ -207,8 +207,8 @@ class ResolutionTests(Base):
             res = self.resolve("sonnet", "claude_cli", selection_mode="exact",
                                snapshot=cli_exact_snapshot(status))
             self.assertEqual(res.status, expected, status)
-        self.assertEqual(res.identity.resolved.value, "claude-sonnet-5-5")
-        self.assertTrue(res.identity.resolved.canonical)
+        # No evidence names the canonical served model yet: it stays unknown.
+        self.assertFalse(res.identity.resolved.known)
 
     def test_cli_preferred_is_resolved_with_alias_unverified_note(self):
         res = self.resolve("opus", "claude_cli")
@@ -409,6 +409,140 @@ class RouterEntrypointAndMigrationTests(Base):
     def test_migration_is_empty_when_nothing_drifts(self):
         self.assertEqual(identity.propose_host_migration(HOST_YAML.replace(
             "claude-sonnet-5\n", "claude-sonnet-5-5\n"), self.cfg), "")
+
+
+class FixRound1Tests(Base):
+    def test_drift_reports_codex_alias_model_disagreement_with_owners(self):
+        self.host["delegation"]["targets"]["terra"]["model"] = "gpt-5.5-terra"
+        diag = identity.drift_diagnostic(self.cfg, self.host)
+        found = [f for f in diag["findings"] if f.get("alias") == "terra"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["kind"], "config_drift")
+        self.assertEqual(found[0]["expected"]["owner"], "router_config")
+        self.assertEqual(found[0]["expected"]["key"], "models.terra")
+        self.assertEqual(found[0]["disagreeing"][0]["owner"], "host_config")
+        self.assertEqual(found[0]["disagreeing"][0]["key"], "delegation.targets.terra.model")
+        self.assertEqual(found[0]["disagreeing"][0]["value"], "gpt-5.5-terra")
+        json.dumps(diag)
+
+    def test_drift_reports_provider_disagreement_with_owners(self):
+        self.host["delegation"]["targets"]["terra"]["provider"] = "openai"
+        self.host["delegation"]["targets"]["sonnet5"]["provider"] = "bedrock"
+        diag = identity.drift_diagnostic(self.cfg, self.host)
+        found = {f["alias"]: f for f in diag["findings"] if f["kind"] == "provider_drift"}
+        self.assertEqual(set(found), {"terra", "sonnet5"})
+        self.assertEqual(found["terra"]["expected"],
+                         {"owner": "router_config", "key": "tier_providers.terra", "value": "openai-codex"})
+        self.assertEqual(found["terra"]["disagreeing"][0],
+                         {"owner": "host_config", "key": "delegation.targets.terra.provider", "value": "openai"})
+
+    def test_aligned_codex_aliases_produce_no_alias_finding(self):
+        diag = identity.drift_diagnostic(self.cfg, self.host)
+        self.assertFalse([f for f in diag["findings"] if f.get("alias") == "terra"])
+
+    def test_cli_exact_supported_does_not_copy_requested_into_resolved(self):
+        res = self.resolve("sonnet", "claude_cli", selection_mode="exact",
+                           snapshot=cli_exact_snapshot("supported"))
+        self.assertEqual(res.status, "resolved")
+        self.assertFalse(res.identity.resolved.known)
+        self.assertNotEqual(res.identity.resolved.source, "cli_canonical_model_argument")
+
+    def test_cli_exact_supported_with_differing_requested_model_is_a_mismatch(self):
+        res = self.resolve("sonnet", "claude_cli", selection_mode="exact", requested_model="claude-sonnet-5",
+                           snapshot=cli_exact_snapshot("supported"))
+        self.assertEqual(res.status, "exact_mismatch")
+        self.assertEqual(res.mismatch.stage, "resolved")
+        self.assertEqual((res.mismatch.requested, res.mismatch.actual), ("claude-sonnet-5", "claude-sonnet-5-5"))
+        self.assertIn("cli_alias_map", res.mismatch.actual_source)
+
+    def test_exact_without_known_requested_model_is_unsupported(self):
+        del self.cfg["models"]["terra"]
+        res = self.resolve("terra", "hermes_codex", selection_mode="exact")
+        self.assertEqual(res.status, "unsupported")
+        self.assertEqual(res.failure_class, "capability")
+        self.assertFalse(res.identity.requested.known)
+        preferred = self.resolve("terra", "hermes_codex")
+        self.assertEqual(preferred.status, "resolved")
+        self.assertFalse(preferred.identity.requested.known)
+
+    def test_verify_observed_alias_shaped_value_is_not_canonical_evidence(self):
+        exact = self.resolve("opus5", "hermes_claude", selection_mode="exact").identity
+        seen, mismatch, substitution = identity.verify_observed(exact, "sonnet", "cli_payload")
+        self.assertFalse(seen.observed.canonical)
+        self.assertIsNone(mismatch)
+        self.assertIsNone(substitution)
+        seen, mismatch, _ = identity.verify_observed(exact, "claude-sonnet-5", None)
+        self.assertEqual(mismatch.stage, "observed")
+
+
+MIGRATION_YAML = """model:
+  default: claude-sonnet-5
+  provider: anthropic
+auxiliary:
+  compression:
+    provider: openrouter
+    model: claude-sonnet-5
+delegation:
+  model: claude-sonnet-5
+  provider: anthropic
+  fallback_providers:
+  - provider: anthropic
+    model: "claude-sonnet-5"
+  - provider: openrouter
+    model: claude-sonnet-5
+  targets:
+    sonnet5:
+      provider: anthropic
+      model: 'claude-sonnet-5'   # quoted
+    other:
+      provider: openrouter
+      model: claude-sonnet-5
+    opus5:
+      provider: anthropic
+      model: claude-opus-5-5
+"""
+
+
+class MigrationStructureTests(Base):
+    def test_only_anthropic_named_targets_and_fallbacks_are_rewritten(self):
+        diff = identity.propose_host_migration(MIGRATION_YAML, self.cfg)
+        new = self.apply(diff)
+        self.assertIn("  default: claude-sonnet-5-5\n", new)
+        self.assertIn('    model: "claude-sonnet-5-5"\n', new)
+        self.assertIn("      model: 'claude-sonnet-5-5'   # quoted\n", new)
+        self.assertIn("auxiliary:\n  compression:\n    provider: openrouter\n    model: claude-sonnet-5\n", new)
+        self.assertIn("delegation:\n  model: claude-sonnet-5\n", new)
+        self.assertIn("    other:\n      provider: openrouter\n      model: claude-sonnet-5\n", new)
+        self.assertIn("  - provider: openrouter\n    model: claude-sonnet-5\n", new)
+        self.assertEqual(new.count("claude-sonnet-5-5"), 3)
+
+    def test_diff_is_a_full_applyable_unified_diff(self):
+        diff = identity.propose_host_migration(MIGRATION_YAML, self.cfg)
+        self.assertTrue(diff.startswith("--- config.yaml\n+++ config.yaml (proposed)\n@@ "))
+        self.assertEqual(self.apply(diff).count("claude-sonnet-5-5"), 3)
+
+    def apply(self, diff):
+        """Minimal unified-diff applier: proves the hunks carry real context."""
+        import re
+        old = MIGRATION_YAML.splitlines(keepends=True)
+        out, pos = [], 0
+        lines = diff.splitlines(keepends=True)[2:]
+        i = 0
+        while i < len(lines):
+            start = int(re.match(r"@@ -(\d+)", lines[i]).group(1)) - 1
+            out.extend(old[pos:start])
+            pos = start
+            i += 1
+            while i < len(lines) and not lines[i].startswith("@@"):
+                tag, body = lines[i][0], lines[i][1:]
+                if tag in " -":
+                    self.assertEqual(old[pos], body)
+                    pos += 1
+                if tag in " +":
+                    out.append(body)
+                i += 1
+        out.extend(old[pos:])
+        return "".join(out)
 
 
 class ContractHelpersTests(unittest.TestCase):

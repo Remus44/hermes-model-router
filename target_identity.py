@@ -171,7 +171,13 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
                 return refuse(ModelFact(tier, "cli_alias_argument", canonical=False), provider,
                               f"exact canonical CLI selection needs exact_model evidence; status {status}"
                               + (f" ({why})" if why else ""))
-            resolved = ModelFact(requested.value, "cli_canonical_model_argument")
+            resolved = ModelFact()
+            if requested.source == "operator_request":
+                # Evidence is the bridge's alias map, never the operator's own ask.
+                resolved = ModelFact(cli_map[tier],
+                                     f"cli_alias_map:claude_opus_bridge.CLAUDE_REVIEW_MODELS.{tier}")
+            else:
+                reasons.append("CLI canonical model is not verified until observed")
         else:
             resolved = ModelFact(tier, "cli_alias_argument", canonical=False)
             reasons.append(f"CLI alias {tier!r} to canonical model is not verified until observed")
@@ -192,9 +198,8 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
         resolved = ModelFact(host_hit[0], host_hit[2])
 
     identity = build(resolved, provider)
-    if not requested.known:
-        requested = ModelFact(resolved.value, resolved.source) if resolved.canonical else requested
-        identity = build(resolved, provider)
+    if mode == SELECTION_EXACT and not requested.known:
+        return refuse(resolved, provider, "exact selection has no known requested model identity")
     mismatch = check_exact(identity)
     if mismatch:
         return ResolutionResult(identity, EXACT_MISMATCH, FAILURE_EXACT_ROUTE_MISMATCH,
@@ -260,14 +265,19 @@ def verify_observed(identity: TargetIdentity, observed_model: str, source: str
                     ) -> Tuple[TargetIdentity, Optional[ExactRouteMismatch], Optional[Dict[str, Any]]]:
     """Attach per-call observed evidence: (identity, exact mismatch, recorded substitution)."""
     from dataclasses import replace
-    seen = replace(identity, observed=ModelFact(str(observed_model or UNKNOWN) or UNKNOWN, source))
+    value = str(observed_model or UNKNOWN).strip() or UNKNOWN
+    aliases = ({t.casefold() for t in claude_delegation.TIERS} | set(claude_delegation.TIER_FOR_TARGET)
+               | {k.casefold() for k in _cli_alias_map()})
+    # An alias-shaped value (``sonnet``) names a request, not a served model.
+    seen = replace(identity, observed=ModelFact(value, str(source or "unspecified"),
+                                                canonical=value.casefold() not in aliases))
     mismatch = check_exact(seen)
     substitution = None
-    if (identity.selection_mode == SELECTION_PREFERRED and seen.observed.known
+    if (identity.selection_mode == SELECTION_PREFERRED and seen.observed.known and seen.observed.canonical
             and identity.requested.known and seen.observed.value != identity.requested.value):
         substitution = {"policy": SELECTION_PREFERRED, "requested": identity.requested.value,
                         "requested_source": identity.requested.source,
-                        "observed": seen.observed.value, "observed_source": source,
+                        "observed": seen.observed.value, "observed_source": seen.observed.source,
                         "reason": "observed model differs from the requested model"}
     return seen, mismatch, substitution
 
@@ -309,6 +319,41 @@ def _host_claude_values(host_cfg: Mapping[str, Any]) -> List[Tuple[str, str, str
     return found
 
 
+def _alias_findings(cfg: Mapping[str, Any], host_cfg: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Router aliases versus the host's same-named delegation target (model and provider).
+
+    Claude-tier models are compared per tier by the caller; here every router
+    ``models.<alias>`` (non-Claude-tier) and every ``tier_providers.<alias>`` is
+    checked against ``delegation.targets.<alias>``, naming both owning configs.
+    """
+    findings: List[Dict[str, Any]] = []
+    models = (cfg or {}).get("models") or {}
+    providers = (cfg or {}).get("tier_providers") or {}
+    models = models if isinstance(models, dict) else {}
+    providers = providers if isinstance(providers, dict) else {}
+    for alias in dict.fromkeys([*models, *providers]):
+        name = str(alias).strip().casefold()
+        hit = _host_target(host_cfg, name)
+        if not hit:
+            continue
+        host_model, host_provider, host_key = hit
+        host_key = host_key.split(":", 1)[1] if ":" in host_key else host_key
+        model = str(models.get(alias) or "").strip()
+        if model and name not in claude_delegation.TIER_FOR_TARGET and host_model != model:
+            findings.append({"kind": "config_drift", "alias": name,
+                             "expected": {"owner": "router_config", "key": f"models.{alias}", "value": model},
+                             "disagreeing": [{"owner": "host_config", "key": host_key, "value": host_model}]})
+        provider = str(providers.get(alias) or "").strip()
+        if provider and host_provider and host_provider != provider.casefold():
+            findings.append({"kind": "provider_drift", "alias": name,
+                             "expected": {"owner": "router_config", "key": f"tier_providers.{alias}",
+                                          "value": provider},
+                             "disagreeing": [{"owner": "host_config",
+                                              "key": host_key.rsplit(".", 1)[0] + ".provider",
+                                              "value": host_provider}]})
+    return findings
+
+
 def drift_diagnostic(cfg: Mapping[str, Any], host_cfg: Optional[Mapping[str, Any]] = None,
                      observed: Optional[Mapping[str, Sequence[Tuple[str, str]]]] = None,
                      snapshot: Optional[runtime_capabilities.RuntimeSnapshot] = None) -> Dict[str, Any]:
@@ -345,6 +390,7 @@ def drift_diagnostic(cfg: Mapping[str, Any], host_cfg: Optional[Mapping[str, Any
                 if expected and m != expected["value"]]
         if seen:
             findings.append({"kind": "observed_mismatch", "tier": tier, "expected": expected, "observed": seen})
+    findings.extend(_alias_findings(cfg, host_cfg))
     status, reason = _cli_exact_capability(snapshot, cfg)
     return {"schema_version": SCHEMA_VERSION, "network_used": False,
             "host_config": {"available": bool(host_cfg)},
@@ -352,23 +398,73 @@ def drift_diagnostic(cfg: Mapping[str, Any], host_cfg: Optional[Mapping[str, Any
             "tiers": tiers, "findings": findings}
 
 
-_MODEL_LINE = re.compile(r"^(\s*(?:model|default):\s*)([^\s#]+)(.*)$")
+try:
+    import yaml
+except ImportError:  # pragma: no cover - Hermes includes PyYAML
+    yaml = None
+
+
+def _map_get(node: Any, key: str) -> Any:
+    """The value node for ``key`` in a YAML mapping node, else None."""
+    if yaml is None or not isinstance(node, yaml.MappingNode):
+        return None
+    for k, v in node.value:
+        if isinstance(k, yaml.ScalarNode) and k.value == key:
+            return v
+    return None
+
+
+def _scalar(node: Any) -> str:
+    return node.value if yaml is not None and isinstance(node, yaml.ScalarNode) else ""
+
+
+def _anthropic_model_nodes(root: Any) -> List[Any]:
+    """Scalar model nodes of anthropic entries in the host's named targets, fallbacks and parent default."""
+    entries: List[Any] = []  # (mapping node, key holding the model)
+    delegation = _map_get(root, "delegation")
+    targets = _map_get(delegation, "targets")
+    if yaml is not None and isinstance(targets, yaml.MappingNode):
+        entries.extend((v, "model") for _, v in targets.value)
+    for owner in (root, delegation):
+        fallbacks = _map_get(owner, "fallback_providers")
+        if yaml is not None and isinstance(fallbacks, yaml.SequenceNode):
+            entries.extend((item, "model") for item in fallbacks.value)
+    entries.append((_map_get(root, "model"), "default"))
+    nodes = []
+    for entry, key in entries:
+        node = _map_get(entry, key)
+        if _scalar(_map_get(entry, "provider")).strip().casefold() == "anthropic" and _scalar(node):
+            nodes.append(node)
+    return nodes
 
 
 def propose_host_migration(host_text: str, cfg: Mapping[str, Any]) -> str:
     """Unified diff aligning drifting host Claude models with the router's tier models.
 
     Text only: nothing is applied or written. Empty string when nothing drifts.
-    Only ``model:``/``default:`` lines holding a Claude model of a tier family
-    that differs from that tier's router-owned model are proposed.
+    Structural: the YAML is parsed and only the model scalar of an ``anthropic``
+    entry in ``delegation.targets.*``, ``fallback_providers[*]``,
+    ``delegation.fallback_providers[*]`` or the parent ``model.default`` is edited,
+    in place (quotes and trailing comments kept), when it holds a Claude model of
+    a tier family that differs from that tier's router-owned model.
     """
+    if yaml is None:
+        return ""
+    try:
+        root = yaml.compose(host_text)
+    except yaml.YAMLError:
+        return ""
     expected = {tier: _tier_model(tier, cfg)[0] for tier in claude_delegation.TIERS}
     old = host_text.splitlines(keepends=True)
-    new: List[str] = []
-    for line in old:
-        match = _MODEL_LINE.match(line.rstrip("\n"))
-        tier = _family(match.group(2)) if match else None
-        if match and tier and expected.get(tier) and match.group(2) != expected[tier]:
-            line = f"{match.group(1)}{expected[tier]}{match.group(3)}" + ("\n" if line.endswith("\n") else "")
-        new.append(line)
+    new = list(old)
+    for node in _anthropic_model_nodes(root):
+        tier = _family(node.value)
+        want = expected.get(tier)
+        mark, end = node.start_mark, node.end_mark
+        if not (tier and want and node.value.strip() != want and mark.line == end.line):
+            continue
+        quote = node.style if node.style in ("'", '"') else ""
+        line = new[mark.line]
+        new[mark.line] = line[:mark.column] + quote + want + quote + line[end.column:]
     return "".join(difflib.unified_diff(old, new, "config.yaml", "config.yaml (proposed)"))
+
