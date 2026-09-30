@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from claude_opus_bridge import CANONICAL_OPUS_MODEL, classify_coding_dispatch, classify_review_dispatch, dispatch
+from claude_opus_bridge import (CANONICAL_OPUS_MODEL, ClaudeBridgeFailure, classify_coding_dispatch,
+                                classify_review_dispatch, dispatch)
 
 
 class ClaudeOpusBridgeTests(unittest.TestCase):
@@ -106,8 +107,9 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
     def test_timeout_is_terminal_and_has_highest_precedence(self, run, log):
         with tempfile.TemporaryDirectory() as directory:
             lifecycle = Path(directory) / "bridge.jsonl"
-            with self.assertRaisesRegex(RuntimeError, "timed out"):
+            with self.assertRaises(ClaudeBridgeFailure) as raised:
                 dispatch("[opus-review] Review only", Path(directory), review=True, timeout=1, lifecycle_path=lifecycle)
+            self.assertEqual(raised.exception.failure_kind, "timeout")
             events = lifecycle.read_text().splitlines()
             terminal = json.loads(events[-1])
         self.assertEqual(terminal["state"], "timeout")
@@ -122,13 +124,40 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
                 run.return_value.stderr = "CLI error"
                 run.return_value.stdout = stdout
                 lifecycle = Path(directory) / "bridge.jsonl"
-                with self.assertRaisesRegex(RuntimeError, "result object"):
+                with self.assertRaises(ClaudeBridgeFailure) as raised:
                     dispatch("[opus-review] Review parser", Path(directory), review=True, lifecycle_path=lifecycle)
+                self.assertEqual(raised.exception.failure_kind, "malformed-json")
                 events = [json.loads(line) for line in lifecycle.read_text().splitlines()]
             self.assertEqual([event["event"] for event in events], ["started", "terminal"])
             self.assertEqual(events[-1]["state"], "error")
             self.assertTrue(events[-1]["malformed"])
             self.assertEqual(events[-1]["returncode"], 1)
+        log.assert_not_called()
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
+    def test_cli_failures_are_typed_and_keep_one_terminal_lifecycle_record(self, run, log):
+        cases = (
+            ("max-turn", {"subtype": "error_max_turns", "is_error": True,
+                           "modelUsage": {CANONICAL_OPUS_MODEL: {}}}, 0),
+            ("budget", {"subtype": "error_budget", "is_error": True,
+                        "modelUsage": {CANONICAL_OPUS_MODEL: {}}}, 0),
+            ("nonzero-exit", {"modelUsage": {CANONICAL_OPUS_MODEL: {}}}, 2),
+            ("model-mismatch", {"modelUsage": {"claude-sonnet-5": {}}, "result": "no"}, 0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for expected, payload, returncode in cases:
+                with self.subTest(expected=expected):
+                    lifecycle = Path(directory) / f"{expected}.jsonl"
+                    run.return_value.returncode = returncode
+                    run.return_value.stderr = "CLI error"
+                    run.return_value.stdout = json.dumps(payload)
+                    with self.assertRaises(ClaudeBridgeFailure) as raised:
+                        dispatch("[opus-review] Review parser", Path(directory), review=True,
+                                 lifecycle_path=lifecycle)
+                    self.assertEqual(raised.exception.failure_kind, expected)
+                    events = [json.loads(line) for line in lifecycle.read_text().splitlines()]
+                    self.assertEqual([event["event"] for event in events], ["started", "terminal"])
         log.assert_not_called()
 
     @patch("claude_opus_bridge._log_decision")

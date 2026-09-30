@@ -58,6 +58,22 @@ DEFAULT_CODING_MAX_TURNS = 8
 # wall time bounded but allow the configured 16-turn/$5 contract to finish.
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 600
 DEFAULT_CODING_TIMEOUT_SECONDS = 300
+
+
+class ClaudeBridgeFailure(RuntimeError):
+    """A terminal CLI outcome with typed failure evidence for the caller."""
+
+    def __init__(self, message: str, failure_kind: str, *, identity: Any = None,
+                 mismatch: Any = None) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.failure_class = "exact-route-mismatch" if failure_kind == "model-mismatch" else (
+            "timeout" if failure_kind == "timeout" else "execution-error"
+        )
+        self.identity = identity
+        self.mismatch = mismatch
+
+
 CODING_SIGNAL = re.compile(
     r"\b(implement|debug|fix|refactor|patch|test|code|repository|repo|"
     r"backend|api|parser|router|middleware|python|javascript|typescript|"
@@ -108,6 +124,9 @@ def classify_review_dispatch(task: str) -> tuple[bool, str]:
 
 def _effective_model(payload: dict[str, Any], expected: str = CANONICAL_OPUS_MODEL) -> str:
     """Return Claude Code's actual served model, never the requested alias."""
+    reported = payload.get("model")
+    if isinstance(reported, str) and reported.strip():
+        return reported.strip()
     usage = payload.get("modelUsage") or {}
     if isinstance(usage, dict):
         # Claude Code can report small internal/helper usage alongside the main
@@ -167,7 +186,7 @@ def _terminal_state(payload: dict[str, Any] | None, *, timeout: bool = False, ma
 def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False, timeout: int | None = None,
              max_turns: int | None = None, model: str | None = None, max_budget_usd: float = 5.0,
              requested_alias: str | None = None, adjustment: str = "",
-             parent_session_id: str | None = None, parent_turn_id: str | None = None,
+             identity: Any = None, parent_session_id: str | None = None, parent_turn_id: str | None = None,
              lifecycle_path: Path | None = None) -> dict[str, Any]:
     if review and write:
         raise ValueError("a Claude review is always read-only")
@@ -189,6 +208,9 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     if requested_alias not in CLAUDE_REVIEW_MODELS:
         raise ValueError(f"unknown requested Claude tier {requested_alias!r}")
     expected_model = CLAUDE_REVIEW_MODELS[alias]
+    if identity is not None and getattr(getattr(identity, "requested", None), "known", False):
+        expected_model = str(identity.requested.value)
+    model_argument = expected_model if getattr(identity, "selection_mode", "") == "exact" else alias
     if not repo.is_dir():
         raise ValueError(f"repository directory does not exist: {repo}")
     resolved_max_turns = max_turns if max_turns is not None else (DEFAULT_REVIEW_MAX_TURNS if review else DEFAULT_CODING_MAX_TURNS)
@@ -215,7 +237,7 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     # E2BIG/"Argument list too long". Claude Code's print mode accepts text on
     # stdin when no positional prompt is supplied.
     command = [
-        "claude", "-p", "--model", alias,
+        "claude", "-p", "--model", model_argument,
         "--max-turns", str(resolved_max_turns), "--max-budget-usd", f"{budget:.2f}", "--output-format", "json",
     ]
     # Results are accepted only when Claude reports the requested canonical tier.
@@ -245,7 +267,7 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     except subprocess.TimeoutExpired as exc:
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "timeout",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at})
-        raise RuntimeError("Claude Code timed out") from exc
+        raise ClaudeBridgeFailure("Claude Code timed out", "timeout", identity=identity) from exc
     except OSError:
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "error",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at})
@@ -256,12 +278,12 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "error",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at,
                                           "malformed": True, "returncode": completed.returncode})
-        raise RuntimeError("Claude Code did not return JSON output") from exc
+        raise ClaudeBridgeFailure("Claude Code did not return JSON output", "malformed-json", identity=identity) from exc
     if not isinstance(payload, dict):
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "error",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at,
                                           "malformed": True, "returncode": completed.returncode})
-        raise RuntimeError("Claude Code did not return a JSON result object")
+        raise ClaudeBridgeFailure("Claude Code did not return a JSON result object", "malformed-json", identity=identity)
     effective_model = _effective_model(payload, expected_model)
     state = _terminal_state(payload, returncode=completed.returncode, expected_model=expected_model)
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
@@ -274,16 +296,31 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
         "total_cost_usd": payload.get("total_cost_usd"),
     })
+    observed_identity, mismatch, substitution = identity, None, None
+    if identity is not None:
+        from .target_identity import verify_observed
+        observed_identity, mismatch, substitution = verify_observed(
+            identity, effective_model, "claude_cli.result.modelUsage",
+        )
     if state == "max-turn":
-        raise RuntimeError("Claude Code reached max turns")
+        raise ClaudeBridgeFailure("Claude Code reached max turns", "max-turn", identity=observed_identity)
     if state == "budget":
-        raise RuntimeError("Claude Code exhausted its budget")
+        raise ClaudeBridgeFailure("Claude Code exhausted its budget", "budget", identity=observed_identity)
     if completed.returncode:
-        raise RuntimeError(f"Claude Code failed with exit {completed.returncode}: {completed.stderr.strip()[:500]}")
-    if effective_model != expected_model:
-        raise RuntimeError(f"Claude Code did not serve {expected_model}; effective model was {effective_model or 'missing'}")
+        raise ClaudeBridgeFailure(
+            f"Claude Code failed with exit {completed.returncode}: {completed.stderr.strip()[:500]}",
+            "nonzero-exit", identity=observed_identity,
+        )
+    if effective_model != expected_model or mismatch:
+        raise ClaudeBridgeFailure(
+            f"Claude Code did not serve {expected_model}; effective model was {effective_model or 'missing'}",
+            "model-mismatch", identity=observed_identity, mismatch=mismatch,
+        )
     if state != "success":
-        raise RuntimeError(f"Claude Code failed with subtype {payload.get('subtype') or 'unknown'}")
+        raise ClaudeBridgeFailure(
+            f"Claude Code failed with subtype {payload.get('subtype') or 'unknown'}",
+            "execution-error", identity=observed_identity,
+        )
     cfg = _load_config()
     _log_decision(
         RouteDecision("sonnet5" if alias == "sonnet" else "opus5", effective_model,
@@ -291,7 +328,11 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         {"turn_id": f"{bridge_run_id}:{payload.get('num_turns', 1)}", "api_call_count": payload.get("num_turns", 1), "request": {}},
         cfg,
     )
-    return {"bridge_run_id": bridge_run_id, "effective_model": effective_model, "reason": reason, "result": payload.get("result", ""), "num_turns": payload.get("num_turns"), "total_cost_usd": payload.get("total_cost_usd")}
+    return {"bridge_run_id": bridge_run_id, "effective_model": effective_model, "reason": reason,
+            "result": payload.get("result", ""), "num_turns": payload.get("num_turns"),
+            "total_cost_usd": payload.get("total_cost_usd"),
+            "identity": observed_identity.as_dict() if observed_identity is not None else None,
+            "substitution": substitution}
 
 
 def main() -> int:

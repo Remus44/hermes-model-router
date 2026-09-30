@@ -292,7 +292,13 @@ Hermes update; re-running Hermes's own update/install step resolves it.
 A read-only CLI bridge also exists (`[opus-review]` / `[sonnet-review]`,
 `coding_agent.delegated_review`). It replaces a single call rather than running
 an agent, so it cannot write and holds a child slot for the duration; the native
-target above supersedes it for ordinary work.
+target above supersedes it for ordinary work. CLI review identity is recorded as
+requested, resolved and observed: a CLI alias is not proof of the served model.
+An `exact` review requires recorded `exact_model` capability evidence and is
+refused before the CLI starts when that evidence is absent. The default
+`profile_preferred` review may use the configured ordinary provider route after
+an attempted CLI failure, but its child prompt and Claude audit record the typed
+failure and replacement tier/model; that response is not a Claude review.
 
 ### A parent on a fallback account still orchestrates
 

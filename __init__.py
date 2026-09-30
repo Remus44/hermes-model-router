@@ -4823,7 +4823,7 @@ def _verified_delegated_claude_review(text: str, cfg: Dict[str, Any], *, request
 
 def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False, cfg: Dict[str, Any],
                       model: Optional[str] = None, requested_alias: Optional[str] = None,
-                      adjustment: str = "", **context: Any) -> Dict[str, Any]:
+                      adjustment: str = "", identity: Any = None, **context: Any) -> Dict[str, Any]:
     """Lazy bridge import keeps the standalone CLI and package imports independent."""
     from .claude_opus_bridge import dispatch
 
@@ -4836,6 +4836,7 @@ def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False
         model=model,
         requested_alias=requested_alias,
         adjustment=adjustment,
+        identity=identity,
         timeout=int(coding_cfg.get("timeout_seconds", 300)),
         max_turns=(coding_cfg.get("delegated_review") or {}).get("max_turns") if review else coding_cfg.get("max_turns"),
         max_budget_usd=coding_cfg.get("max_budget_usd", 5.0),
@@ -4894,6 +4895,25 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
     requested_alias = review_model_alias(routing_text) or "opus"
     adjustment = ""
 
+    def ordinary_replacement(error: BaseException) -> Dict[str, Any]:
+        message = str(error).casefold()
+        failure_kind = str(getattr(error, "failure_kind", "")) or (
+            "max-turn" if "max turn" in message else "budget" if "budget" in message
+            else "timeout" if "timed out" in message else "malformed-json" if "json" in message
+            else "nonzero-exit" if "exit " in message else "execution-error"
+        )
+        model = str(request.get("model") or "")
+        tier = next((name for name, candidate in (cfg.get("models") or {}).items()
+                     if str(candidate) == model), "ordinary")
+        return {
+            "policy": "legacy_ordinary_provider_route",
+            "tier": tier,
+            "model": model or "unknown",
+            "provider": str(kwargs.get("provider") or cfg.get("provider") or "unknown"),
+            "reason": "attempted Claude CLI review failed; ordinary provider route is the configured legacy replacement",
+            "failure_kind": failure_kind,
+        }
+
     def audit_refusal(message: str) -> None:
         turn_id = str(kwargs.get("parent_turn_id") or kwargs.get("turn_id") or "")
         session_id = str(kwargs.get("parent_session_id") or kwargs.get("session_id")
@@ -4930,8 +4950,16 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         except Exception as error:
             if review:
                 message = str(error).strip()[:300] or type(error).__name__
+                replacement = ordinary_replacement(error)
+                failure = {"message": message, "replacement": replacement,
+                           "failure_kind": replacement["failure_kind"],
+                           "identity": getattr(error, "identity", None)}
+                setattr(error, "_bridge_review_failure", failure)
                 claude_delegation._log(cfg, {
                     "event": "bridge_claude", "outcome": "error", "message": message,
+                    "failure_kind": replacement["failure_kind"],
+                    "failure_class": str(getattr(error, "failure_class", "execution-error")),
+                    "substitution": replacement,
                     "tier_requested": requested_alias, "tier_used": requested_alias,
                     "session_id": str(kwargs.get("session_id") or ""),
                     "turn_id": str(kwargs.get("turn_id") or ""),
@@ -4949,8 +4977,23 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         delegated = _verified_delegated_claude_review(routing_text, cfg, request=source_request)
         if delegated is not None:
             repo, _requested_alias = delegated
+            policy = coding_cfg.get("delegated_review") or {}
+            selection_mode = str(policy.get("selection_mode") or "profile_preferred")
+            requested_model = str(policy.get("requested_model") or "").strip() or None
+            from . import target_identity
+            resolution = target_identity.resolve_target(
+                requested_alias, transport="claude_cli", selection_mode=selection_mode,
+                requested_model=requested_model, cfg=cfg,
+            )
+            if resolution.status != target_identity.RESOLVED:
+                audit_refusal("Claude CLI review route is unsupported: " + "; ".join(resolution.reasons))
+                return None
+            identity = resolution.identity
             alias = admitted_alias()
             if alias is None:
+                return None
+            if identity.selection_mode == "exact" and alias != requested_alias:
+                audit_refusal("exact Claude CLI review cannot substitute the requested tier")
                 return None
             allowed = (coding_cfg.get("delegated_review") or {}).get("models")
             if isinstance(allowed, list) and alias not in allowed:
@@ -4963,6 +5006,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                 model=alias,
                 requested_alias=requested_alias,
                 adjustment=adjustment,
+                identity=identity,
                 cfg=cfg,
                 turn_id=str(kwargs.get("turn_id") or ""),
                 parent_session_id=kwargs.get("parent_session_id") or kwargs.get("session_id"),
@@ -5103,11 +5147,22 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     opus_context = {key: value for key, value in kwargs.items() if key not in {"request", "next_call", "retry_call"}}
     try:
         opus_response = _maybe_run_opus5(request, cfg, **opus_context)
-    except Exception:
+    except Exception as error:
         # Failures before an attempt are not attributed to the CLI; attempted
         # reviews write a separate audit with the concrete reason.
         _logger.warning("Claude bridge did not complete; falling back to the normal route", exc_info=True)
         opus_response = None
+        review_failure = getattr(error, "_bridge_review_failure", None)
+        if review_failure:
+            replacement = review_failure["replacement"]
+            request = deepcopy(request)
+            _append_user_instruction(
+                request,
+                "Claude CLI review did not complete "
+                f"({review_failure['failure_kind']}: {review_failure['message']}). "
+                f"This response is the explicit legacy substitution on {replacement['tier']} "
+                f"({replacement['model']}); it is not the requested Claude review.",
+            )
     if opus_response is not None:
         return opus_response
 

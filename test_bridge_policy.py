@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import model_router as router
 from model_router import _maybe_run_opus5, route_llm_request, usage_guard
@@ -214,6 +214,9 @@ class DelegatedReviewRepositoryTests(unittest.TestCase):
                                           api_mode="codex_responses")
         self.assertEqual(result.model, "claude-sonnet-5-5")
         bridge.assert_called_once()
+        identity = bridge.call_args.kwargs["identity"]
+        self.assertEqual(identity.transport, "claude_cli")
+        self.assertEqual(identity.observed.value, "unknown")
         self.assertEqual(bridge.call_args.kwargs["repo"], str(repo.resolve()))
 
     def test_dispatch_resolved_repository_carries_to_child_without_workspace_path(self):
@@ -407,7 +410,7 @@ class AccountOfExecutionTests(unittest.TestCase):
         from unittest.mock import Mock
         from model_router import run_llm_with_transient_failover
         cfg = {
-            'enabled': True, 'provider': 'openai-codex',
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
             'callable': {'opus5': True, 'sonnet5': True},
             'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
             'usage_guard': {'accounts': {
@@ -455,6 +458,30 @@ class AccountOfExecutionTests(unittest.TestCase):
             codex.assert_not_called()
             self.assertEqual(bridge.call_count, 0 if claude == 95 else 1)
 
+    def test_exact_cli_route_without_capability_evidence_is_refused_before_bridge_attempt(self):
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'opus5': True, 'sonnet5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {
+                'enabled': True, 'selection_mode': 'exact',
+                'requested_model': 'claude-sonnet-5-5',
+            }},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[sonnet-review] Review parser'}]}
+        downstream = Mock(return_value='Codex ran')
+        with patch('model_router._load_config', return_value=cfg), \
+             patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
+             patch('model_router._run_opus5_bridge') as bridge, \
+             patch('model_router.claude_delegation._log') as audit:
+            result = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=downstream,
+                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        self.assertEqual(result, 'Codex ran')
+        bridge.assert_not_called()
+        self.assertEqual(audit.call_args.args[1]['outcome'], 'refused')
+        self.assertIn('exact canonical CLI selection needs exact_model evidence', audit.call_args.args[1]['message'])
+
     def test_failed_review_bridge_keeps_one_route_call_and_records_visible_failure_audit(self):
         with patch('model_router._log_decision') as route_log, \
              patch('model_router.claude_delegation._log') as audit:
@@ -470,7 +497,12 @@ class AccountOfExecutionTests(unittest.TestCase):
         event = audit.call_args.args[1]
         self.assertEqual(event['outcome'], 'error')
         self.assertEqual(event['tier_requested'], 'sonnet')
+        self.assertEqual(event['failure_kind'], 'max-turn')
+        self.assertEqual(event['substitution']['tier'], 'terra')
+        self.assertEqual(event['substitution']['model'], 'gpt-terra')
+        self.assertEqual(event['turn_id'], 's:sa-1')
         self.assertIn('Claude Code reached max turns', event['message'])
+        self.assertIn('CLI review did not complete', codex.call_args.args[0]['messages'][-1]['content'])
 
     def test_pre_bridge_review_exception_is_not_audited_as_a_claude_failure(self):
         with patch('model_router.claude_delegation._log') as audit:
