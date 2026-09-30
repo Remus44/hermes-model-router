@@ -1231,6 +1231,31 @@ config owner's value per Claude tier and flags drift and observed mismatches.
 `target_identity.propose_host_migration()` returns an optional unified diff for
 `~/.hermes/config.yaml`; nothing is ever applied. No routing behaviour changes.
 
+### Execution records and offline adapter doubles
+
+`execution_contracts.py` also freezes the scheduler-facing records without adding a
+scheduler or dispatch path: a bounded `ExecutionRequest`, an `AttemptLifecycle`, a
+non-terminal `Submission`, and a terminal-only `WorkerResult`. All records use an
+explicit schema version and strict `as_dict()`/`from_dict()` validation: unknown
+routing fields, malformed IDs, invalid types, illegal lifecycle transitions and
+oversized inline payloads are rejected. A submission acceptance is only a handle;
+it cannot be consumed as a completed worker result. Execution success remains
+separate from validation evidence and later parent acceptance.
+
+Unknown effort and provider usage remain explicit (`"unknown"`) and provider usage
+may carry bounded future meter fields. Inline output is bounded; callers retain a
+bounded artifact reference plus failure and validation evidence rather than silently
+dropping those records. `legacy_direct_tool_request()` gives existing direct tool
+invocations stable `legacy:<tool-id>` workflow/task/attempt identities without a
+TaskGraph.
+
+`execution_test_doubles.py` supplies no-I/O scripted adapters for delayed completion,
+partial batches, capability refusal, observed-identity mismatch, unknown liveness
+and cancellation. They freeze the future adapter seam (`capabilities`,
+`can_execute`, `submit`, `result`, `cancel`) for S05 without wrapping production
+transports. TaskGraph construction (S08), event persistence/reconciliation (S06),
+production adapters (S05), scheduling and verification remain deferred.
+
 ## Usage
 
 ### Explicit Model Override
