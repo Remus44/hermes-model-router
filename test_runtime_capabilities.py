@@ -101,7 +101,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         self.assertEqual(adapter.capability("cancellation").status, "supported")
         self.assertIn("cooperative", adapter.capability("cancellation").reason)
         self.assertEqual(adapter.capability("async_delivery").status, "supported")
-        self.assertIn("consumer", adapter.capability("async_delivery").reason)
+        self.assertIn("on_subagent_stop", adapter.capability("async_delivery").reason)
         self.assertEqual(adapter.capability("workspace_isolation").status, "unknown")
 
     def test_matrix_unknown_identity_effort_permissions_and_cli(self):
@@ -111,8 +111,8 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                 for transport in ("hermes_codex", "hermes_claude", "claude_cli"):
                     adapter = snap.adapter(transport)
                     for name in ("exact_model", "identity_observability", "permissions", "workspace_isolation"):
-                        self.assertNotEqual(adapter.capability(name).status, "supported")
-                    self.assertNotEqual(adapter.capability("effort_application").status, "supported")
+                        self.assertEqual(adapter.capability(name).status, "unknown")
+                    self.assertIn(adapter.capability("effort_application").status, ("unknown", "unsupported"))
                 self.assertEqual(snap.adapter("claude_cli").capability("submission").status, "unknown")
 
     def test_mixed_batch_and_concurrency_not_slot_reservation(self):
@@ -122,10 +122,142 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             self.assertEqual(snap.adapter("hermes_claude").capability("mixed_target_batch").status, "unsupported")
             self.assertTrue(snap.admission_required)
 
-    def test_fallback_owned_by_host_not_parent_config_mutation(self):
+    def test_codex_mixed_batch_is_never_supported_without_split_evidence(self):
+        for schema, expected in (("model-param", "unknown"), ("batch-only", "unsupported")):
+            with self.subTest(schema=schema):
+                cap = self.snapshot(delegate_task_request(schema)).adapter("hermes_codex").capability("mixed_target_batch")
+                self.assertEqual(cap.status, expected)
+                self.assertTrue(cap.reason)
+        cap = self.snapshot({}).adapter("hermes_codex").capability("mixed_target_batch")
+        self.assertEqual(cap.status, "unknown")
+
+    def test_fallback_ownership_needs_a_checked_seam_in_both_states(self):
+        # present seams: no seam reports ownership, so unknown (never supported)
+        for transport, active in (("hermes_codex", True), ("hermes_claude", True)):
+            with patch.object(claude_delegation, "is_active", return_value=active):
+                cap = self.snapshot().adapter(transport).capability("fallback_ownership")
+                self.assertEqual(cap.status, "unknown", transport)
+                self.assertTrue(cap.reason)
+        # missing host: codex unsupported with reason
+        with patch.dict(sys.modules, {"tools.delegate_tool": None, "tools.delegate_tool_config": None}):
+            cap = self.snapshot().adapter("hermes_codex").capability("fallback_ownership")
+            self.assertEqual((cap.status, bool(cap.reason)), ("unsupported", True))
+        # false host seam: codex unsupported
+        with patch.object(self.host, "_build_child_agent", False):
+            self.assertEqual(self.snapshot().adapter("hermes_codex").capability("fallback_ownership").status, "unsupported")
+        # inactive Claude delegation: unsupported, consistent with its submission
+        with patch.object(claude_delegation, "is_active", return_value=False):
+            adapter = self.snapshot().adapter("hermes_claude")
+            self.assertEqual(adapter.capability("submission").status, "unsupported")
+            self.assertEqual(adapter.capability("fallback_ownership").status, "unsupported")
+
+    def test_claude_cancellation_and_async_are_unknown_without_a_claude_seam(self):
+        with patch.object(claude_delegation, "is_active", return_value=True):
+            request = delegate_task_request()
+            request["tools"].append({"name": "delegate_claude", "parameters": {}})
+            adapter = self.snapshot(request).adapter("hermes_claude")
+            self.assertEqual(adapter.capability("submission").status, "supported")
+            for name in ("cancellation", "async_delivery"):
+                cap = adapter.capability(name)
+                self.assertEqual(cap.status, "unknown", name)
+                self.assertIn("delegate_claude", cap.reason)
+
+    def test_codex_cancellation_present_and_missing_seam(self):
+        self.assertEqual(self.snapshot().adapter("hermes_codex").capability("cancellation").status, "supported")
+        with patch.object(self.host, "interrupt_subagent", False):
+            self.assertEqual(self.snapshot().adapter("hermes_codex").capability("cancellation").status, "unknown")
+
+    def test_codex_async_delivery_needs_getter_and_stop_hook_both_present_and_missing(self):
+        self.assertEqual(self.snapshot().adapter("hermes_codex").capability("async_delivery").status, "supported")
+        import tools.delegate_tool_config as host_cfg
+        with patch.object(host_cfg, "_get_max_async_children", False):
+            cap = self.snapshot().adapter("hermes_codex").capability("async_delivery")
+            self.assertEqual(cap.status, "unknown")
+            self.assertIn("async child limit", cap.reason)
+        with patch.object(router, "on_subagent_stop", None):
+            cap = self.snapshot().adapter("hermes_codex").capability("async_delivery")
+            self.assertEqual(cap.status, "unknown")
+            self.assertIn("on_subagent_stop", cap.reason)
+
+    def _matrix(self, request=None, *, parallel=False):
+        return runtime.compatibility_matrix(self.snapshot(request), parallel=parallel)
+
+    def test_matrix_emits_every_section7_row_with_owner_and_reason(self):
+        rows = self._matrix()
+        self.assertEqual(len(runtime.MATRIX_CASES), 14)
+        self.assertEqual(len(rows), 14 * 3)
+        self.assertEqual({r["transport"] for r in rows}, set(runtime.TRANSPORTS))
+        self.assertEqual(len({(r["case"], r["transport"]) for r in rows}), 42)
+        for row in rows:
+            self.assertIn(row["status"], ("supported", "unsupported", "unknown"))
+            self.assertTrue(row["owner"].startswith("S"), row)
+            if row["status"] != "supported":
+                self.assertTrue(row["reason"], row)
+
+    def test_matrix_exact_statuses_for_rows_s01_cannot_evaluate(self):
+        table = {r["case"] + "/" + r["transport"]: (r["status"], r["owner"]) for r in self._matrix()}
+        for transport in runtime.TRANSPORTS:
+            for case, owner in (("usage_admission", "S03"), ("quota_vs_pacing", "S03"),
+                                ("restart_duplicate_hook", "S06"), ("parent_stop_amend", "S09"),
+                                ("verification_substitution", "S14")):
+                self.assertEqual(table[case + "/" + transport], ("unknown", owner))
+            self.assertEqual(table["exact_model/" + transport], ("unknown", "S02"))
+            self.assertEqual(table["tool_context_permissions/" + transport], ("unknown", "S04"))
+
+    def test_matrix_exact_statuses_for_evaluated_rows(self):
+        with host_delegation(depth=2), patch.object(claude_delegation, "is_active", return_value=True):
+            codex_parent = {c + "/" + t: s for c, t, s in
+                            ((r["case"], r["transport"], r["status"]) for r in self._matrix(delegate_task_request("model-param")))}
+            claude_request = delegate_task_request("model-param", wire="anthropic")
+            claude_request["tools"].append({"name": "delegate_claude", "parameters": {}})
+            claude_parent = {c + "/" + t: s for c, t, s in
+                             ((r["case"], r["transport"], r["status"]) for r in self._matrix(claude_request))}
+        # parent that can reach delegate_claude vs one that cannot
+        self.assertEqual(codex_parent["submission/hermes_claude"], "unknown")
+        self.assertEqual(claude_parent["submission/hermes_claude"], "supported")
+        self.assertEqual(codex_parent["submission/hermes_codex"], "supported")
+        self.assertEqual(claude_parent["submission/claude_cli"], "unknown")
+        for table in (codex_parent, claude_parent):
+            self.assertEqual(table["mixed_target_batch/hermes_codex"], "unknown")
+            self.assertEqual(table["mixed_target_batch/hermes_claude"], "unsupported")
+            self.assertEqual(table["mixed_target_batch/claude_cli"], "unsupported")
+            self.assertEqual(table["native_fallback/hermes_codex"], "unknown")
+            self.assertEqual(table["native_fallback/hermes_claude"], "unknown")
+            self.assertEqual(table["background_completion/hermes_codex"], "supported")
+            self.assertEqual(table["background_completion/hermes_claude"], "unknown")
+            self.assertEqual(table["failure_cancel_timeout/hermes_codex"], "supported")
+            self.assertEqual(table["failure_cancel_timeout/hermes_claude"], "unknown")
+            self.assertEqual(table["failure_cancel_timeout/claude_cli"], "unknown")
+        self.assertEqual(codex_parent["exact_effort/claude_cli"], "unknown")
+
+    def test_matrix_unsupported_host_and_deferred_visibility_cells(self):
+        with patch.dict(sys.modules, {"tools.delegate_tool": None, "tools.delegate_tool_config": None}):
+            table = {(r["case"], r["transport"]): r["status"] for r in self._matrix()}
+        self.assertEqual(table[("submission", "hermes_codex")], "unsupported")
+        self.assertEqual(table[("native_fallback", "hermes_codex")], "unsupported")
+        self.assertEqual(table[("failure_cancel_timeout", "hermes_codex")], "unknown")
+        self.assertEqual(table[("background_completion", "hermes_codex")], "unknown")
+        with host_delegation(depth=2), patch.object(claude_delegation, "is_active", return_value=True):
+            request = delegate_task_request()
+            request["tools"].extend({"name": n, "parameters": {}} for n in DEFERRED_CLAUDE_TOOLS if n != "delegate_task")
+            table = {(r["case"], r["transport"]): r["status"] for r in self._matrix(request)}
+        self.assertEqual(table[("submission", "hermes_claude")], "unknown")
+
+    def test_matrix_serial_vs_parallel_depends_on_host_concurrency(self):
+        for limit, parallel, expected in ((1, False, "unknown"), (1, True, "unsupported"),
+                                          (3, True, "unknown"), (3, False, "unknown")):
+            with self.subTest(limit=limit, parallel=parallel), host_delegation(depth=1, max_concurrent_children=limit):
+                rows = [r for r in self._matrix(parallel=parallel) if r["case"] == "concurrent_calls"]
+                self.assertEqual({r["status"] for r in rows}, {expected})
+                self.assertTrue(all(r["reason"] and r["owner"] == "S05" for r in rows))
+        with patch.dict(sys.modules, {"tools.delegate_tool": None, "tools.delegate_tool_config": None}):
+            rows = [r for r in self._matrix(parallel=True) if r["case"] == "concurrent_calls"]
+            self.assertEqual({r["status"] for r in rows}, {"unknown"})
+
+    def test_fallback_ownership_not_reported_from_config(self):
         snap = self.snapshot()
-        self.assertEqual(snap.adapter("hermes_codex").capability("fallback_ownership").value, "host_route_config")
-        self.assertEqual(snap.adapter("hermes_claude").capability("fallback_ownership").value, "per_call_credentials_cfg")
+        for transport in ("hermes_codex", "hermes_claude"):
+            self.assertIsNone(snap.adapter(transport).capability("fallback_ownership").value)
 
     def test_fingerprint_changes_on_depth_schema_config_and_seam(self):
         with host_delegation(depth=1):

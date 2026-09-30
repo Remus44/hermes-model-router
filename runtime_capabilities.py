@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -205,6 +206,7 @@ def _gather(request: Any, cfg: Any) -> Dict[str, Any]:
         "claude_active": claude_active,
         "interrupt": callable(getattr(host, "interrupt_subagent", None)),
         "async_getter": callable(getattr(host_cfg, "_get_max_async_children", None)),
+        "stop_hook": callable(getattr(sys.modules.get(__package__ or ""), "on_subagent_stop", None)),
         "config": _config_view(cfg),
     }
 
@@ -247,8 +249,14 @@ def _build_adapters(g: Dict[str, Any]) -> Tuple[AdapterCapabilities, ...]:
         if bridge_ok else (UNSUPPORTED, bridge_reason or "reasoning-effort seam unavailable")
     cancellation = (SUPPORTED, "cooperative interrupt via host interrupt_subagent; no forced kill") \
         if g["interrupt"] else (UNKNOWN, "host exposes no interrupt_subagent seam")
-    async_delivery = (SUPPORTED, "host background children exist; completion needs a hook consumer") \
-        if g["async_getter"] else (UNKNOWN, "host exposes no async child limit seam")
+    if g["async_getter"] and g["stop_hook"]:
+        async_delivery = (SUPPORTED, "host background-child limit seam and router on_subagent_stop hook "
+                                     "are both callable; completion delivery itself is not observed")
+    elif not g["stop_hook"]:
+        async_delivery = (UNKNOWN, "router on_subagent_stop lifecycle hook is not callable")
+    else:
+        async_delivery = (UNKNOWN, "host exposes no async child limit seam")
+    claude_seam_reason = "delegate_claude is not shown to use the host interrupt/async seams (S05)"
     common_unknown = {
         "exact_model": "exact wire identity needs per-call observation, not a schema",
         "identity_observability": "served model identity is not derivable from a schema",
@@ -259,17 +267,25 @@ def _build_adapters(g: Dict[str, Any]) -> Tuple[AdapterCapabilities, ...]:
     def unknowns():
         return [_cap(n, UNKNOWN, reason=r) for n, r in common_unknown.items()]
 
+    if model_param[0] == SUPPORTED:
+        codex_batch = (UNKNOWN, "schema declares a model parameter; per-task split is not verified (S04)")
+    elif model_param[0] == UNSUPPORTED:
+        codex_batch = (UNSUPPORTED, "needs a model parameter per task")
+    else:
+        codex_batch = (UNKNOWN, model_param[1])
+    if host_missing or not seams_ok:
+        codex_fallback = (UNSUPPORTED, submission[1])
+    else:
+        codex_fallback = (UNKNOWN, "no host seam reports fallback ownership; determined per call (S05)")
+
     codex = AdapterCapabilities("hermes_codex", tuple([
         _pair("submission", submission),
         _pair("model_parameter", model_param),
-        _cap("mixed_target_batch", model_param[0] if model_param[0] != UNKNOWN else UNSUPPORTED,
-             reason="needs a model parameter per task" if model_param[0] != SUPPORTED
-             else "schema exposes a model parameter; batch split not verified"),
+        _pair("mixed_target_batch", codex_batch),
         _pair("effort_application", effort_host),
         _pair("cancellation", cancellation),
         _pair("async_delivery", async_delivery),
-        _cap("fallback_ownership", SUPPORTED, "host_route_config",
-             "fallback is owned by the host route configuration"),
+        _pair("fallback_ownership", codex_fallback),
     ] + unknowns()))
 
     claude_name = claude_delegation.TOOL_NAME
@@ -282,15 +298,19 @@ def _build_adapters(g: Dict[str, Any]) -> Tuple[AdapterCapabilities, ...]:
     else:
         claude_submission = (UNKNOWN, f"{claude_name} not visible in this request (deferred or absent)")
 
+    if claude_submission[0] == UNSUPPORTED:
+        claude_fallback = (UNSUPPORTED, claude_submission[1])
+    else:
+        claude_fallback = (UNKNOWN, "no seam reports Claude fallback ownership; determined per call (S05)")
+
     claude = AdapterCapabilities("hermes_claude", tuple([
         _pair("submission", claude_submission),
         _cap("model_parameter", UNSUPPORTED, reason="route is chosen per call by tier, not a model parameter"),
         _cap("mixed_target_batch", UNSUPPORTED, reason="one tier and effort per delegate_claude call"),
         _pair("effort_application", effort_host),
-        _pair("cancellation", cancellation),
-        _pair("async_delivery", async_delivery),
-        _cap("fallback_ownership", SUPPORTED, "per_call_credentials_cfg",
-             "per-call credentials and configured fallback"),
+        _cap("cancellation", UNKNOWN, reason=claude_seam_reason),
+        _cap("async_delivery", UNKNOWN, reason=claude_seam_reason),
+        _pair("fallback_ownership", claude_fallback),
     ] + unknowns()))
 
     cli_reason = "CLI availability is not probed on the request path"
@@ -311,7 +331,7 @@ def _fingerprint(g: Dict[str, Any], depth: Fact, conc: Fact, orch: Fact) -> str:
         "v": SCHEMA_VERSION, "depth": [depth.status, depth.value], "conc": [conc.status, conc.value],
         "orch": [orch.status, orch.value], "seams": g["seams"], "tool": g["tool_present"],
         "props": g["properties"], "names": g["tool_names"], "bridge": g["bridge"],
-        "claude": g["claude_active"], "interrupt": g["interrupt"], "async": g["async_getter"],
+        "claude": g["claude_active"], "interrupt": g["interrupt"], "async": g["async_getter"], "stop_hook": g["stop_hook"],
         "config": g["config"], "host": g["host"] is not None,
     })
 
@@ -413,3 +433,54 @@ def diagnostic(snap: RuntimeSnapshot, requested: str = DEFAULT_TOPOLOGY,
         "topology": {**choice.as_dict(), "active": "unknown",
                      "active_reason": "a snapshot cannot observe the running topology"},
     }
+
+
+# ------------------------------------------------------------- section-7 matrix
+# (case, capability read by S01 or None, owning slice, reason when S01 cannot evaluate)
+MATRIX_CASES = (
+    ("submission", "submission", "S01", ""),
+    ("exact_model", "exact_model", "S02", ""),
+    ("exact_effort", "effort_application", "S05", ""),
+    ("mixed_target_batch", "mixed_target_batch", "S04", ""),
+    ("tool_context_permissions", "permissions", "S04", ""),
+    ("usage_admission", None, "S03", "shared admission is evaluated by worker_admission at dispatch, not discovery"),
+    ("quota_vs_pacing", None, "S03", "failure classification needs a runtime failure, not discovery"),
+    ("native_fallback", "fallback_ownership", "S05", ""),
+    ("background_completion", "async_delivery", "S06", ""),
+    ("failure_cancel_timeout", "cancellation", "S06", ""),
+    ("concurrent_calls", None, "S05", ""),
+    ("restart_duplicate_hook", None, "S06", "needs lifecycle ingestion, not discovery"),
+    ("parent_stop_amend", None, "S09", "needs plan amendment and launch suppression, not discovery"),
+    ("verification_substitution", None, "S14", "needs reviewer identity records, not discovery"),
+)
+
+
+def compatibility_matrix(snap: RuntimeSnapshot, *, parallel: bool = False) -> Tuple[Dict[str, Any], ...]:
+    """Every plan-section-7 case x transport with an explicit status, reason and owning slice.
+
+    Parent provider is deliberately not an input: the host seams do not depend on it, and
+    what a Codex or Claude parent can reach is already visible as the request's tool list
+    (``delegate_claude`` present or deferred) that the snapshot fingerprints. ``parallel``
+    only matters for ``concurrent_calls``, which depends on the host concurrency limit.
+    """
+    rows = []
+    for case, cap_name, owner, why in MATRIX_CASES:
+        for adapter in snap.adapters:
+            if cap_name is not None:
+                cap = adapter.capability(cap_name)
+                status, reason = cap.status, cap.reason
+            elif case == "concurrent_calls":
+                conc = snap.max_concurrent_children
+                if not parallel:
+                    status, reason = UNKNOWN, "state isolation between calls is verified by adapter tests"
+                elif conc.status != SUPPORTED:
+                    status, reason = UNKNOWN, f"host concurrency limit unknown: {conc.reason}"
+                elif conc.value < 2:
+                    status, reason = UNSUPPORTED, f"host max concurrent children is {conc.value}"
+                else:
+                    status, reason = UNKNOWN, "limit allows parallel calls; state isolation is not verified"
+            else:
+                status, reason = UNKNOWN, why
+            rows.append({"case": case, "transport": adapter.transport, "status": status,
+                         "reason": reason, "owner": owner})
+    return tuple(rows)
