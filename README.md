@@ -1283,31 +1283,58 @@ scheduling and verification remain deferred.
 
 ### Transport adapters
 
-`execution_adapters.py` now translates the frozen request records onto the three
-existing transport seams: Hermes/Codex uses the host's batch-only `delegate_task`
-route with its existing goal-prefix selector; Hermes/Claude calls the existing
-`delegate_claude` handler one tier at a time; and Claude CLI calls the existing
-bridge. The adapters do not construct agents, invoke a provider or CLI directly,
-or mutate delegation/configuration state. Legacy entrypoints are passed into the
-adapter factory as raw callables, so an adapter does not intercept itself or apply
-admission twice.
+`execution_adapters.py` wraps the actual legacy transport boundaries. Registered
+`delegate_task` execution retains the existing account guard as its sole admission
+owner; `delegate_claude` retains its existing admission/step-down and scoped effort
+handler, then invokes an explicitly raw host callable. The public CLI bridge wrapper
+likewise invokes an explicitly raw bridge function and passes the authoritative
+identity unchanged, including the exact canonical model argument. No boundary calls
+its own public entrypoint recursively or performs a second account admission.
+Legacy goals, context, supported tool payloads and host-owned budgets/permissions
+remain authoritative. They are **not** converted into fabricated `ExecutionRequest`
+permissions, criteria or deadlines.
 
-An exact request is accepted only when the transport both enforces the requested
-selection and supplies served-identity evidence. On the current batch-only Codex
-host, exact model/provider/effort selection is therefore typed `unsupported`;
-configured child metadata is not promoted to observed evidence. Claude's Haiku
-route accurately records effort as `not_applicable`; non-Haiku effort remains
-unknown unless its scoped legacy seam reports application. Claude CLI derives its
-observed model only from the bridge result and returns an `exact-route-mismatch`
-result when that evidence differs.
+Structured requests are more restrictive than those legacy tools. On the current
+transports, the adapter cannot enforce the complete mandatory request contract:
+trusted context/revision resolution, permission and required-tool fit, workspace and
+write-scope enforcement, deadline/timeout ownership, credential-account binding and
+substitution policy must all be proven. Consequently **all current structured submit
+cells explicitly return typed `unsupported`/capability refusal before dispatch**.
+A supported host model or effort seam alone does not make a full request supported.
+Requested Claude effort is not silently replaced with configured per-tier effort;
+Haiku accurately remains `not_applicable`. Capability lists advertise implemented
+adapter methods only, not host cancellation or structured submission that the
+adapter cannot deliver. There is no scheduler or activation switch in this slice.
 
-Each submit performs fresh shared admission. Hermes child submissions also claim a
-locked, process-local host-slot reservation before dispatch, releasing it when the
-transport refuses before a handle; S06 owns completion reconciliation and release.
-The adapters preserve goal context, workspace/request records and existing tool
-boundaries, but they intentionally return `unknown` pending results for Hermes
-handles until lifecycle correlation lands. They do not add a scheduler, persistence,
-active-mode switch or live capability probe.
+Legacy responses are returned unchanged and separately normalized into bounded,
+process-local execution receipts. Real synchronous results (including background to
+synchronous fallback) are terminal execution evidence even without a top-level
+handle; they do not prove acceptance criteria or served native model identity.
+Claude tier-adjustment evidence is retained as resolved selection, not served model
+proof. CLI observed model evidence comes only from its validated bridge result.
+Malformed/partial responses, background acceptance and post-dispatch errors remain
+`unknown` and keep their reservations; a top-level error is not assumed to prove
+that no worker started.
+
+One locked reservation owner is shared by the native transports per active parent,
+with batch child counts charged against the host capacity seam. Missing capacity
+support refuses before launch. Full attempt keys prevent reuse across workflows;
+where the host supplies session/turn/tool-call IDs, the public boundary deduplicates
+that invocation and rejects changed payloads under the same IDs. A legacy call with
+no stable invocation IDs receives observation-only IDs: a later new call is not
+invented to be the same attempt. In-flight duplicates do not dispatch again, and
+terminal duplicate receipts do not re-run completed work. CLI runs use a conservative
+single process-local slot for the shared local credentials.
+
+S06 owns persistence, background completion correlation, unknown-work reconciliation
+and eventual reservation release. Unknown work never expires automatically. The
+receipt journal is bounded to 4096 attempts and cached responses to 8192 characters;
+exhaustion or an uncached duplicate refuses new dispatch rather than forgetting an
+attempt. Until S06, background/ambiguous work can conservatively block capacity and
+receipts do not survive restart. Do not automatically replay unknown work after a
+restart. No production configuration/log write, provider probe or new routing-hot-path
+subprocess is introduced. Running Hermes/dashboard processes need their normal
+restart to load the changed boundaries.
 
 ## Usage
 

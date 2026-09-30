@@ -811,6 +811,18 @@ def _dispatch(args: Dict[str, Any]) -> str:
         _audit(cfg, parent, requested, tier, outcome, "refused", message)
         return _error(message)
 
+    # Admission/step-down above is the single owner for this legacy entrypoint.
+    # Keep an explicit raw host callable: the adapter must not call this handler
+    # again or route through the delegate_task tool-execution middleware.
+    raw_delegate_task = delegate_task
+    def delegate_task(**kwargs: Any) -> Any:
+        from .execution_adapters import native_legacy_dispatch
+        evidence = {"claude_tier": tier, "tier_adjusted": outcome.adjusted}
+        if tier == "haiku":
+            evidence["reasoning_effort"] = "not_applicable"
+        return native_legacy_dispatch(lambda: raw_delegate_task(**kwargs), parent=parent,
+            tasks=kwargs.get("tasks"), transport="hermes_claude", evidence=evidence)
+
     # Haiku has no extended-thinking support (see agent.anthropic_adapter.build_anthropic_kwargs),
     # so the reasoning-effort bridge is simply irrelevant to it: a Haiku call never sets a scope
     # and must delegate normally even when the bridge is unavailable on this host.

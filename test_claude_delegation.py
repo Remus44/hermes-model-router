@@ -145,6 +145,10 @@ class SchemaTests(unittest.TestCase):
 
 class HandlerTests(unittest.TestCase):
     def setUp(self):
+        from model_router import execution_adapters
+        owner = patch.object(execution_adapters, "RESERVATIONS", execution_adapters.ReservationBook())
+        owner.start()
+        self.addCleanup(owner.stop)
         usage_guard._reset_cache()
         self.addCleanup(usage_guard._reset_cache)
 
@@ -239,6 +243,7 @@ class HandlerTests(unittest.TestCase):
 
         fake_module = types.ModuleType("tools.delegate_tool")
         fake_module._resolve_child_runtime = fake_resolver
+        fake_module._get_max_concurrent_children = lambda: 8
         with tempfile.TemporaryDirectory() as directory, \
              patch.dict(sys.modules, {"tools.delegate_tool": fake_module,
                                       "tools.delegate_tool_config": fake_module}):
@@ -357,6 +362,7 @@ class HandlerTests(unittest.TestCase):
         import types
         fake_module = types.ModuleType("tools.delegate_tool")
         fake_module._resolve_child_runtime = fake_resolver
+        fake_module._get_max_concurrent_children = lambda: 8
         cfg = _cfg()
         cfg["claude_delegation"]["reasoning_effort"] = {"sonnet": "high", "opus": "low"}
         with patch.dict(sys.modules, {"tools.delegate_tool": fake_module,

@@ -1,262 +1,524 @@
-"""S05 adapters wrap existing execution seams without shared routing mutation."""
+"""Offline transport regressions: execute public boundaries, never construct agents."""
 import inspect
 import json
 import threading
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import model_router as router
 from model_router import execution_adapters as adapters
 from model_router import execution_contracts as contracts
 from model_router import runtime_capabilities as runtime
+from model_router import claude_delegation as claude
+from model_router import claude_opus_bridge as cli
+from model_router import worker_admission
+from model_router.test_claude_delegation import _cfg, _reading
 
 
 def identity(transport, *, alias="terra", provider="openai-codex", model="gpt-5.6-terra",
              selection_mode="profile_preferred", effort="unknown"):
-    return contracts.TargetIdentity(
-        provider=provider, account=provider, transport=transport, alias=alias,
-        selection_mode=selection_mode,
-        requested=contracts.ModelFact(model, "operator_request"),
-        resolved=contracts.ModelFact(model, "configured_target"),
-        observed=contracts.ModelFact(),
-        effort=contracts.EffortFact(effort, "unknown", "not_observed"),
-    )
+    return contracts.TargetIdentity(provider, provider, transport, alias, selection_mode,
+        contracts.ModelFact(model, "operator_request"), contracts.ModelFact(model, "configured_target"),
+        contracts.ModelFact(), contracts.EffortFact(effort, "unknown", "not_observed"))
 
 
 def request(target, *, attempt="attempt-001"):
-    return contracts.ExecutionRequest(
-        workflow_id="wf-001", plan_version=1, task_id="task-001", attempt_id=attempt,
-        goal="Implement one bounded change.", acceptance_criteria=("tests pass",),
-        context_reference="repo:README.md@abc123", target=target,
-        repository="repo:/work/router", workspace="workspace:/work/router",
-        permissions=("read", "write"), tool_requirements=("terminal",), mutating=True,
-        write_scope=("one.py",), timeout_seconds=60, deadline_epoch_ms=999999,
-        attempt_budget=1, verification_policy="required", substitution_policy="forbid",
-    )
+    return contracts.ExecutionRequest("wf-001", 1, "task-001", attempt,
+        "Implement one bounded change.", ("tests pass",), "repo:README.md@abc123", target,
+        "repo:/work/router", "workspace:/work/router", ("read", "write"), ("terminal",),
+        True, ("one.py",), 60, 999999, 1, "required", "forbid")
 
 
-def snapshot(*, codex_model="unsupported", claude_submission="supported", bridge="supported"):
-    def cap(name, status, reason="fixture"):
-        return runtime.Capability(name, status, reason=reason)
-    return runtime.RuntimeSnapshot(
-        1, "fixture", runtime.Fact("supported", 2), runtime.Fact("supported", 1),
-        runtime.Fact("supported", False), (), (
-            runtime.AdapterCapabilities("hermes_codex", (
-                cap("submission", "supported"), cap("model_parameter", codex_model),
-                cap("effort_application", "unknown"), cap("identity_observability", "unknown"),
-                cap("cancellation", "supported"), cap("fallback_ownership", "unknown"),
-            )),
-            runtime.AdapterCapabilities("hermes_claude", (
-                cap("submission", claude_submission), cap("effort_application", bridge),
-                cap("identity_observability", "unknown"), cap("cancellation", "unknown"),
-                cap("fallback_ownership", "unknown"),
-            )),
-            runtime.AdapterCapabilities("claude_cli", (
-                cap("submission", "supported"), cap("exact_model", "supported"),
-                cap("identity_observability", "supported"), cap("effort_application", "unknown"),
-                cap("cancellation", "unknown"), cap("fallback_ownership", "unknown"),
-            )),
-        ), (), True,
-    )
+def snapshot(*, bridge="supported"):
+    def cap(name, status):
+        return runtime.Capability(name, status, reason="fixture")
+    return runtime.RuntimeSnapshot(1, "fixture", runtime.Fact("supported", 2),
+        runtime.Fact("supported", 1), runtime.Fact("supported", False), (), (
+        runtime.AdapterCapabilities("hermes_codex", tuple(cap(n, s) for n, s in (
+            ("submission", "supported"), ("model_parameter", "unsupported"),
+            ("effort_application", "unknown"), ("identity_observability", "unknown"),
+            ("cancellation", "supported")))),
+        runtime.AdapterCapabilities("hermes_claude", tuple(cap(n, s) for n, s in (
+            ("submission", "supported"), ("effort_application", bridge),
+            ("identity_observability", "unknown"), ("cancellation", "supported")))),
+        runtime.AdapterCapabilities("claude_cli", tuple(cap(n, s) for n, s in (
+            ("submission", "supported"), ("exact_model", "supported"),
+            ("identity_observability", "supported"), ("effort_application", "unknown"),
+            ("cancellation", "supported")))),
+        ), (), True)
 
 
-class HermesCodexAdapterTests(unittest.TestCase):
-    def test_exact_codex_is_unsupported_when_host_cannot_enforce_and_observe_model(self):
-        adapter = adapters.HermesCodexAdapter(lambda **_kwargs: "{}", cfg={}, runtime_snapshot=snapshot())
-        exact = request(identity("hermes_codex", selection_mode="exact"))
-        eligibility = adapter.can_execute(exact, snapshot())
-        self.assertEqual(eligibility.status, "unsupported")
-        self.assertIn("exact", " ".join(eligibility.reasons))
+class StructuredConstraintTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.instances = (
+            adapters.HermesCodexAdapter(lambda **kw: self.calls.append(kw), runtime_snapshot=snapshot(),
+                parent_agent=lambda: SimpleNamespace(_delegate_depth=0), admission=lambda *a, **k: ""),
+            adapters.HermesClaudeAdapter(lambda args: self.calls.append(args), runtime_snapshot=snapshot(),
+                admission=lambda *a, **k: ""),
+            adapters.ClaudeCliAdapter(lambda **kw: self.calls.append(kw), runtime_snapshot=snapshot(),
+                admission=lambda *a, **k: ""))
+        self.targets = (identity("hermes_codex"),
+            identity("hermes_claude", alias="haiku", provider="anthropic", model="claude-haiku-4-5", effort="not_applicable"),
+            identity("claude_cli", alias="sonnet", provider="anthropic", model="claude-sonnet-5-5"))
 
-    def test_profile_codex_uses_only_supported_task_fields_and_keeps_result_unknown(self):
-        calls = []
-        parent = SimpleNamespace(_delegate_depth=0)
-        def delegate_task(**kwargs):
-            calls.append(kwargs)
-            return json.dumps({"status": "dispatched", "delegation_id": "deleg-1"})
-        adapter = adapters.HermesCodexAdapter(delegate_task, cfg={}, runtime_snapshot=snapshot(),
-                                              parent_agent=lambda: parent,
-                                              admission=lambda *_args, **_kwargs: "")
+    def test_restrictive_permissions_do_not_inherit_writes(self):
+        for adapter, target in zip(self.instances, self.targets):
+            item = replace(request(target), mutating=False, permissions=("read",), write_scope=())
+            self.assertEqual(adapter.can_execute(item, snapshot()).status, "unsupported")
+            self.assertFalse(adapter.submit(item).accepted)
+        self.assertEqual(self.calls, [])
+
+    def test_missing_tools_are_refused_before_dispatch(self):
+        for adapter, target in zip(self.instances, self.targets):
+            item = replace(request(target), tool_requirements=("missing-tool",))
+            decision = adapter.can_execute(item, snapshot())
+            self.assertEqual(decision.status, "unsupported")
+            self.assertIn("tool", " ".join(decision.reasons))
+        self.assertEqual(self.calls, [])
+
+    def test_workspace_and_unresolved_context_are_not_reported_as_used(self):
+        for adapter, target in zip(self.instances, self.targets):
+            item = replace(request(target), workspace="workspace:/other", context_reference="repo:required.md@revision")
+            decision = adapter.can_execute(item, snapshot())
+            self.assertEqual(decision.status, "unsupported")
+            reasons = " ".join(decision.reasons)
+            self.assertIn("workspace", reasons)
+            self.assertIn("context", reasons)
+            self.assertFalse(adapter.submit(item).accepted)
+        self.assertEqual(self.calls, [])
+
+    def test_exact_native_identity_is_not_configured_metadata_proof(self):
+        for adapter, target in zip(self.instances[:2], self.targets[:2]):
+            decision = adapter.can_execute(request(replace(target, selection_mode="exact")), snapshot())
+            self.assertEqual(decision.status, "unsupported")
+            self.assertIn("exact", " ".join(decision.reasons))
+
+    def test_cli_exact_effort_and_account_constraints_are_refused(self):
+        target = replace(self.targets[2], selection_mode="exact", effort=contracts.EffortFact("high", "unknown", "not_observed"))
+        decision = self.instances[2].can_execute(request(target), snapshot())
+        self.assertEqual(decision.status, "unsupported")
+        reasons = " ".join(decision.reasons)
+        self.assertIn("effort", reasons)
+        self.assertIn("account", reasons)
+        self.assertFalse(self.instances[2].submit(request(target)).accepted)
+        self.assertEqual(self.calls, [])
+
+    def test_same_tier_effort_is_refused_not_silently_replaced_with_config(self):
+        adapter = self.instances[1]
+        for effort in ("low", "high"):
+            target = identity("hermes_claude", alias="sonnet5", provider="anthropic", model="claude-sonnet-5-5", effort=effort)
+            decision = adapter.can_execute(request(target), snapshot())
+            self.assertEqual(decision.status, "unsupported")
+            self.assertIn("effort", " ".join(decision.reasons))
+        self.assertEqual(self.calls, [])
+
+    def test_missing_effort_seam_is_explicit_and_haiku_has_no_thinking(self):
+        adapter = self.instances[1]
+        target = identity("hermes_claude", alias="sonnet5", provider="anthropic", model="claude-sonnet-5-5", effort="high")
+        decision = adapter.can_execute(request(target), snapshot(bridge="unsupported"))
+        self.assertEqual(decision.status, "unsupported")
+        self.assertIn("effort", " ".join(decision.reasons))
+        self.assertEqual(adapter.applied_effort(request(self.targets[1])).applied, "not_applicable")
+
+    def test_forbidden_native_substitution_is_not_assumed_enforceable(self):
+        for adapter, target in zip(self.instances[:2], self.targets[:2]):
+            decision = adapter.can_execute(request(target), snapshot())
+            self.assertEqual(decision.status, "unsupported")
+            self.assertIn("substitution", " ".join(decision.reasons))
+
+    def test_deadline_timeout_and_write_scope_require_real_seams(self):
+        for adapter, target in zip(self.instances, self.targets):
+            decision = adapter.can_execute(request(target), snapshot())
+            reasons = " ".join(decision.reasons)
+            for constraint in ("deadline", "timeout", "write_scope"):
+                self.assertIn(constraint, reasons)
+            self.assertEqual(decision.status, "unsupported")
+
+    def test_advertised_capabilities_match_methods_not_host_cancellation(self):
+        for adapter in self.instances:
+            self.assertNotIn("cancellation", adapter.capabilities(snapshot()).capabilities)
+            self.assertEqual(adapter.cancel("not-running").status, "unsupported")
+            self.assertNotIn("submission", adapter.capabilities(snapshot()).capabilities)
+
+
+class ExistingDefectRegressionTests(unittest.TestCase):
+    """These assertion failures reproduce defects using only pre-fix public APIs."""
+    def test_existing_claim_is_not_a_fresh_dispatch_authorization(self):
+        book = adapters.ReservationBook()
+        self.assertTrue(book.claim("shared", ("wf", 1, "task", "attempt"), 1))
+        self.assertFalse(book.claim("shared", ("wf", 1, "task", "attempt"), 1))
+
+    def test_completed_native_work_is_not_a_safe_submission_rejection(self):
+        starts = []
+        raw = lambda **kw: starts.append(kw) or json.dumps({"results": [{"status": "completed", "result": "changed"}], "total_duration_seconds": 1})
+        adapter = adapters.HermesCodexAdapter(raw, runtime_snapshot=snapshot(),
+            parent_agent=lambda: SimpleNamespace(_delegate_depth=1), admission=lambda *a, **k: "")
         submitted = adapter.submit(request(identity("hermes_codex")))
-        self.assertTrue(submitted.accepted)
-        self.assertEqual(submitted.handle, "deleg-1")
-        # The supported middleware selector is the goal label; no model/provider/effort field exists.
-        self.assertEqual(calls, [{"tasks": [{"goal": "[terra] Implement one bounded change.",
-                                               "context": "repo:README.md@abc123"}],
-                                  "parent_agent": parent, "background": True}])
-        self.assertEqual(adapter.result("deleg-1").status, "unknown")
+        self.assertFalse(starts and not submitted.accepted, "work already completed but adapter reported safe rejection")
 
-    def test_kwargs_bind_to_the_installed_host_delegate_task_signature(self):
-        from tools import delegate_tool
+    def test_same_attempt_never_runs_native_transport_twice(self):
+        starts = []
+        raw = lambda **kw: starts.append(kw) or json.dumps({"delegation_id": "same-child"})
+        adapter = adapters.HermesCodexAdapter(raw, runtime_snapshot=snapshot(),
+            parent_agent=lambda: SimpleNamespace(_delegate_depth=0), reservations=adapters.ReservationBook(),
+            admission=lambda *a, **k: "")
+        item = request(identity("hermes_codex"))
+        adapter.submit(item)
+        adapter.submit(item)
+        self.assertLessEqual(len(starts), 1)
+
+    def test_registered_entrypoint_is_the_transport_boundary_not_only_old_guard(self):
+        registrations = {}
+        ctx = SimpleNamespace(register_hook=lambda *a: None,
+            register_middleware=lambda name, fn: registrations.update({name: fn}))
+        with patch.object(claude, "register", return_value=True):
+            router.register(ctx)
+        self.assertIsNot(registrations["tool_execution"], worker_admission.guard_tool_execution)
+
+
+class LegacyBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.book = adapters.ReservationBook()
+        self.parent = SimpleNamespace(_delegate_depth=0, session_id="parent")
+        self.shared_patch = patch.object(adapters, "RESERVATIONS", self.book, create=True)
+        self.shared_patch.start()
+        self.addCleanup(self.shared_patch.stop)
+
+    def dispatch(self, raw, *, key=("workflow", 1, "task", "attempt"), limit=1, transport="hermes_codex", weight=1):
+        return adapters.dispatch_legacy(raw, transport=transport, scope="parent:shared", attempt_key=key,
+            limit=limit, weight=weight, reservations=self.book)
+
+    def test_oversized_handle_is_not_silently_repaired_into_another_identifier(self):
+        payload = json.dumps({"delegation_id": "d" * 300})
+        self.assertIs(self.dispatch(lambda: payload), payload)
+        record = self.book.record(("workflow", 1, "task", "attempt"))
+        self.assertTrue(record.handle.startswith("local-"))
+        self.assertEqual(record.status, "unknown")
+
+    def test_changed_payload_under_same_public_attempt_is_refused(self):
         calls = []
-        adapter = adapters.HermesCodexAdapter(lambda **kw: calls.append(kw) or json.dumps({"delegation_id": "d"}),
-                                              cfg={}, runtime_snapshot=snapshot(),
-                                              parent_agent=lambda: SimpleNamespace(_delegate_depth=1),
-                                              admission=lambda *_a, **_k: "")
-        self.assertTrue(adapter.submit(request(identity("hermes_codex"))).accepted)
-        inspect.signature(delegate_tool.delegate_task).bind(**calls[0])
-        self.assertIs(calls[0]["background"], False)  # host rule: synchronous below the top level
-
-    def test_no_active_parent_or_unroutable_alias_never_dispatches(self):
-        calls = []
-        def delegate_task(**kwargs):
-            calls.append(kwargs)
-            return "{}"
-        adapter = adapters.HermesCodexAdapter(delegate_task, cfg={}, runtime_snapshot=snapshot(),
-                                              parent_agent=lambda: None, admission=lambda *_a, **_k: "")
-        self.assertEqual(adapter.submit(request(identity("hermes_codex"))).rejection.failure_class, "capability")
-        with_parent = adapters.HermesCodexAdapter(delegate_task, cfg={}, runtime_snapshot=snapshot(),
-                                                  parent_agent=lambda: SimpleNamespace(_delegate_depth=0),
-                                                  admission=lambda *_a, **_k: "")
-        odd = request(identity("hermes_codex", alias="qwen"))
-        self.assertEqual(with_parent.can_execute(odd, snapshot()).status, "unsupported")
-        self.assertEqual(calls, [])
-
-    def test_luna_and_spark_do_not_receive_mutating_work_where_router_would_substitute(self):
-        adapter = adapters.HermesCodexAdapter(lambda **_kw: "{}", cfg={}, runtime_snapshot=snapshot(),
-                                              parent_agent=lambda: SimpleNamespace(_delegate_depth=0),
-                                              admission=lambda *_a, **_k: "")
-        for alias in ("luna", "spark"):
-            eligibility = adapter.can_execute(request(identity("hermes_codex", alias=alias)), snapshot())
-            self.assertEqual(eligibility.status, "unsupported", alias)
-
-    def test_host_error_text_is_preserved_in_the_typed_rejection(self):
-        adapter = adapters.HermesCodexAdapter(lambda **_kw: json.dumps({"error": "Delegation depth limit reached"}),
-                                              cfg={}, runtime_snapshot=snapshot(),
-                                              parent_agent=lambda: SimpleNamespace(_delegate_depth=0),
-                                              admission=lambda *_a, **_k: "")
-        rejected = adapter.submit(request(identity("hermes_codex")))
-        self.assertFalse(rejected.accepted)
-        self.assertIn("depth limit", rejected.rejection.message.summary)
-
-
-class HermesClaudeAdapterTests(unittest.TestCase):
-    def test_mixed_tiers_use_separate_calls_and_haiku_effort_is_not_applicable(self):
-        calls = []
-        def delegate_claude(args):
-            calls.append(args)
-            return json.dumps({"delegation_id": f"deleg-{len(calls)}", "claude_tier": args["tier"]})
-        adapter = adapters.HermesClaudeAdapter(delegate_claude, cfg={}, runtime_snapshot=snapshot(), admission=lambda *_args, **_kwargs: "")
-        haiku = request(identity("hermes_claude", alias="haiku", provider="anthropic",
-                                 model="claude-haiku-4-5", effort="not_applicable"), attempt="attempt-haiku")
-        sonnet = request(identity("hermes_claude", alias="sonnet5", provider="anthropic",
-                                  model="claude-sonnet-5-5", effort="high"), attempt="attempt-sonnet")
-        outcomes = adapter.submit_batch((haiku, sonnet))
-        self.assertEqual([outcome.handle for outcome in outcomes], ["deleg-1", "deleg-2"])
-        self.assertEqual([call["tier"] for call in calls], ["haiku", "sonnet"])
-        self.assertEqual(calls[0]["tasks"][0]["context"], "repo:README.md@abc123")
-        self.assertEqual(adapter.applied_effort(haiku).applied, "not_applicable")
-        self.assertEqual(adapter.applied_effort(sonnet).applied, "unknown")
-
-    def test_missing_transport_specific_effort_seam_refuses_non_haiku_and_not_haiku(self):
-        adapter = adapters.HermesClaudeAdapter(lambda _args: "{}", cfg={}, runtime_snapshot=snapshot(),
-                                               admission=lambda *_args, **_kwargs: "")
-        sonnet = request(identity("hermes_claude", alias="sonnet5", provider="anthropic",
-                                  model="claude-sonnet-5-5", effort="high"))
-        haiku = request(identity("hermes_claude", alias="haiku", provider="anthropic",
-                                 model="claude-haiku-4-5", effort="not_applicable"))
-        self.assertEqual(adapter.can_execute(sonnet, snapshot(bridge="unsupported")).status, "unsupported")
-        self.assertEqual(adapter.can_execute(haiku, snapshot(bridge="unsupported")).status, "yes")
-
-
-class ClaudeCliAdapterTests(unittest.TestCase):
-    def test_cli_uses_bridge_result_identity_and_does_not_promote_configured_metadata(self):
-        calls = []
-        def bridge(**kwargs):
-            calls.append(kwargs)
-            return {"bridge_run_id": "bridge-1", "result": "reviewed", "effective_model": "claude-other",
-                    "identity": None, "num_turns": 2}
-        target = identity("claude_cli", alias="sonnet", provider="anthropic", model="claude-sonnet-5-5",
-                          selection_mode="exact")
-        adapter = adapters.ClaudeCliAdapter(bridge, cfg={}, runtime_snapshot=snapshot(),
-                                            admission=lambda *_args, **_kwargs: "")
-        submitted = adapter.submit(request(target))
-        self.assertTrue(submitted.accepted)
-        result = adapter.result(submitted.handle)
-        self.assertEqual(calls[0]["model"], "sonnet")
-        self.assertEqual(result.observed_target.observed.value, "claude-other")
-        self.assertEqual(result.observed_target.observed.source, "claude_cli.result.effective_model")
-        self.assertEqual(result.terminal_status, "failed")
-        self.assertEqual(result.failure.failure_class, "exact-route-mismatch")
-
-
-class AdmissionReservationTests(unittest.TestCase):
-    def test_shared_reservation_blocks_parallel_last_slot_before_second_dispatch(self):
-        calls = []
-        calls_lock = threading.Lock()
-        def delegate_task(**kwargs):
-            with calls_lock:
-                calls.append(kwargs)
-            return json.dumps({"delegation_id": f"deleg-{len(calls)}"})
-        limited = snapshot()
-        limited = replace(limited, max_concurrent_children=runtime.Fact("supported", 1))
-        reservations = adapters.ReservationBook()
-        adapter = adapters.HermesCodexAdapter(delegate_task, cfg={}, runtime_snapshot=limited,
-                                              parent_agent=lambda: SimpleNamespace(_delegate_depth=0),
-                                              reservations=reservations,
-                                              admission=lambda *_args, **_kwargs: "")
-        barrier = threading.Barrier(3)
-        results = []
-        def submit(attempt):
-            barrier.wait()
-            results.append(adapter.submit(request(identity("hermes_codex"), attempt=attempt)))
-        first = threading.Thread(target=submit, args=("attempt-first",))
-        second = threading.Thread(target=submit, args=("attempt-second",))
-        first.start()
-        second.start()
-        barrier.wait()
-        first.join()
-        second.join()
-        self.assertEqual(sum(outcome.accepted for outcome in results), 1)
-        rejected = next(outcome for outcome in results if not outcome.accepted)
-        self.assertEqual(rejected.rejection.failure_class, "concurrency")
+        with patch.object(router, "_load_config", return_value={"enabled": True}), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(router, "_delegated_claude_review_status", return_value=(None, "")), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(worker_admission, "refusal", return_value=""), \
+             patch("agent.subagent_lifecycle.get_active_subagent_parent", return_value=self.parent):
+            raw = lambda sent: calls.append(sent) or json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+            common = {"tool_name": "delegate_task", "next_call": raw, "session_id": "wf", "turn_id": "turn", "tool_call_id": "attempt"}
+            adapters.guard_legacy_tool_execution(args={"goal": "read only"}, **common)
+            refused = adapters.guard_legacy_tool_execution(args={"goal": "edit different files"}, **common)
+        self.assertIn("error", json.loads(refused))
         self.assertEqual(len(calls), 1)
 
-    def test_factory_retains_actual_legacy_entrypoints_without_recursive_wrapping(self):
-        delegate_task = object()
-        delegate_claude = object()
-        bridge = object()
-        registry = adapters.legacy_adapters(delegate_task=delegate_task, delegate_claude=delegate_claude,
-                                            claude_bridge=bridge, cfg={})
-        self.assertIs(registry["hermes_codex"]._delegate_task, delegate_task)
-        self.assertIs(registry["hermes_claude"]._delegate_claude, delegate_claude)
-        self.assertIs(registry["claude_cli"]._bridge, bridge)
-        self.assertEqual(set(registry), {"hermes_codex", "hermes_claude", "claude_cli"})
+    def test_default_factory_has_one_mandatory_reservation_owner(self):
+        registry = adapters.legacy_adapters(delegate_task=lambda **kw: None,
+            delegate_claude=lambda args: None, claude_bridge=lambda **kw: None)
+        self.assertTrue(all(adapter._reservations is self.book for adapter in registry.values()))
 
-    def test_different_transport_calls_keep_context_and_configuration_isolated(self):
-        cfg = {"claude_delegation": {"tiers": {"sonnet": "configured-only"}}, "unchanged": ["value"]}
-        codex_calls, claude_calls = [], []
-        shared = adapters.ReservationBook()
-        roomy = replace(snapshot(), max_concurrent_children=runtime.Fact("supported", 2))
-        parent = SimpleNamespace(_delegate_depth=0)
-        codex = adapters.HermesCodexAdapter(
-            lambda **kwargs: codex_calls.append(kwargs) or json.dumps({"delegation_id": "codex-1"}),
-            cfg=cfg, runtime_snapshot=roomy, parent_agent=lambda: parent, reservations=shared,
-            admission=lambda *_args, **_kwargs: "",
-        )
-        claude = adapters.HermesClaudeAdapter(
-            lambda args: claude_calls.append(args) or json.dumps({"delegation_id": "claude-1"}),
-            cfg=cfg, runtime_snapshot=roomy, reservations=shared,
-            admission=lambda *_args, **_kwargs: "",
-        )
-        codex_request = replace(request(identity("hermes_codex"), attempt="codex-attempt"),
-                                context_reference="repo:codex.md@one")
-        claude_request = replace(request(identity("hermes_claude", alias="haiku", provider="anthropic",
-                                                  model="claude-haiku-4-5", effort="not_applicable"),
-                                 attempt="claude-attempt"), context_reference="repo:claude.md@two")
-        threads = [threading.Thread(target=adapter.submit, args=(item,))
-                   for adapter, item in ((codex, codex_request), (claude, claude_request))]
+    def test_terminal_journal_bound_refuses_new_work_without_forgetting_attempt(self):
+        calls = []
+        payload = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        with patch.object(adapters, "_MAX_RECORDS", 1):
+            self.dispatch(lambda: calls.append("first") or payload)
+            refused = self.dispatch(lambda: calls.append("second") or payload, key=("other", 1, "task", "attempt"))
+            self.assertIn("error", json.loads(refused))
+            self.assertIs(self.dispatch(lambda: calls.append("duplicate") or payload), payload)
+        self.assertEqual(calls, ["first"])
+
+    def test_real_synchronous_shape_has_terminal_evidence_without_top_level_handle(self):
+        payload = json.dumps({"results": [{"task_index": 0, "status": "completed", "result": "done",
+            "subagent_id": "sa-0-child", "session_id": "child-session"}], "total_duration_seconds": 1.2})
+        self.assertIs(self.dispatch(lambda: payload), payload)
+        record = self.book.record(("workflow", 1, "task", "attempt"))
+        self.assertEqual(record.status, "succeeded")
+        self.assertEqual(record.child_ids, ("sa-0-child", "child-session"))
+        self.assertTrue(record.handle)
+        self.assertEqual(self.dispatch(lambda: "{}", key=("wf2", 1, "t", "a")), "{}")
+
+    def test_background_to_sync_fallback_preserves_host_payload(self):
+        payload = json.dumps({"results": [{"task_index": 0, "status": "completed", "result": "done"}],
+            "total_duration_seconds": 0.2, "note": "background=true unavailable; ran SYNCHRONOUSLY"})
+        self.assertIs(self.dispatch(lambda: payload), payload)
+        self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, "succeeded")
+
+    def test_unknown_result_and_start_then_error_keep_reservation(self):
+        for mode in ("malformed", "exception", "error-after-start"):
+            with self.subTest(mode=mode):
+                self.book = adapters.ReservationBook()
+                def raw():
+                    if mode == "exception":
+                        raise RuntimeError("started worker but lost response")
+                    return "lost response" if mode == "malformed" else json.dumps({"error": "host failed after building children"})
+                if mode == "exception":
+                    with self.assertRaises(RuntimeError):
+                        self.dispatch(raw)
+                else:
+                    self.dispatch(raw)
+                self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, "unknown")
+                later = json.loads(self.dispatch(lambda: "SHOULD NOT START", key=("wf2", 1, "t", "a")))
+                self.assertIn("error", later)
+
+    def test_same_full_attempt_is_dispatched_only_once_even_after_terminal(self):
+        calls = []
+        payload = json.dumps({"results": [{"status": "completed", "result": "done"}], "total_duration_seconds": 1})
+        raw = lambda: calls.append("start") or payload
+        self.assertIs(self.dispatch(raw), payload)
+        self.assertIs(self.dispatch(raw), payload)
+        self.assertEqual(calls, ["start"])
+
+    def test_cross_workflow_same_local_attempt_does_not_share_claim(self):
+        calls = []
+        raw = lambda: calls.append("start") or json.dumps({"status": "dispatched", "delegation_id": "d"})
+        self.dispatch(raw)
+        other = json.loads(self.dispatch(raw, key=("other-workflow", 1, "task", "attempt")))
+        self.assertIn("error", other)
+        self.assertEqual(len(calls), 1)
+
+    def test_pending_same_attempt_is_blocked_during_dispatch(self):
+        started, finish = threading.Event(), threading.Event()
+        calls = []
+        def raw():
+            calls.append("start")
+            started.set()
+            self.assertTrue(finish.wait(5))
+            return json.dumps({"delegation_id": "d"})
+        thread = threading.Thread(target=lambda: self.dispatch(raw))
+        thread.start()
+        self.assertTrue(started.wait(5))
+        try:
+            duplicate = json.loads(self.dispatch(raw))
+            self.assertIn("error", duplicate)
+        finally:
+            finish.set()
+            thread.join(5)
+        self.assertEqual(len(calls), 1)
+
+    def test_shared_owner_last_slot_race_and_batch_weight(self):
+        barrier = threading.Barrier(3)
+        calls, responses = [], []
+        def submit(transport, key):
+            barrier.wait()
+            responses.append(self.dispatch(lambda: calls.append(transport) or json.dumps({"delegation_id": transport}),
+                transport=transport, key=key))
+        threads = [threading.Thread(target=submit, args=(t, (t, 1, "task", "attempt")))
+            for t in ("hermes_codex", "hermes_claude")]
         for thread in threads:
             thread.start()
+        barrier.wait()
         for thread in threads:
-            thread.join()
-        self.assertEqual(codex_calls[0]["tasks"][0]["context"], "repo:codex.md@one")
-        self.assertEqual(codex_calls[0]["tasks"][0]["goal"], "[terra] Implement one bounded change.")
-        self.assertNotIn("credentials_cfg", codex_calls[0])
-        self.assertEqual(claude_calls[0], {"tasks": [{"goal": "Implement one bounded change.",
-                                                         "context": "repo:claude.md@two"}], "tier": "haiku"})
-        self.assertEqual(cfg, {"claude_delegation": {"tiers": {"sonnet": "configured-only"}},
-                               "unchanged": ["value"]})
+            thread.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sum("error" in json.loads(r) for r in responses), 1)
+        self.assertIn("error", json.loads(self.dispatch(lambda: "no", weight=2)))
+
+    def test_empty_and_ambiguous_partial_sync_results_do_not_free_capacity(self):
+        for results in ([], [{"status": "unknown", "result": "lost"}], [{"status": "completed"}, {"status": "running"}]):
+            self.book = adapters.ReservationBook()
+            self.dispatch(lambda: json.dumps({"results": results, "total_duration_seconds": 1}))
+            self.assertEqual(self.book.record(("workflow", 1, "task", "attempt")).status, "unknown")
+            self.assertIn("error", json.loads(self.dispatch(lambda: "no", key=("w2", 1, "t", "a"))))
+
+    def test_claude_adjustment_evidence_is_retained_not_served_identity(self):
+        payload = json.dumps({"delegation_id": "d", "claude_tier": "sonnet", "tier_adjusted": "opus→sonnet (weekly usage 75.0)",
+            "reasoning_effort": "not applied"})
+        self.dispatch(lambda: payload, transport="hermes_claude")
+        record = self.book.record(("workflow", 1, "task", "attempt"))
+        self.assertEqual(record.adjustment, "opus→sonnet (weekly usage 75.0)")
+        self.assertEqual(record.resolved_tier, "sonnet")
+        self.assertEqual(record.observed_model, "unknown")
+        self.assertEqual(record.effort, "not applied")
+
+    def test_registered_codex_boundary_preserves_authority_and_single_admission(self):
+        registrations = {}
+        ctx = SimpleNamespace(register_hook=lambda *a: None,
+            register_middleware=lambda name, fn: registrations.update({name: fn}))
+        with patch.object(claude, "register", return_value=True):
+            router.register(ctx)
+        entrypoint = registrations["tool_execution"]
+        admissions, dispatches = [], []
+        args = {"tasks": [{"goal": "original bounded goal", "context": "original context", "output_schema": {"type": "object"}}]}
+        result = json.dumps({"results": [{"status": "completed", "result": "done"}], "total_duration_seconds": 1})
+        def raw(sent):
+            dispatches.append(sent)
+            return result
+        with patch.object(router, "_load_config", return_value={"enabled": True}), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(router, "_delegated_claude_review_status", return_value=(None, "")), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(worker_admission, "refusal", side_effect=lambda *a, **k: admissions.append(a) or ""), \
+             patch("agent.subagent_lifecycle.get_active_subagent_parent", return_value=self.parent):
+            self.assertIs(entrypoint(tool_name="delegate_task", args=args, next_call=raw), result)
+        self.assertEqual(len(admissions), 1)
+        self.assertEqual(dispatches, [args])
+        self.assertIs(dispatches[0], args)
+        self.assertTrue(self.book.records())
+
+    def test_public_codex_attempt_metadata_deduplicates_dispatch(self):
+        cfg = {"enabled": True}
+        calls = []
+        args = {"goal": "original goal", "context": "original context"}
+        raw = lambda sent: calls.append(sent) or json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(router, "_delegated_claude_review_status", return_value=(None, "")), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(worker_admission, "refusal", return_value=""), \
+             patch("agent.subagent_lifecycle.get_active_subagent_parent", return_value=self.parent):
+            entry = getattr(adapters, "guard_legacy_tool_execution", worker_admission.guard_tool_execution)
+            first = entry(tool_name="delegate_task", args=args, next_call=raw,
+                session_id="workflow", turn_id="turn", tool_call_id="attempt")
+            second = entry(tool_name="delegate_task", args=args, next_call=raw,
+                session_id="workflow", turn_id="turn", tool_call_id="attempt")
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+
+    def test_public_claude_attempt_metadata_deduplicates_without_second_raw_launch(self):
+        calls = []
+        raw = lambda **kw: calls.append(kw) or json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+            entry = getattr(adapters, "guard_legacy_tool_execution", worker_admission.guard_tool_execution)
+            for _ in range(2):
+                payload = entry(tool_name="delegate_claude", args={"goal": "g", "tier": "haiku"},
+                    next_call=claude.handle_delegate_claude, session_id="workflow", turn_id="turn", tool_call_id="attempt")
+                self.assertNotIn("error", json.loads(payload))
+        self.assertEqual(len(calls), 1)
+
+    def test_non_spawn_tools_and_control_actions_bypass_boundary(self):
+        for name, args in (("terminal", {"command": "unchanged"}), ("delegate_task", {"action": "list"})):
+            sentinel = object()
+            entry = getattr(adapters, "guard_legacy_tool_execution", worker_admission.guard_tool_execution)
+            self.assertIs(entry(tool_name=name, args=args, next_call=lambda a: sentinel), sentinel)
+            self.assertEqual(self.book.records(), ())
+
+    def test_actual_claude_entrypoint_single_guard_and_raw_dispatch_with_step_down(self):
+        cfg = _cfg()
+        raw_calls = []
+        parent = self.parent
+        raw_result = json.dumps({"results": [{"status": "completed", "result": "done"}], "total_duration_seconds": 1})
+        def raw(**kw):
+            raw_calls.append(kw)
+            inspect.signature(__import__("tools.delegate_tool", fromlist=["delegate_task"]).delegate_task).bind(**kw)
+            return raw_result
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(claude, "_host", return_value=(raw, lambda: parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(75.0)) as read, \
+             patch.object(claude.usage_guard, "apply", wraps=claude.usage_guard.apply) as apply:
+            args = {"tasks": [{"goal": "g", "context": "original context"}], "tier": "opus"}
+            payload = json.loads(claude.handle_delegate_claude(args))
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(apply.call_count, 1)
+        self.assertEqual(len(raw_calls), 1)
+        self.assertEqual(raw_calls[0]["credentials_cfg"], {"provider": "anthropic", "model": "claude-sonnet-5-5", "fallback_providers": []})
+        self.assertEqual(raw_calls[0]["tasks"], args["tasks"])
+        self.assertEqual(payload["claude_tier"], "sonnet")
+        self.assertIn("opus→sonnet", payload["tier_adjusted"])
+        records = self.book.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].resolved_tier, "sonnet")
+        self.assertIn("opus→sonnet", records[0].adjustment)
+        self.assertEqual(records[0].status, "succeeded")
+
+    def test_real_claude_handler_preserves_scoped_config_effort_and_credentials(self):
+        from tools import delegate_tool, delegate_tool_config
+        from hermes_constants import parse_reasoning_effort
+        cfg = _cfg()
+        cfg["claude_delegation"]["reasoning_effort"] = {"sonnet": "high", "opus": "low"}
+        self.addCleanup(claude._reset_reasoning_bridge_for_tests)
+        parent = SimpleNamespace(provider="openai-codex", reasoning_config={"effort": "medium"}, _delegate_depth=0)
+        seen = []
+        def resolver(parent_agent, delegation_cfg, parent_api_key, *, model=None, override_provider=None,
+                     override_base_url=None, override_api_key=None, override_api_mode=None,
+                     override_acp_command=None, override_acp_args=None, routing_cfg=None):
+            return {"provider": override_provider, "model": model, "reasoning_config": parent.reasoning_config}
+        def raw(**kw):
+            creds = kw["credentials_cfg"]
+            seen.append(delegate_tool._resolve_child_runtime(parent, {}, None, model=creds["model"], override_provider=creds["provider"]))
+            return json.dumps({"results": [{"status": "completed", "result": "done"}], "total_duration_seconds": 1})
+        with patch.object(delegate_tool, "_resolve_child_runtime", resolver), \
+             patch.object(delegate_tool_config, "_resolve_child_runtime", resolver), \
+             patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(claude, "_host", return_value=(raw, lambda: parent)), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+            for tier in ("sonnet", "opus"):
+                self.assertNotIn("error", json.loads(claude.handle_delegate_claude({"goal": "g", "tier": tier})))
+        self.assertEqual([r["reasoning_config"] for r in seen], [parse_reasoning_effort("high"), parse_reasoning_effort("low")])
+        self.assertEqual(parent.reasoning_config, {"effort": "medium"})
+
+    def test_requested_same_tier_efforts_never_reach_real_configured_medium_handler(self):
+        cfg = _cfg()
+        cfg["claude_delegation"]["reasoning_effort"] = {"sonnet": "medium"}
+        starts = []
+        adapter = adapters.HermesClaudeAdapter(claude.handle_delegate_claude,
+            runtime_snapshot=snapshot(), admission=lambda *a, **k: "")
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(claude, "_host", return_value=(lambda **kw: starts.append(kw) or json.dumps({"delegation_id": "d"}), lambda: self.parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+            for effort in ("low", "high"):
+                target = identity("hermes_claude", alias="sonnet5", provider="anthropic", model="claude-sonnet-5-5", effort=effort)
+                self.assertFalse(adapter.submit(request(target, attempt=effort)).accepted)
+        self.assertEqual(starts, [])
+        self.assertEqual(cfg["claude_delegation"]["reasoning_effort"], {"sonnet": "medium"})
+
+    def test_forbidden_step_down_never_reaches_real_handler_but_legacy_records_adjustment(self):
+        cfg = _cfg()
+        starts = []
+        adapter = adapters.HermesClaudeAdapter(claude.handle_delegate_claude,
+            runtime_snapshot=snapshot(), admission=lambda *a, **k: "")
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(claude, "_host", return_value=(lambda **kw: starts.append(kw) or json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1}), lambda: self.parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(75.0)):
+            target = identity("hermes_claude", alias="opus5", provider="anthropic", model="claude-opus-5-5")
+            self.assertFalse(adapter.submit(request(target)).accepted)
+            self.assertEqual(starts, [])
+            allowed = json.loads(claude.handle_delegate_claude({"goal": "g", "tier": "opus"}))
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(allowed["claude_tier"], "sonnet")
+        self.assertIn("opus→sonnet", allowed["tier_adjusted"])
+        self.assertEqual(self.book.records()[0].resolved_tier, "sonnet")
+
+    def test_missing_capacity_seam_refuses_before_native_dispatch(self):
+        import sys
+        import types
+        starts = []
+        with patch.dict(sys.modules, {"tools.delegate_tool": types.ModuleType("tools.delegate_tool")}):
+            raw = adapters.native_legacy_dispatch(lambda: starts.append("start"), parent=self.parent,
+                transport="hermes_codex")
+        self.assertIn("error", json.loads(raw))
+        self.assertEqual(starts, [])
+        self.assertEqual(self.book.records(), ())
+
+    def test_real_cli_wrapper_passes_exact_canonical_identity_and_read_only_tools(self):
+        target = identity("claude_cli", alias="sonnet", provider="anthropic", model="claude-sonnet-5-5", selection_mode="exact")
+        completed = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"type": "result", "subtype": "success", "result": "reviewed", "modelUsage": {"claude-sonnet-5-5": {}}, "num_turns": 1}))
+        with patch.object(cli.subprocess, "run", return_value=completed) as run, \
+             patch.object(cli, "_load_config", return_value={}), \
+             patch.object(cli, "classify_review_dispatch", return_value=(True, "")):
+            result = router._run_opus5_bridge(repo=str(Path(__file__).parent), task="[sonnet-review] inspect file", write=False,
+                review=True, model="sonnet", requested_alias="sonnet", identity=target, cfg={})
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], "claude-sonnet-5-5")
+        self.assertEqual(command[command.index("--tools") + 1], "Read")
+        self.assertIn("Bash", command[command.index("--disallowedTools") + 1])
+        self.assertEqual(run.call_args.kwargs["cwd"], str(Path(__file__).parent))
+        self.assertEqual(result["effective_model"], "claude-sonnet-5-5")
+        self.assertEqual(len(self.book.records()), 1)
+        self.assertEqual(self.book.records()[0].observed_model, "claude-sonnet-5-5")
+
+    def test_cli_failure_keeps_unknown_receipt_and_propagates_typed_exception(self):
+        with patch.object(cli, "dispatch", side_effect=cli.ClaudeBridgeFailure("model mismatch", "model-mismatch")):
+            with self.assertRaises(cli.ClaudeBridgeFailure):
+                router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
+        self.assertEqual(len(self.book.records()), 1)
+        self.assertEqual(self.book.records()[0].status, "unknown")
 
 
 if __name__ == "__main__":

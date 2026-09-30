@@ -9,6 +9,12 @@ from claude_opus_bridge import (CANONICAL_OPUS_MODEL, ClaudeBridgeFailure, class
 
 
 class ClaudeOpusBridgeTests(unittest.TestCase):
+    def setUp(self):
+        from model_router import execution_adapters
+        owner = patch.object(execution_adapters, "RESERVATIONS", execution_adapters.ReservationBook())
+        owner.start()
+        self.addCleanup(owner.stop)
+
     @patch("claude_opus_bridge.subprocess.run")
     def test_invalid_limits_never_launch_a_process(self, run):
         with tempfile.TemporaryDirectory() as directory:

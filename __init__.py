@@ -4824,7 +4824,20 @@ def _verified_delegated_claude_review(text: str, cfg: Dict[str, Any], *, request
 def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False, cfg: Dict[str, Any],
                       model: Optional[str] = None, requested_alias: Optional[str] = None,
                       adjustment: str = "", identity: Any = None, **context: Any) -> Dict[str, Any]:
-    """Lazy bridge import keeps the standalone CLI and package imports independent."""
+    """Legacy CLI boundary; keep admission at the existing policy call site."""
+    from .execution_adapters import dispatch_legacy
+    return dispatch_legacy(
+        lambda: _run_opus5_bridge_raw(repo=repo, task=task, write=write, review=review, cfg=cfg,
+            model=model, requested_alias=requested_alias, adjustment=adjustment, identity=identity, **context),
+        transport="claude_cli", scope="claude_cli:local_credentials", limit=1,
+        evidence={"claude_tier": model or "opus", "tier_adjusted": adjustment},
+    )
+
+
+def _run_opus5_bridge_raw(*, repo: str, task: str, write: bool, review: bool = False, cfg: Dict[str, Any],
+                      model: Optional[str] = None, requested_alias: Optional[str] = None,
+                      adjustment: str = "", identity: Any = None, **context: Any) -> Dict[str, Any]:
+    """Lazy raw bridge import; never calls the public adapter boundary recursively."""
     from .claude_opus_bridge import dispatch
 
     coding_cfg = cfg.get("coding_agent") or {}
@@ -5560,7 +5573,8 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_middleware("llm_request", route_llm_request)
     ctx.register_middleware("llm_execution", run_llm_with_transient_failover)
-    ctx.register_middleware("tool_execution", worker_admission.guard_tool_execution)
+    from .execution_adapters import guard_legacy_tool_execution
+    ctx.register_middleware("tool_execution", guard_legacy_tool_execution)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("subagent_start", on_subagent_start)
     ctx.register_hook("subagent_stop", on_subagent_stop)

@@ -1,392 +1,350 @@
-"""S05 wrappers for the existing Hermes/Codex, Hermes/Claude and Claude CLI seams.
+"""Transport boundaries, not a second scheduler or a source of tool authority.
 
-These adapters translate the frozen S04 records into the narrow, already-supported
-transport calls.  They deliberately do not alter global delegation configuration,
-construct agents, or infer an observed identity from a configured target.
+Legacy calls keep their host-owned payload/selection/budgets. Their receipts are
+separate from ExecutionRequest: missing authority is never filled with defaults.
+Structured requests fail closed where the installed transports cannot enforce the
+whole request. S06 owns durable receipts and reconciliation of unknown workers.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
-from dataclasses import replace
+import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 from . import execution_contracts as contracts
 from . import worker_admission
+
+AttemptKey = Tuple[str, int, str, str]
+_MAX_RECORDS = 4096
+_MAX_CACHED_RESPONSE = 8192
+_NATIVE_INVOCATION: ContextVar[Any] = ContextVar("model_router_legacy_invocation", default=None)
+
+
+@dataclass(frozen=True)
+class LegacyReceipt:
+    """Bounded execution evidence only; no invented permissions or observed identity."""
+    attempt_key: AttemptKey
+    transport: str
+    scope: str
+    handle: str
+    status: str = "unknown"
+    child_ids: Tuple[str, ...] = ()
+    resolved_tier: str = "unknown"
+    adjustment: str = ""
+    effort: str = "unknown"
+    observed_model: str = "unknown"
+
+
+@dataclass
+class _Claim:
+    scope: str
+    weight: int
+    receipt: LegacyReceipt
+    response: Any = None
+    cached: bool = False
+    fingerprint: str = ""
+
+
+class ReservationBook:
+    """One locked process-local owner for slot claims and attempt deduplication.
+
+    Unknown/in-flight claims never expire. Terminal receipts also retain their
+    attempt keys: reaching the bounded journal limit refuses new work rather than
+    silently forgetting a key and permitting duplicate mutation. S06 supplies
+    persistence/reconciliation; this class never automatically replays an attempt.
+    """
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._claims: Dict[Any, _Claim] = {}
+
+    def _begin(self, scope: str, key: AttemptKey, limit: int, weight: int,
+               transport: str, fingerprint: str = "") -> Tuple[bool, Optional[_Claim]]:
+        with self._lock:
+            existing = self._claims.get(key)
+            if existing is not None:
+                if (existing.scope != scope or existing.receipt.transport != transport
+                        or existing.fingerprint != fingerprint):
+                    return False, None  # changed authority under an already used attempt ID
+                return False, existing
+            if (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+                    or isinstance(weight, bool) or not isinstance(weight, int) or weight < 1):
+                return False, None
+            used = sum(c.weight for c in self._claims.values() if c.scope == scope)
+            if used + weight > limit or len(self._claims) >= _MAX_RECORDS:
+                return False, None
+            entry = _Claim(scope, weight, LegacyReceipt(key, transport, scope, "local-" + uuid.uuid4().hex), fingerprint=fingerprint)
+            self._claims[key] = entry
+            return True, entry
+
+    def claim(self, scope: str, attempt_key: AttemptKey, limit: int) -> bool:
+        """True means a *fresh* authorization, never a previously claimed attempt."""
+        return self._begin(scope, attempt_key, limit, 1, "hermes_codex")[0]
+
+    def record(self, key: AttemptKey) -> Optional[LegacyReceipt]:
+        with self._lock:
+            entry = self._claims.get(key)
+            return entry.receipt if entry else None
+
+    def records(self) -> Tuple[LegacyReceipt, ...]:
+        with self._lock:
+            return tuple(entry.receipt for entry in self._claims.values())
+
+    def _finish(self, key: AttemptKey, raw: Any, *, exceptional: bool = False,
+                evidence: Optional[Mapping[str, Any]] = None) -> None:
+        with self._lock:
+            entry = self._claims[key]
+            entry.receipt = _normalize(entry.receipt, raw, exceptional=exceptional, evidence=evidence)
+            if entry.receipt.status in ("succeeded", "failed", "cancelled", "timed_out"):
+                entry.weight = 0
+            # Cache only bounded legacy responses. Oversized duplicates refuse,
+            # never re-dispatch; the original caller still receives the full raw result.
+            try:
+                size = len(raw) if isinstance(raw, str) else len(json.dumps(raw))
+            except (TypeError, ValueError):
+                size = _MAX_CACHED_RESPONSE + 1
+            if not exceptional and size <= _MAX_CACHED_RESPONSE:
+                entry.response, entry.cached = raw, True
+
+
+RESERVATIONS = ReservationBook()
+
+
+def _payload(raw: Any) -> Mapping[str, Any]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _bounded(value: Any, limit: int = 256) -> str:
+    return value[:limit] if isinstance(value, str) else ""
+
+
+def _identifier(value: Any) -> str:
+    # Reject unretainable identifiers instead of truncating them into a different
+    # handle/model. The original legacy response is still returned verbatim.
+    return value if isinstance(value, str) and 0 < len(value) <= 256 else ""
+
+
+def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
+               evidence: Optional[Mapping[str, Any]] = None) -> LegacyReceipt:
+    payload = _payload(raw)
+    facts = evidence or payload
+    receipt = replace(receipt, resolved_tier=_bounded(facts.get("claude_tier")) or receipt.resolved_tier,
+        adjustment=_bounded(facts.get("tier_adjusted"), 512),
+        effort=_bounded(facts.get("reasoning_effort")) or receipt.effort)
+    if exceptional:
+        return receipt
+    # Only the validated CLI bridge result supplies served-model evidence.
+    if receipt.transport == "claude_cli" and _identifier(payload.get("bridge_run_id")):
+        return replace(receipt, handle=_identifier(payload["bridge_run_id"]), status="succeeded",
+            observed_model=_identifier(payload.get("effective_model")) or "unknown")
+    results = payload.get("results")
+    if isinstance(results, list) and results:
+        statuses = [r.get("status") if isinstance(r, Mapping) else None for r in results]
+        terminal = {"completed", "failed", "error", "cancelled", "timeout"}
+        ids = tuple(dict.fromkeys(_identifier(r.get(k)) for r in results if isinstance(r, Mapping)
+            for k in ("subagent_id", "session_id") if _identifier(r.get(k))))[:128]
+        receipt = replace(receipt, child_ids=ids)
+        if all(isinstance(s, str) and s in terminal for s in statuses) and not payload.get("delegation_id"):
+            state = "succeeded" if all(s == "completed" for s in statuses) else "failed"
+            return replace(receipt, status=state)
+    # A handle proves dispatch acceptance, not completion. Malformed responses,
+    # top-level errors and partial results may follow a start; keep them reserved.
+    handle = next((_identifier(payload.get(k)) for k in ("delegation_id", "subagent_id", "id")
+                   if _identifier(payload.get(k))), receipt.handle)
+    return replace(receipt, handle=handle)
+
+
+def dispatch_legacy(raw_dispatch: Callable[[], Any], *, transport: str, scope: str,
+                    limit: int, weight: int = 1, attempt_key: Optional[AttemptKey] = None,
+                    reservations: Optional[ReservationBook] = None,
+                    evidence: Optional[Mapping[str, Any]] = None, fingerprint: str = "") -> Any:
+    """Call an explicitly raw seam exactly once and return its public payload unchanged.
+
+    Admission remains with the named legacy owner upstream of this call. An
+    observation-only invocation ID is created when the host has no attempt IDs;
+    repeated *new* legacy tool calls are not invented to be the same attempt.
+    """
+    owner = reservations if reservations is not None else RESERVATIONS
+    key = attempt_key if attempt_key is not None else ("legacy", 0, transport, uuid.uuid4().hex)
+    fresh, entry = owner._begin(scope, key, limit, weight, transport, fingerprint)
+    if not fresh:
+        if entry is not None and entry.cached:
+            return entry.response
+        message = "No fresh execution reservation: attempt already started/unknown, capacity unavailable, or receipt journal full. Nothing was spawned by this call."
+        if transport == "claude_cli":
+            from .claude_opus_bridge import ClaudeBridgeFailure
+            raise ClaudeBridgeFailure(message, "concurrency")
+        return json.dumps({"error": message})
+    try:
+        raw = raw_dispatch()
+    except BaseException:
+        owner._finish(key, None, exceptional=True, evidence=evidence)
+        raise
+    owner._finish(key, raw, evidence=evidence)
+    return raw
+
+
+def native_legacy_dispatch(raw_dispatch: Callable[[], Any], *, parent: Any, tasks: Any = None,
+                           transport: str, evidence: Optional[Mapping[str, Any]] = None) -> Any:
+    """No tools/workspaces/routes are invented: the host remains their authority."""
+    try:
+        from tools.delegate_tool import _get_max_concurrent_children
+        limit = _get_max_concurrent_children()
+    except Exception:
+        limit = 0  # missing host capacity seam cannot authorize a launch
+    weight = len(tasks) if isinstance(tasks, list) and tasks else 1
+    # Both native transports share this parent's child capacity. No parent field
+    # or config mutation is used to simulate a route, a workspace, or isolation.
+    scope = f"hermes_children:{getattr(parent, 'session_id', '')}:{id(parent)}"
+    invocation = _NATIVE_INVOCATION.get()
+    key, fingerprint = invocation if invocation is not None else (None, "")
+    return dispatch_legacy(raw_dispatch, transport=transport, scope=scope, limit=limit,
+                           weight=weight, evidence=evidence, attempt_key=key, fingerprint=fingerprint)
+
+
+def guard_legacy_tool_execution(**kwargs: Any) -> Any:
+    """Registered native boundaries; each legacy transport retains one admission owner."""
+    args = kwargs.get("args") or {}
+    name = str(kwargs.get("tool_name") or "").removeprefix("mcp__")
+    if name not in ("delegate_task", "delegate_claude") or args.get("action", "spawn") in ("list", "steer", "stop"):
+        return kwargs["next_call"](args)
+    raw_next = kwargs["next_call"]
+    identifiers = tuple(kwargs.get(k) for k in ("session_id", "turn_id", "tool_call_id"))
+    invocation = None
+    if all(isinstance(value, str) and value for value in identifiers):
+        session, turn, tool_call = identifiers
+        key = (session, 0, turn, tool_call)
+        try:
+            fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        except (TypeError, ValueError):
+            return json.dumps({"error": "Legacy invocation is not a JSON-compatible tool payload. Nothing was spawned."})
+        invocation = (key, fingerprint)
+    token = _NATIVE_INVOCATION.set(invocation)
+    try:
+        if name == "delegate_claude":
+            # Its real handler performs admission, effort scoping and raw native
+            # dispatch. Only correlation metadata crosses this outer boundary.
+            return raw_next(args)
+        def admitted(sent: Dict[str, Any]) -> Any:
+            from agent.subagent_lifecycle import get_active_subagent_parent
+            return native_legacy_dispatch(lambda: raw_next(sent), parent=get_active_subagent_parent(),
+                tasks=sent.get("tasks"), transport="hermes_codex")
+        return worker_admission.guard_tool_execution(**{**kwargs, "next_call": admitted})
+    finally:
+        _NATIVE_INVOCATION.reset(token)
 
 
 def _cap(snapshot: Any, transport: str, name: str) -> Any:
     return snapshot.adapter(transport).capability(name)
 
 
-def _known_handle(raw: Any, *keys: str) -> str:
-    payload: Any = raw
-    if isinstance(raw, str):
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            payload = None
-    if not isinstance(payload, Mapping):
-        return ""
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
-
-
-def _transport_error(raw: Any) -> str:
-    """Return an existing transport refusal verbatim without treating it as a handle."""
-    payload: Any = raw
-    if isinstance(raw, str):
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            return ""
-    if not isinstance(payload, Mapping):
-        return ""
-    error = payload.get("error")
-    return str(error) if isinstance(error, str) and error else ""
-
-
-def _rejection(request: contracts.ExecutionRequest, failure_class: str, reason: str) -> contracts.Submission:
-    return contracts.Submission(request.workflow_id, request.task_id, request.attempt_id, False,
-                                rejection=contracts.FailureDetail(failure_class, False,
-                                                                  message=contracts.OutputReference(reason)))
-
-
-def _unknown_target(target: contracts.TargetIdentity) -> contracts.TargetIdentity:
-    return replace(target, observed=contracts.ModelFact(),
-                   effort=contracts.EffortFact(target.effort.requested, "unknown", "not_observed"))
-
-
-def _failed_result(request: contracts.ExecutionRequest, handle: str, failure_class: str, reason: str,
-                   observed: Optional[contracts.TargetIdentity] = None) -> contracts.WorkerResult:
-    target = observed or _unknown_target(request.target)
-    return contracts.WorkerResult(
-        request.workflow_id, request.task_id, request.attempt_id, handle, "failed", reason,
-        contracts.OutputReference(reason), request.target, request.target, target,
-        workspace=request.workspace, plan_version=request.plan_version,
-        failure=contracts.FailureDetail(failure_class, False, message=contracts.OutputReference(reason)),
-    )
-
-
-class ReservationBook:
-    """Atomic local claims for a host concurrency slot until S06 observes completion."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._claims: Dict[str, set[str]] = {}
-
-    def claim(self, scope: str, attempt_id: str, limit: int) -> bool:
-        with self._lock:
-            attempts = self._claims.setdefault(scope, set())
-            if attempt_id in attempts:
-                return True
-            if len(attempts) >= limit:
-                return False
-            attempts.add(attempt_id)
-            return True
-
-    def release(self, scope: str, attempt_id: str) -> None:
-        with self._lock:
-            attempts = self._claims.get(scope)
-            if attempts is None:
-                return
-            attempts.discard(attempt_id)
-            if not attempts:
-                self._claims.pop(scope, None)
-
-
 class _Adapter:
     transport = ""
-
     def __init__(self, *, cfg: Optional[Dict[str, Any]] = None, runtime_snapshot: Any = None,
                  admission: Callable[..., str] = worker_admission.refusal,
                  reservations: Optional[ReservationBook] = None) -> None:
         self._cfg = cfg if isinstance(cfg, dict) else {}
         self._runtime_snapshot = runtime_snapshot
         self._admission = admission
-        self._reservations = reservations
-        self._pending: Dict[str, contracts.AdapterResult] = {}
+        self._reservations = reservations if reservations is not None else RESERVATIONS
 
     def capabilities(self, runtime_snapshot: Any) -> contracts.AdapterCapabilities:
-        names = tuple(cap.name for cap in runtime_snapshot.adapter(self.transport).capabilities
-                      if cap.status == "supported")
-        return contracts.AdapterCapabilities(self.transport, names)
+        # Host seams are not adapter methods. No structured submit cell is fully
+        # enforceable yet; result lookup and cancellation are likewise not implemented.
+        return contracts.AdapterCapabilities(self.transport, ())
 
-    def _snapshot(self) -> Any:
-        if self._runtime_snapshot is None:
-            raise RuntimeError("adapter requires a runtime capability snapshot")
-        return self._runtime_snapshot
-
-    def _base_eligibility(self, request: contracts.ExecutionRequest, snapshot: Any) -> Optional[contracts.Eligibility]:
+    def _constraint_reasons(self, request: contracts.ExecutionRequest, snapshot: Any) -> Tuple[str, ...]:
+        reasons = []
         if request.target.transport != self.transport:
-            return contracts.Eligibility("unsupported", (f"request transport is {request.target.transport}, not {self.transport}",))
+            reasons.append("request transport does not match adapter")
         submission = _cap(snapshot, self.transport, "submission")
         if submission.status != "supported":
-            return contracts.Eligibility("unsupported", (f"submission is {submission.status}: {submission.reason}",))
-        try:
-            refusal = self._admission(request.target.provider, request.target.resolved.value, self._cfg, blocking=True)
-        except TypeError:
-            refusal = self._admission(request.target.provider, request.target.resolved.value, self._cfg)
-        if refusal:
-            return contracts.Eligibility("unavailable", (str(refusal),))
-        return None
+            reasons.append(f"submission seam is {submission.status}: {submission.reason}")
+        # These mandatory S04 fields have no proven per-call enforcement seams.
+        # Prompting a worker to comply is not permission, workspace or budget enforcement.
+        reasons.extend(("permissions/tool requirements cannot be enforced by this legacy transport",
+            "repository/workspace selection or confinement is not verified for this request",
+            "context reference has no trusted content/revision resolver; acceptance criteria cannot replace it",
+            "per-attempt timeout/deadline and attempt budget lack an enforcing seam"))
+        if request.write_scope:
+            reasons.append("write_scope cannot be enforced by the legacy tool permission contract")
+        if request.target.account:
+            reasons.append("account credential binding is not verified for the authoritative request")
+        if request.target.effort.requested not in ("unknown", "not_applicable"):
+            effort = _cap(snapshot, self.transport, "effort_application")
+            reasons.append(f"requested effort has no proven per-request application/observation seam (host={effort.status})")
+        if request.substitution_policy == "forbid":
+            reasons.append("forbidden substitution cannot be guaranteed by legacy routing/admission")
+        if request.target.selection_mode == "exact":
+            reasons.append("exact provider/account/model/effort request is not fully enforceable and observable")
+        return tuple(reasons)
+
+    def can_execute(self, request: contracts.ExecutionRequest, runtime_snapshot: Any) -> contracts.Eligibility:
+        return contracts.Eligibility("unsupported", self._constraint_reasons(request, runtime_snapshot))
+
+    def submit(self, request: contracts.ExecutionRequest) -> contracts.Submission:
+        if self._runtime_snapshot is None:
+            reasons = ("adapter requires a runtime capability snapshot",)
+        else:
+            reasons = self.can_execute(request, self._runtime_snapshot).reasons
+        return contracts.Submission(request.workflow_id, request.task_id, request.attempt_id, False,
+            rejection=contracts.FailureDetail("capability", False,
+                message=contracts.OutputReference("; ".join(reasons))))
 
     def result(self, handle: str) -> contracts.AdapterResult:
-        return self._pending.get(handle, contracts.PendingResult("unknown", "adapter has no observed handle"))
+        return contracts.PendingResult("unknown", "no structured execution was dispatched; legacy receipts are separate")
 
-    def _reservation_scope(self, request: contracts.ExecutionRequest) -> str:
-        if self.transport in ("hermes_codex", "hermes_claude"):
-            return "hermes_children"
-        return f"{self.transport}:{request.target.provider}:{request.target.account}"
-
-    def _reserve(self, request: contracts.ExecutionRequest, snapshot: Any) -> bool:
-        """Claim the host slot before dispatch; S06 owns eventual completion release."""
-        if self._reservations is None:
-            return True
-        limit = snapshot.max_concurrent_children
-        if limit.status != "supported" or not isinstance(limit.value, int) or limit.value < 1:
-            return False
-        return self._reservations.claim(self._reservation_scope(request), request.attempt_id, limit.value)
-
-    def _release(self, request: contracts.ExecutionRequest) -> None:
-        if self._reservations is not None:
-            self._reservations.release(self._reservation_scope(request), request.attempt_id)
+    def cancel(self, handle: str) -> contracts.CancelOutcome:
+        return contracts.CancelOutcome("unsupported", "S05 does not implement cancellation/reconciliation")
 
 
 class HermesCodexAdapter(_Adapter):
-    """Wrap the host's supported ``delegate_task(tasks=...)`` route.
-
-    The installed host's batch schema does not establish per-call model, provider,
-    effort or completion identity.  Exact requests are therefore refused rather
-    than simulated through host/global configuration mutation.
-    """
     transport = "hermes_codex"
-
-    _GOAL_PREFIX_TARGETS = ("luna", "spark", "terra", "sol")
-
-    def __init__(self, delegate_task: Callable[..., Any], *, cfg: Optional[Dict[str, Any]] = None,
-                 runtime_snapshot: Any = None, admission: Callable[..., str] = worker_admission.refusal,
-                 parent_agent: Callable[[], Any] = lambda: None,
-                 reservations: Optional[ReservationBook] = None) -> None:
-        super().__init__(cfg=cfg, runtime_snapshot=runtime_snapshot, admission=admission,
-                         reservations=reservations)
-        self._delegate_task = delegate_task
-        self._parent_agent = parent_agent
-
-    def can_execute(self, request: contracts.ExecutionRequest, runtime_snapshot: Any) -> contracts.Eligibility:
-        base = self._base_eligibility(request, runtime_snapshot)
-        if base is not None:
-            return base
-        if request.target.alias not in self._GOAL_PREFIX_TARGETS:
-            return contracts.Eligibility("unsupported", (
-                f"Hermes/Codex host selection supports only goal-prefix targets: {', '.join(self._GOAL_PREFIX_TARGETS)}",))
-        if request.mutating and request.target.alias in ("luna", "spark"):
-            return contracts.Eligibility("unsupported", (
-                f"{request.target.alias} is not an eligible mutating Hermes/Codex worker target",))
-        if request.target.selection_mode == "exact":
-            model = _cap(runtime_snapshot, self.transport, "model_parameter")
-            observed = _cap(runtime_snapshot, self.transport, "identity_observability")
-            return contracts.Eligibility("unsupported", (
-                "exact Hermes/Codex selection requires supported per-call model and served-identity seams; "
-                f"model_parameter={model.status}, identity_observability={observed.status}",
-            ))
-        if request.target.effort.requested not in ("unknown", "not_applicable"):
-            return contracts.Eligibility("unsupported", (
-                "Hermes/Codex effort is not a supported per-call delegate_task field on this host",))
-        return contracts.Eligibility("yes")
-
-    def submit(self, request: contracts.ExecutionRequest) -> contracts.Submission:
-        snapshot = self._snapshot()
-        eligibility = self.can_execute(request, snapshot)
-        if eligibility.status != "yes":
-            return _rejection(request, "capability" if eligibility.status == "unsupported" else "concurrency",
-                              "; ".join(eligibility.reasons))
-        parent = self._parent_agent()
-        if parent is None:
-            return _rejection(request, "capability", "delegate_task requires an active Hermes parent")
-        if not self._reserve(request, snapshot):
-            return _rejection(request, "concurrency", "no atomic Hermes child slot is available")
-        try:
-            raw = self._delegate_task(
-                tasks=[{"goal": f"[{request.target.alias}] {request.goal}", "context": request.context_reference}],
-                parent_agent=parent,
-                background=not getattr(parent, "_delegate_depth", 0) > 0,
-            )
-        except Exception as exc:
-            self._release(request)
-            return _rejection(request, "execution-error", f"delegate_task failed: {type(exc).__name__}: {exc}")
-        error = _transport_error(raw)
-        if error:
-            self._release(request)
-            return _rejection(request, "execution-error", error)
-        handle = _known_handle(raw, "delegation_id", "subagent_id", "id")
-        if not handle:
-            self._release(request)
-            return _rejection(request, "execution-error", "delegate_task accepted no observable delegation handle")
-        self._pending[handle] = contracts.PendingResult("unknown", "host completion correlation is owned by S06")
-        return contracts.Submission.for_acceptance(request.workflow_id, request.task_id, request.attempt_id, handle)
-
-    def cancel(self, handle: str) -> contracts.CancelOutcome:
-        return contracts.CancelOutcome("unsupported", "legacy delegate_task stop ownership is not wrapped by S05")
+    def __init__(self, delegate_task: Callable[..., Any], *, parent_agent: Callable[[], Any] = lambda: None,
+                 **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._delegate_task, self._parent_agent = delegate_task, parent_agent
 
 
 class HermesClaudeAdapter(_Adapter):
-    """Wrap ``delegate_claude`` while keeping its per-call credentials/effort scope."""
     transport = "hermes_claude"
     _TIER_FOR_ALIAS = {"haiku": "haiku", "sonnet5": "sonnet", "opus5": "opus", "sonnet": "sonnet", "opus": "opus"}
-
-    def __init__(self, delegate_claude: Callable[[Dict[str, Any]], Any], *, cfg: Optional[Dict[str, Any]] = None,
-                 runtime_snapshot: Any = None, admission: Callable[..., str] = worker_admission.refusal,
-                 reservations: Optional[ReservationBook] = None) -> None:
-        super().__init__(cfg=cfg, runtime_snapshot=runtime_snapshot, admission=admission,
-                         reservations=reservations)
+    def __init__(self, delegate_claude: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self._delegate_claude = delegate_claude
 
-    def _tier(self, request: contracts.ExecutionRequest) -> str:
-        return self._TIER_FOR_ALIAS.get(request.target.alias, "")
-
     def applied_effort(self, request: contracts.ExecutionRequest) -> contracts.EffortFact:
-        return contracts.EffortFact(request.target.effort.requested,
-                                    "not_applicable" if self._tier(request) == "haiku" else "unknown",
-                                    "haiku_no_thinking" if self._tier(request) == "haiku" else "not_observed")
-
-    def can_execute(self, request: contracts.ExecutionRequest, runtime_snapshot: Any) -> contracts.Eligibility:
-        base = self._base_eligibility(request, runtime_snapshot)
-        if base is not None:
-            return base
-        tier = self._tier(request)
-        if not tier:
-            return contracts.Eligibility("unsupported", (f"no delegate_claude tier for {request.target.alias!r}",))
-        if tier == "haiku":
-            if request.target.effort.requested not in ("unknown", "not_applicable"):
-                return contracts.Eligibility("unsupported", ("Haiku has no reasoning-effort transport seam",))
-        else:
-            effort = _cap(runtime_snapshot, self.transport, "effort_application")
-            if effort.status != "supported":
-                return contracts.Eligibility("unsupported", (
-                    f"Claude reasoning-effort seam is {effort.status}: {effort.reason}",))
-            if request.target.selection_mode == "exact" and request.target.effort.requested not in ("unknown", "not_applicable"):
-                return contracts.Eligibility("unsupported", (
-                    "exact Claude effort is not observable from the legacy delegate_claude response",))
-        if request.target.selection_mode == "exact":
-            observed = _cap(runtime_snapshot, self.transport, "identity_observability")
-            return contracts.Eligibility("unsupported", (
-                f"exact Hermes/Claude selection needs served identity evidence; identity_observability={observed.status}",))
-        return contracts.Eligibility("yes")
-
-    def submit(self, request: contracts.ExecutionRequest) -> contracts.Submission:
-        snapshot = self._snapshot()
-        eligibility = self.can_execute(request, snapshot)
-        if eligibility.status != "yes":
-            return _rejection(request, "capability" if eligibility.status == "unsupported" else "concurrency",
-                              "; ".join(eligibility.reasons))
-        if not self._reserve(request, snapshot):
-            return _rejection(request, "concurrency", "no atomic Hermes child slot is available")
-        try:
-            raw = self._delegate_claude({"tasks": [{"goal": request.goal, "context": request.context_reference}],
-                                         "tier": self._tier(request)})
-        except Exception as exc:
-            self._release(request)
-            return _rejection(request, "execution-error", f"delegate_claude failed: {type(exc).__name__}: {exc}")
-        error = _transport_error(raw)
-        if error:
-            self._release(request)
-            return _rejection(request, "execution-error", error)
-        handle = _known_handle(raw, "delegation_id", "subagent_id", "id")
-        if not handle:
-            self._release(request)
-            return _rejection(request, "execution-error", "delegate_claude accepted no observable delegation handle")
-        self._pending[handle] = contracts.PendingResult("unknown", "host completion correlation is owned by S06")
-        return contracts.Submission.for_acceptance(request.workflow_id, request.task_id, request.attempt_id, handle)
+        haiku = self._TIER_FOR_ALIAS.get(request.target.alias) == "haiku"
+        return contracts.EffortFact(request.target.effort.requested, "not_applicable" if haiku else "unknown",
+            "haiku_no_thinking" if haiku else "not_observed")
 
     def submit_batch(self, requests: Iterable[contracts.ExecutionRequest]) -> Tuple[contracts.Submission, ...]:
-        # Mixed tiers/efforts become individual calls; delegate_claude accepts one tier per call.
         return tuple(self.submit(request) for request in requests)
-
-    def cancel(self, handle: str) -> contracts.CancelOutcome:
-        return contracts.CancelOutcome("unsupported", "delegate_claude cancellation seam is not observed by S05")
 
 
 class ClaudeCliAdapter(_Adapter):
-    """Wrap the existing synchronous Claude CLI bridge with result-model evidence."""
     transport = "claude_cli"
-    _TIER_FOR_ALIAS = {"opus": "opus", "opus5": "opus", "sonnet": "sonnet", "sonnet5": "sonnet"}
-
-    def __init__(self, bridge: Callable[..., Mapping[str, Any]], *, cfg: Optional[Dict[str, Any]] = None,
-                 runtime_snapshot: Any = None, admission: Callable[..., str] = worker_admission.refusal,
-                 reservations: Optional[ReservationBook] = None) -> None:
-        super().__init__(cfg=cfg, runtime_snapshot=runtime_snapshot, admission=admission,
-                         reservations=reservations)
+    def __init__(self, bridge: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self._bridge = bridge
 
-    def can_execute(self, request: contracts.ExecutionRequest, runtime_snapshot: Any) -> contracts.Eligibility:
-        base = self._base_eligibility(request, runtime_snapshot)
-        if base is not None:
-            return base
-        tier = self._TIER_FOR_ALIAS.get(request.target.alias)
-        if not tier:
-            return contracts.Eligibility("unsupported", (f"no Claude CLI tier for {request.target.alias!r}",))
-        if request.target.selection_mode == "exact":
-            exact = _cap(runtime_snapshot, self.transport, "exact_model")
-            observed = _cap(runtime_snapshot, self.transport, "identity_observability")
-            if exact.status != "supported" or observed.status != "supported":
-                return contracts.Eligibility("unsupported", (
-                    f"exact CLI route needs exact_model and identity_observability evidence; "
-                    f"exact_model={exact.status}, identity_observability={observed.status}",))
-        return contracts.Eligibility("yes")
 
-    def submit(self, request: contracts.ExecutionRequest) -> contracts.Submission:
-        eligibility = self.can_execute(request, self._snapshot())
-        if eligibility.status != "yes":
-            return _rejection(request, "capability" if eligibility.status == "unsupported" else "concurrency",
-                              "; ".join(eligibility.reasons))
-        tier = self._TIER_FOR_ALIAS[request.target.alias]
-        try:
-            payload = self._bridge(repo=request.repository.removeprefix("repo:"), task=request.goal,
-                                   write=request.mutating, review=not request.mutating, model=tier,
-                                   requested_alias=tier, cfg=self._cfg)
-        except Exception as exc:
-            return _rejection(request, getattr(exc, "failure_class", "execution-error"), str(exc))
-        handle = _known_handle(payload, "bridge_run_id")
-        if not handle:
-            return _rejection(request, "execution-error", "Claude CLI bridge returned no observable bridge_run_id")
-        model = str(payload.get("effective_model") or "") if isinstance(payload, Mapping) else ""
-        observed = replace(request.target, observed=contracts.ModelFact(
-            model or "unknown", "claude_cli.result.effective_model" if model else "not_observed", canonical=bool(model)),
-            effort=contracts.EffortFact(request.target.effort.requested, "unknown", "not_observed"))
-        if request.target.selection_mode == "exact" and (not model or model != request.target.requested.value):
-            result = _failed_result(request, handle, "exact-route-mismatch",
-                                    "Claude CLI served-model evidence did not match the exact request", observed)
-        else:
-            result = contracts.WorkerResult(
-                request.workflow_id, request.task_id, request.attempt_id, handle, "succeeded", "completed",
-                contracts.OutputReference(str(payload.get("result") or "")), request.target, request.target, observed,
-                workspace=request.workspace, plan_version=request.plan_version,
-            )
-        self._pending[handle] = result
-        return contracts.Submission.for_acceptance(request.workflow_id, request.task_id, request.attempt_id, handle)
-
-    def cancel(self, handle: str) -> contracts.CancelOutcome:
-        return contracts.CancelOutcome("unsupported", "synchronous Claude CLI process cancellation is not wrapped by S05")
-
-
-def legacy_adapters(*, delegate_task: Callable[..., Any], delegate_claude: Callable[[Dict[str, Any]], Any],
-                    claude_bridge: Callable[..., Mapping[str, Any]], cfg: Optional[Dict[str, Any]] = None,
-                    runtime_snapshot: Any = None,
-                    admission: Callable[..., str] = worker_admission.refusal,
+def legacy_adapters(*, delegate_task: Callable[..., Any], delegate_claude: Callable[..., Any],
+                    claude_bridge: Callable[..., Any], cfg: Optional[Dict[str, Any]] = None,
+                    runtime_snapshot: Any = None, admission: Callable[..., str] = worker_admission.refusal,
                     parent_agent: Callable[[], Any] = lambda: None,
                     reservations: Optional[ReservationBook] = None) -> Dict[str, _Adapter]:
-    """Expose existing legacy transports through the adapter boundary without interception.
-
-    Callers keep ownership of their current entrypoints; this factory only passes the
-    original callable through, so it cannot recurse through a tool wrapper or perform
-    a second admission/dispatch.
-    """
+    """Compatibility factory; actual legacy entrypoints use dispatch_legacy directly."""
     kwargs = {"cfg": cfg, "runtime_snapshot": runtime_snapshot, "admission": admission,
-              "reservations": reservations}
+              "reservations": reservations if reservations is not None else RESERVATIONS}
     return {"hermes_codex": HermesCodexAdapter(delegate_task, parent_agent=parent_agent, **kwargs),
             "hermes_claude": HermesClaudeAdapter(delegate_claude, **kwargs),
             "claude_cli": ClaudeCliAdapter(claude_bridge, **kwargs)}
