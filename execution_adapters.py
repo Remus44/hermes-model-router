@@ -47,6 +47,7 @@ class _Claim:
     response: Any = None
     cached: bool = False
     fingerprint: str = ""
+    sealed: bool = False
 
 
 class ReservationBook:
@@ -64,6 +65,13 @@ class ReservationBook:
     def _begin(self, scope: str, key: AttemptKey, limit: int, weight: int,
                transport: str, fingerprint: str = "") -> Tuple[bool, Optional[_Claim]]:
         with self._lock:
+            if not isinstance(key, tuple) or len(key) != 4:
+                return False, None  # an attempt ID alone is not a full ownership key
+            workflow, plan_version, task, attempt = key
+            if (isinstance(plan_version, bool) or not isinstance(plan_version, int) or plan_version < 0
+                    or not all(isinstance(value, str) and 0 < len(value) <= 256
+                               for value in (workflow, task, attempt))):
+                return False, None
             existing = self._claims.get(key)
             if existing is not None:
                 if (existing.scope != scope or existing.receipt.transport != transport
@@ -93,10 +101,32 @@ class ReservationBook:
         with self._lock:
             return tuple(entry.receipt for entry in self._claims.values())
 
+    def _tool_response(self, key: AttemptKey, fingerprint: str, transport: str) -> Tuple[bool, Any]:
+        with self._lock:
+            entry = self._claims.get(key)
+            if entry is None:
+                return False, None
+            if (entry.fingerprint == fingerprint and entry.receipt.transport == transport
+                    and entry.sealed and entry.cached):
+                return True, entry.response
+            return True, json.dumps({"error": "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})
+
+    def _seal_tool_response(self, key: AttemptKey, raw: Any) -> None:
+        # Native raw completion precedes Claude's effort/step-down annotation.
+        # Seal only the complete public response so replay neither re-admits nor
+        # enters a fresh reasoning scope that could falsely report 'not applied'.
+        with self._lock:
+            if key not in self._claims:
+                return  # established refusal before raw dispatch
+        self._finish(key, raw)
+        with self._lock:
+            self._claims[key].sealed = True
+
     def _finish(self, key: AttemptKey, raw: Any, *, exceptional: bool = False,
                 evidence: Optional[Mapping[str, Any]] = None) -> None:
         with self._lock:
             entry = self._claims[key]
+            entry.response, entry.cached = None, False
             entry.receipt = _normalize(entry.receipt, raw, exceptional=exceptional, evidence=evidence)
             if entry.receipt.status in ("succeeded", "failed", "cancelled", "timed_out"):
                 entry.weight = 0
@@ -205,8 +235,12 @@ def native_legacy_dispatch(raw_dispatch: Callable[[], Any], *, parent: Any, task
     # or config mutation is used to simulate a route, a workspace, or isolation.
     scope = f"hermes_children:{getattr(parent, 'session_id', '')}:{id(parent)}"
     invocation = _NATIVE_INVOCATION.get()
-    key, fingerprint = invocation if invocation is not None else (None, "")
-    return dispatch_legacy(raw_dispatch, transport=transport, scope=scope, limit=limit,
+    key, fingerprint, started = invocation if invocation is not None else (None, "", None)
+    def launch() -> Any:
+        if started is not None:
+            started[0] = True
+        return raw_dispatch()
+    return dispatch_legacy(launch, transport=transport, scope=scope, limit=limit,
                            weight=weight, evidence=evidence, attempt_key=key, fingerprint=fingerprint)
 
 
@@ -226,18 +260,26 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
             fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, allow_nan=False).encode()).hexdigest()
         except (TypeError, ValueError):
             return json.dumps({"error": "Legacy invocation is not a JSON-compatible tool payload. Nothing was spawned."})
-        invocation = (key, fingerprint)
+        invocation = (key, fingerprint, [False])
+        transport = "hermes_claude" if name == "delegate_claude" else "hermes_codex"
+        exists, response = RESERVATIONS._tool_response(key, fingerprint, transport)
+        if exists:
+            return response
     token = _NATIVE_INVOCATION.set(invocation)
     try:
         if name == "delegate_claude":
             # Its real handler performs admission, effort scoping and raw native
             # dispatch. Only correlation metadata crosses this outer boundary.
-            return raw_next(args)
-        def admitted(sent: Dict[str, Any]) -> Any:
-            from agent.subagent_lifecycle import get_active_subagent_parent
-            return native_legacy_dispatch(lambda: raw_next(sent), parent=get_active_subagent_parent(),
-                tasks=sent.get("tasks"), transport="hermes_codex")
-        return worker_admission.guard_tool_execution(**{**kwargs, "next_call": admitted})
+            response = raw_next(args)
+        else:
+            def admitted(sent: Dict[str, Any]) -> Any:
+                from agent.subagent_lifecycle import get_active_subagent_parent
+                return native_legacy_dispatch(lambda: raw_next(sent), parent=get_active_subagent_parent(),
+                    tasks=sent.get("tasks"), transport="hermes_codex")
+            response = worker_admission.guard_tool_execution(**{**kwargs, "next_call": admitted})
+        if invocation is not None and invocation[2][0]:
+            RESERVATIONS._seal_tool_response(invocation[0], response)
+        return response
     finally:
         _NATIVE_INVOCATION.reset(token)
 

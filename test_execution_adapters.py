@@ -147,6 +147,14 @@ class StructuredConstraintTests(unittest.TestCase):
 
 class ExistingDefectRegressionTests(unittest.TestCase):
     """These assertion failures reproduce defects using only pre-fix public APIs."""
+    def test_reservation_owner_rejects_partial_attempt_keys(self):
+        for key in ("attempt", ("workflow", 1, "task"), ("workflow", True, "task", "attempt"),
+                    ("", 1, "task", "attempt")):
+            with self.subTest(key=key):
+                book = adapters.ReservationBook()
+                self.assertFalse(book.claim("shared", key, 1))
+                self.assertEqual(book.records(), ())
+
     def test_existing_claim_is_not_a_fresh_dispatch_authorization(self):
         book = adapters.ReservationBook()
         self.assertTrue(book.claim("shared", ("wf", 1, "task", "attempt"), 1))
@@ -381,13 +389,17 @@ class LegacyBoundaryTests(unittest.TestCase):
         raw = lambda **kw: calls.append(kw) or json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
         with patch.object(router, "_load_config", return_value=_cfg()), \
              patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
-             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)) as read:
             entry = getattr(adapters, "guard_legacy_tool_execution", worker_admission.guard_tool_execution)
+            results = []
             for _ in range(2):
                 payload = entry(tool_name="delegate_claude", args={"goal": "g", "tier": "haiku"},
                     next_call=claude.handle_delegate_claude, session_id="workflow", turn_id="turn", tool_call_id="attempt")
+                results.append(payload)
                 self.assertNotIn("error", json.loads(payload))
         self.assertEqual(len(calls), 1)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(results[0], results[1])
 
     def test_non_spawn_tools_and_control_actions_bypass_boundary(self):
         for name, args in (("terminal", {"command": "unchanged"}), ("delegate_task", {"action": "list"})):
@@ -447,7 +459,13 @@ class LegacyBoundaryTests(unittest.TestCase):
              patch.object(claude, "_host", return_value=(raw, lambda: parent)), \
              patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
             for tier in ("sonnet", "opus"):
-                self.assertNotIn("error", json.loads(claude.handle_delegate_claude({"goal": "g", "tier": tier})))
+                metadata = {"tool_name": "delegate_claude", "args": {"goal": "g", "tier": tier},
+                    "next_call": claude.handle_delegate_claude, "session_id": "workflow", "turn_id": "turn", "tool_call_id": tier}
+                first = adapters.guard_legacy_tool_execution(**metadata)
+                duplicate = adapters.guard_legacy_tool_execution(**metadata)
+                self.assertNotIn("error", json.loads(first))
+                self.assertNotIn("reasoning_effort", json.loads(first))  # real wrapped resolver saw application
+                self.assertEqual(first, duplicate)  # replay must not falsely annotate effort 'not applied'
         self.assertEqual([r["reasoning_config"] for r in seen], [parse_reasoning_effort("high"), parse_reasoning_effort("low")])
         self.assertEqual(parent.reasoning_config, {"effort": "medium"})
 
