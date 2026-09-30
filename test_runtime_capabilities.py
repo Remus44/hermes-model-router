@@ -1,0 +1,200 @@
+"""Offline compatibility matrix: capability evidence is not dispatch/admission."""
+from copy import deepcopy
+from dataclasses import FrozenInstanceError
+from concurrent.futures import ThreadPoolExecutor
+import json
+import sys
+import unittest
+from unittest.mock import patch
+
+import model_router as router
+from model_router import claude_delegation
+from model_router.host_delegation_fixtures import (
+    host_delegation, delegate_task_request, DIRECT_CLAUDE_TOOLS, DEFERRED_CLAUDE_TOOLS,
+)
+from model_router import runtime_capabilities as runtime
+
+
+class RuntimeCapabilitiesTests(unittest.TestCase):
+    def setUp(self):
+        # Import only the safe host modules, never run_agent or a real child.
+        import tools.delegate_tool as host
+        self.host = host
+        self.cfg = {"orchestration": {"enabled": True, "conductor": "sonnet5"},
+                    "callable": {"sonnet5": True}, "claude_delegation": {"enabled": True}}
+        runtime.clear_cache()
+        self.addCleanup(runtime.clear_cache)
+
+    def snapshot(self, request=None):
+        return runtime.snapshot(request if request is not None else delegate_task_request(), self.cfg)
+
+    def test_depth_one_refuses_nested_and_defaults_to_parent_direct(self):
+        with host_delegation(depth=1):
+            snap = self.snapshot()
+            self.assertEqual(snap.max_spawn_depth.value, 1)
+            choice = runtime.resolve_topology(snap, "nested_conductor")
+            self.assertEqual(choice.status, "unsupported")
+            self.assertIn("depth", choice.reason)
+            self.assertEqual(choice.selected, "parent_direct")
+            self.assertEqual(runtime.resolve_topology(snap).selected, "parent_direct")
+
+    def test_depth_two_supports_checked_codex_conductor(self):
+        with host_delegation(depth=2):
+            choice = runtime.resolve_topology(self.snapshot(), "nested_conductor")
+            self.assertEqual((choice.status, choice.selected), ("supported", "nested_conductor"))
+
+    def test_orchestrator_kill_switch_is_not_depth_support(self):
+        with host_delegation(depth=2, orchestrator_enabled=False):
+            self.assertEqual(runtime.resolve_topology(self.snapshot(), "nested_conductor").status, "unsupported")
+
+    def test_alias_alone_never_selects_external_conductor(self):
+        with host_delegation(depth=2), patch.object(claude_delegation, "is_active", return_value=False):
+            choice = runtime.resolve_topology(self.snapshot(), "nested_conductor", transport="hermes_claude")
+            self.assertEqual(choice.status, "unsupported")
+            self.assertEqual(choice.selected, "parent_direct")
+            self.assertTrue(choice.reason)
+
+    def test_normal_and_deferred_claude_visibility_are_distinct(self):
+        with host_delegation(depth=2), patch.object(claude_delegation, "is_active", return_value=True):
+            for tools, expected in ((DIRECT_CLAUDE_TOOLS, "supported"), (DEFERRED_CLAUDE_TOOLS, "unknown")):
+                request = delegate_task_request()
+                request["tools"].extend({"name": n, "parameters": {}} for n in tools if n != "delegate_task")
+                snap = self.snapshot(request)
+                self.assertEqual(snap.adapter("hermes_claude").capability("submission").status, expected)
+                if expected == "unknown":
+                    self.assertEqual(runtime.resolve_topology(snap, "nested_conductor", transport="hermes_claude").status, "unsupported")
+
+    def test_schema_variants_under_both_parent_providers_and_depths(self):
+        for wire in ("openai", "anthropic"):
+            for depth in (1, 2):
+                for schema in ("batch-only", "model-param"):
+                    with self.subTest(wire=wire, depth=depth, schema=schema), host_delegation(depth=depth):
+                        snap = self.snapshot(delegate_task_request(schema, wire=wire))
+                        cap = snap.adapter("hermes_codex").capability("model_parameter")
+                        self.assertEqual(cap.status, "supported" if schema == "model-param" else "unsupported")
+                        self.assertEqual(snap.adapter("hermes_codex").capability("exact_model").status, "unknown")
+                        self.assertEqual(runtime.resolve_topology(snap, "nested_conductor").status,
+                                         "supported" if depth == 2 else "unsupported")
+
+    def test_missing_or_false_seams_fail_closed(self):
+        for name in ("delegate_task", "_resolve_child_toolsets", "_build_child_agent"):
+            with self.subTest(name=name), host_delegation(depth=2), patch.object(self.host, name, False):
+                snap = self.snapshot()
+                self.assertEqual(runtime.resolve_topology(snap, "nested_conductor").status, "unsupported")
+
+    def test_missing_host_does_not_import_it_or_invent_limits(self):
+        with patch.dict(sys.modules, {"tools.delegate_tool": None, "tools.delegate_tool_config": None}):
+            snap = self.snapshot()
+            self.assertEqual(snap.max_spawn_depth.status, "unknown")
+            self.assertEqual(snap.adapter("hermes_codex").capability("submission").status, "unsupported")
+
+    def test_absent_and_malformed_tool_schema_are_explicit(self):
+        for request in ({}, {"tools": [{"name": "delegate_task", "parameters": {"properties": []}}]}):
+            with self.subTest(request=request):
+                self.assertNotEqual(self.snapshot(request).adapter("hermes_codex").capability("submission").status, "supported")
+
+    def test_real_installed_schema_and_control_seams(self):
+        request = {"tools": [deepcopy(self.host.DELEGATE_TASK_SCHEMA)]}
+        snap = self.snapshot(request)
+        adapter = snap.adapter("hermes_codex")
+        self.assertEqual(adapter.capability("model_parameter").status, "unsupported")
+        self.assertEqual(adapter.capability("cancellation").status, "supported")
+        self.assertIn("cooperative", adapter.capability("cancellation").reason)
+        self.assertEqual(adapter.capability("async_delivery").status, "supported")
+        self.assertIn("consumer", adapter.capability("async_delivery").reason)
+        self.assertEqual(adapter.capability("workspace_isolation").status, "unknown")
+
+    def test_matrix_unknown_identity_effort_permissions_and_cli(self):
+        for wire in ("openai", "anthropic"):
+            with self.subTest(parent=wire):
+                snap = self.snapshot(delegate_task_request(wire=wire))
+                for transport in ("hermes_codex", "hermes_claude", "claude_cli"):
+                    adapter = snap.adapter(transport)
+                    for name in ("exact_model", "identity_observability", "permissions", "workspace_isolation"):
+                        self.assertNotEqual(adapter.capability(name).status, "supported")
+                    self.assertNotEqual(adapter.capability("effort_application").status, "supported")
+                self.assertEqual(snap.adapter("claude_cli").capability("submission").status, "unknown")
+
+    def test_mixed_batch_and_concurrency_not_slot_reservation(self):
+        with host_delegation(depth=2, max_concurrent_children=1):
+            snap = self.snapshot()
+            self.assertEqual(snap.max_concurrent_children.value, 1)
+            self.assertEqual(snap.adapter("hermes_claude").capability("mixed_target_batch").status, "unsupported")
+            self.assertTrue(snap.admission_required)
+
+    def test_fallback_owned_by_host_not_parent_config_mutation(self):
+        snap = self.snapshot()
+        self.assertEqual(snap.adapter("hermes_codex").capability("fallback_ownership").value, "host_route_config")
+        self.assertEqual(snap.adapter("hermes_claude").capability("fallback_ownership").value, "per_call_credentials_cfg")
+
+    def test_fingerprint_changes_on_depth_schema_config_and_seam(self):
+        with host_delegation(depth=1):
+            first = self.snapshot()
+            self.assertIs(self.snapshot(), first)
+        with host_delegation(depth=2):
+            self.assertNotEqual(self.snapshot().fingerprint, first.fingerprint)
+        self.assertNotEqual(self.snapshot(delegate_task_request("model-param")).fingerprint, first.fingerprint)
+        self.cfg["callable"]["sonnet5"] = False
+        self.assertNotEqual(self.snapshot().fingerprint, first.fingerprint)
+        with patch.object(self.host, "delegate_task", False):
+            self.assertNotEqual(self.snapshot().fingerprint, first.fingerprint)
+
+    def test_cache_ttl_and_bound(self):
+        with patch.object(runtime.time, "monotonic", return_value=100):
+            first = self.snapshot()
+        with patch.object(runtime.time, "monotonic", return_value=100 + runtime.CACHE_TTL_SECONDS + 1):
+            self.assertIsNot(first, self.snapshot())
+        for i in range(runtime.CACHE_MAX_ENTRIES + 5):
+            self.cfg["orchestration"]["conductor"] = "fixture-" + str(i)
+            self.snapshot()
+        self.assertLessEqual(runtime.cache_info()["size"], runtime.CACHE_MAX_ENTRIES)
+
+    def test_snapshot_is_immutable_json_diagnostic_is_detached(self):
+        snap = self.snapshot()
+        with self.assertRaises(FrozenInstanceError):
+            snap.admission_required = False
+        diagnostic = runtime.diagnostic(snap)
+        json.dumps(diagnostic)
+        self.assertEqual(diagnostic["configured"]["orchestration_enabled"], True)
+        self.assertEqual(diagnostic["topology"]["active"], "unknown")
+        self.assertEqual(diagnostic["topology"]["selected"], "parent_direct")
+        diagnostic["configured"]["orchestration_enabled"] = False
+        self.assertTrue(runtime.diagnostic(snap)["configured"]["orchestration_enabled"])
+
+    def test_discovery_has_no_dispatch_subprocess_network_or_writes(self):
+        cfg, request = deepcopy(self.cfg), delegate_task_request()
+        before = deepcopy(request)
+        with patch.object(self.host, "delegate_task", side_effect=AssertionError("dispatch")), \
+             patch("subprocess.Popen", side_effect=AssertionError("subprocess")), \
+             patch("socket.socket", side_effect=AssertionError("network")), \
+             patch.object(claude_delegation, "install_reasoning_bridge", side_effect=AssertionError("mutation")):
+            snap = self.snapshot(request)
+            self.assertEqual(snap.schema_version, 1)
+        self.assertEqual(self.cfg, cfg)
+        self.assertEqual(request, before)
+
+    def test_concurrent_snapshot_reads_do_not_leak_config(self):
+        before = deepcopy(self.cfg)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            snapshots = list(pool.map(lambda _: self.snapshot(), range(32)))
+        self.assertTrue(all(s.fingerprint == snapshots[0].fingerprint for s in snapshots))
+        self.assertEqual(self.cfg, before)
+
+    def test_invalid_topology_and_transport_refused(self):
+        snap = self.snapshot()
+        for topology, transport in (("invented", "hermes_codex"), ("nested_conductor", "invented")):
+            choice = runtime.resolve_topology(snap, topology, transport=transport)
+            self.assertEqual(choice.status, "unsupported")
+            self.assertTrue(choice.reason)
+
+    def test_checked_effort_seam_moved_is_explicit(self):
+        with patch.object(self.host, "_resolve_child_runtime", False):
+            cap = self.snapshot().adapter("hermes_claude").capability("effort_application")
+            self.assertEqual(cap.status, "unsupported")
+            self.assertTrue(cap.reason)
+
+    def test_read_only_router_diagnostic_entrypoint(self):
+        with host_delegation(depth=1):
+            data = router.runtime_diagnostic(delegate_task_request(), self.cfg)
+            self.assertEqual(data["topology"]["selected"], "parent_direct")
+            self.assertEqual(data["schema_version"], 1)

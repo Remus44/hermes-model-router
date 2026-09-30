@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - Hermes includes PyYAML
     yaml = None
 
 from . import claude_delegation
+from . import runtime_capabilities
 from . import usage_guard
 from . import worker_admission
 from .hermes_paths import hermes_path
@@ -3385,6 +3386,21 @@ def _host_delegation_limits() -> Dict[str, Any]:
                 "conductor_available": _get_orchestrator_enabled() and depth >= 2}
     except (ImportError, AttributeError, TypeError, ValueError):
         return {"conductor_available": False}
+
+
+def runtime_diagnostic(
+    request: Any = None, cfg: Optional[Dict[str, Any]] = None,
+    topology: str = runtime_capabilities.DEFAULT_TOPOLOGY, transport: str = "hermes_codex",
+) -> Dict[str, Any]:
+    """Read-only S01 view: configured feature vs runtime capability vs topology.
+
+    Not called from the routing hot path; it never dispatches, probes a model,
+    writes config, or raises the host spawn depth. Fresh admission is still
+    required before any execution.
+    """
+    cfg = _load_config() if cfg is None else cfg
+    snap = runtime_capabilities.snapshot(request, cfg)
+    return runtime_capabilities.diagnostic(snap, topology, transport)
 
 
 def _orchestration_skip_reason(

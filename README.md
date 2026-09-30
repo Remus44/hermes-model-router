@@ -1173,6 +1173,35 @@ it — see above — because the operator asked to own the mapping. A single-ent
 chain (`sensitive: [sol]`) keeps the loud failure; add a second entry only if you
 would rather the work continue elsewhere than stop.
 
+### Runtime capability matrix and worker topology
+
+`runtime_capabilities.py` builds a read-only, frozen snapshot of what the host
+could support: spawn depth, concurrent children, the orchestrator switch, the
+checked delegation seams, and per-transport capabilities (`hermes_codex`,
+`hermes_claude`, `claude_cli`) for submission, model parameter, effort
+application, cancellation, async delivery, fallback ownership and mixed-target
+batches. Each entry is `supported`, `unsupported` or `unknown` with a reason; a
+missing, false or unverifiable seam is never `supported`. Discovery reads the
+request's tool schema and in-process host settings only: no model probe,
+subprocess, network call or config write.
+
+The default topology is `parent_direct` (the parent plans, workers run directly,
+host depth untouched). `nested_conductor` is granted only when depth is at least
+2, the orchestrator role is enabled, the host seams are callable and the chosen
+transport's submission is `supported`. An explicit nested request that fails
+returns `unsupported` with a reason and `parent_direct` as the selected topology;
+the router never raises the host depth, and a configured conductor alias alone
+selects nothing.
+
+`model_router.runtime_diagnostic(request, cfg)` returns a JSON-able view that keeps
+three things apart: *configured* features (router config), *runtime* capability
+(snapshot) and the *topology* (requested/selected; `active` is always `unknown`,
+since a snapshot cannot observe the running topology). Snapshots are cached (30 s,
+16 entries, locked) under a fingerprint of host limits, schema, seams and routing
+config, so any change invalidates them. A snapshot is evidence, not admission:
+fresh admission is still required immediately before execution. The diagnostic
+is not called on the routing path, so existing routing decisions are unchanged.
+
 ## Usage
 
 ### Explicit Model Override
