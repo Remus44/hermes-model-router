@@ -316,6 +316,21 @@ class ReviewRegressionTests(unittest.TestCase):
         unknown = replace(wanted, account=contracts.UNKNOWN)
         self.assertEqual(self.result(resolved_target=unknown, observed_target=unknown).terminal_status, 'succeeded')
 
+    def test_a07_unconstrained_request_accepts_known_observed_account(self):
+        wanted = self.result().requested_target
+        unconstrained = replace(wanted, account=contracts.UNKNOWN)
+        observed = replace(wanted, observed=contracts.ModelFact())
+        self.assertEqual(self.result(requested_target=unconstrained, resolved_target=observed,
+                                     observed_target=observed).terminal_status, 'succeeded')
+
+    def test_a07_unconstrained_request_accepts_known_resolved_account(self):
+        wanted = self.result().requested_target
+        unconstrained = replace(wanted, account=contracts.UNKNOWN)
+        resolved = replace(wanted, observed=contracts.ModelFact())
+        observed = replace(unconstrained, observed=contracts.ModelFact())
+        self.assertEqual(self.result(requested_target=unconstrained, resolved_target=resolved,
+                                     observed_target=observed).terminal_status, 'succeeded')
+
     def test_a07_exact_worker_result_accepts_matching_account_and_transport(self):
         wanted = self.result().requested_target
         matching = replace(wanted, observed=contracts.ModelFact())

@@ -516,8 +516,9 @@ class WorkerResult:
             effort = self.observed_target.effort.applied
             if (check_exact(combined) is not None
                     or any(target.provider != wanted.provider for target in (self.resolved_target, self.observed_target))
-                    or any(target.account not in (UNKNOWN, wanted.account)
-                           for target in (self.resolved_target, self.observed_target))
+                    or (wanted.account != UNKNOWN
+                        and any(target.account not in (UNKNOWN, wanted.account)
+                                for target in (self.resolved_target, self.observed_target)))
                     or any(target.transport != wanted.transport
                            for target in (self.resolved_target, self.observed_target))
                     or (wanted.effort.requested not in (UNKNOWN, NOT_APPLICABLE)
