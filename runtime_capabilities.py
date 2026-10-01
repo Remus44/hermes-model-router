@@ -461,27 +461,30 @@ def compatibility_matrix(snap: RuntimeSnapshot, *, parallel: bool = False) -> Tu
 
     Parent provider is deliberately not an input: the host seams do not depend on it, and
     what a Codex or Claude parent can reach is already visible as the request's tool list
-    (``delegate_claude`` present or deferred) that the snapshot fingerprints. ``parallel``
-    only matters for ``concurrent_calls``, which depends on the host concurrency limit.
+    (``delegate_claude`` present or deferred) that the snapshot fingerprints.
+    ``parallel`` is accepted for compatibility and no longer changes any status. The host
+    ``max_concurrent_children`` is a per-call batch width: not a limit on distinct legacy
+    invocations and not a CLI concurrency limit (the host is the sole admission authority
+    for legacy dispatches). ``concurrent_calls`` therefore stays ``unknown`` and reports
+    the observed width as its own ``observed`` fact.
     """
     rows = []
     for case, cap_name, owner, why in MATRIX_CASES:
         for adapter in snap.adapters:
+            extra: Dict[str, Any] = {}
             if cap_name is not None:
                 cap = adapter.capability(cap_name)
                 status, reason = cap.status, cap.reason
             elif case == "concurrent_calls":
                 conc = snap.max_concurrent_children
-                if not parallel:
-                    status, reason = UNKNOWN, "state isolation between calls is verified by adapter tests"
-                elif conc.status != SUPPORTED:
-                    status, reason = UNKNOWN, f"host concurrency limit unknown: {conc.reason}"
-                elif conc.value < 2:
-                    status, reason = UNSUPPORTED, f"host max concurrent children is {conc.value}"
-                else:
-                    status, reason = UNKNOWN, "limit allows parallel calls; state isolation is not verified"
+                width = conc.value if conc.status == SUPPORTED else UNKNOWN
+                extra["observed"] = {"host_batch_width": width}
+                status = UNKNOWN
+                reason = (f"host per-call batch width is {width} ({conc.status}); it is not a limit on "
+                          "distinct legacy invocations or on the CLI, and the host alone admits legacy "
+                          "dispatches, so distinct-call capacity is not reported")
             else:
                 status, reason = UNKNOWN, why
             rows.append({"case": case, "transport": adapter.transport, "status": status,
-                         "reason": reason, "owner": owner})
+                         "reason": reason, "owner": owner, **extra})
     return tuple(rows)

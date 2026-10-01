@@ -319,16 +319,31 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             table = {(r["case"], r["transport"]): r["status"] for r in self._matrix(request)}
         self.assertEqual(table[("submission", "hermes_claude")], "unknown")
 
-    def test_matrix_serial_vs_parallel_depends_on_host_concurrency(self):
-        for limit, parallel, expected in ((1, False, "unknown"), (1, True, "unsupported"),
-                                          (3, True, "unknown"), (3, False, "unknown")):
-            with self.subTest(limit=limit, parallel=parallel), host_delegation(depth=1, max_concurrent_children=limit):
-                rows = [r for r in self._matrix(parallel=parallel) if r["case"] == "concurrent_calls"]
-                self.assertEqual({r["status"] for r in rows}, {expected})
-                self.assertTrue(all(r["reason"] and r["owner"] == "S05" for r in rows))
+    def test_matrix_concurrent_calls_never_derives_status_from_batch_width(self):
+        # C01: the host per-call batch width is its own observed fact; it is not a limit on
+        # distinct legacy invocations or on the CLI, so the row stays unknown for every width.
+        for limit in (1, 3):
+            for parallel in (False, True):
+                with self.subTest(limit=limit, parallel=parallel), \
+                        host_delegation(depth=1, max_concurrent_children=limit):
+                    rows = [r for r in self._matrix(parallel=parallel) if r["case"] == "concurrent_calls"]
+                    self.assertEqual({r["transport"] for r in rows}, set(runtime.TRANSPORTS))
+                    self.assertEqual({r["status"] for r in rows}, {"unknown"})
+                    for r in rows:
+                        self.assertEqual(r["owner"], "S05")
+                        self.assertEqual(r["observed"], {"host_batch_width": limit})
+                        self.assertIn("batch width", r["reason"])
+                        self.assertIn("not a limit on distinct", r["reason"])
+                        self.assertIn("host", r["reason"])
         with patch.dict(sys.modules, {"tools.delegate_tool": None, "tools.delegate_tool_config": None}):
             rows = [r for r in self._matrix(parallel=True) if r["case"] == "concurrent_calls"]
             self.assertEqual({r["status"] for r in rows}, {"unknown"})
+            self.assertTrue(all(r["observed"] == {"host_batch_width": "unknown"} and r["reason"]
+                                for r in rows))
+
+    def test_matrix_other_rows_carry_no_observed_batch_width(self):
+        rows = [r for r in self._matrix() if r["case"] != "concurrent_calls"]
+        self.assertTrue(all("observed" not in r for r in rows))
 
     def test_fallback_ownership_not_reported_from_config(self):
         snap = self.snapshot()
