@@ -1,4 +1,6 @@
 import json
+import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -1319,6 +1321,180 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(marker['executed']['model'], 'gpt-terra')
         self.assertIs(response.output[0].content[0], original_part)
         self.assertEqual((original_part.type, original_part.refusal), ('refusal', refusal))
+
+    # --- F04 fix round 3 (re-review N3/N4): the text that really ends the turn,
+    # including text the execution middleware never sees, through the real host
+    # finalizer seams, a real host PluginManager holding exactly the hooks
+    # router.register wires, the real normalizer and the real child projection.
+    # Always pass a logger to the host seams: without one they import
+    # agent.conversation_loop, which pulls run_agent's dependency sync.
+    HOOK_LOG = logging.getLogger('test_bridge_policy.f04_n3_n4')
+
+    def _host_hook_manager(self):
+        from hermes_cli.plugins import PluginManager
+
+        manager = PluginManager()
+        ctx = SimpleNamespace(
+            register_hook=lambda name, fn: manager._hooks.setdefault(name, []).append(fn),
+            register_middleware=lambda name, fn: manager._middleware.setdefault(name, []).append(fn))
+        with patch.object(router.claude_delegation, 'register', return_value=True):
+            router.register(ctx)
+        patcher = patch('hermes_cli.plugins._delivery_manager', return_value=manager)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return manager
+
+    @staticmethod
+    def _child_entry(final_response, completed):
+        from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
+        return _build_result_entry(SimpleNamespace(model='configured-child'), {
+            'final_response': final_response, 'completed': completed, 'failed': False, 'api_calls': 3,
+        }, 0, 0.1, _SchemaOutcome(None, None, [], 0))
+
+    def _iteration_limit_turn(self, turn, session_id):
+        """Real budget fallback -> real handle_max_iterations -> real Codex summary
+        builder/normalizer (only the provider result stubbed) -> real output hooks."""
+        from agent import chat_completion_helpers as helpers
+        from agent.transports.codex import ResponsesApiTransport
+        from agent.turn_finalizer import _apply_output_hooks, _resolve_budget_fallback
+
+        summary_call = Mock(return_value=self._n1_response('final'))
+        agent = SimpleNamespace(
+            max_iterations=3, iteration_budget=SimpleNamespace(remaining=0), quiet_mode=True,
+            suppress_status_output=True, api_mode='codex_responses', session_id=session_id,
+            model='gpt-terra', platform='subagent', _persist_disabled=False,
+            _emit_diagnostic_status=Mock(), _safe_print=Mock(),
+            _build_api_kwargs=Mock(return_value={'model': 'gpt-terra', 'tools': []}),
+            _interruptible_api_call=summary_call, _get_transport=ResponsesApiTransport)
+        agent._handle_max_iterations = lambda messages, count: helpers.handle_max_iterations(agent, messages, count)
+        messages = [{'role': 'user', 'content': '[opus-review] Review parser'}]
+        log = self.HOOK_LOG
+        env = {key: value for key, value in os.environ.items() if key != 'HERMES_KANBAN_TASK'}
+        with patch.object(helpers, '_iteration_summary_api_messages', side_effect=lambda a, m: m), \
+             patch('agent.relay_llm.complete_logical_call'), \
+             patch.object(router, '_load_config', return_value=self.N1_CFG), \
+             patch.object(router, 'run_llm_with_transient_failover') as middleware, \
+             patch.dict(os.environ, env, clear=True):
+            final, reason, _ = _resolve_budget_fallback(
+                agent, final_response=None, api_call_count=3, interrupted=False, failed=False,
+                messages=messages, _turn_exit_reason='budget_exhausted', _pending_verification_response=None,
+                _pending_verification_response_previewed=False, logger=log)
+            final, transformed, pre_transform = _apply_output_hooks(
+                agent, final, log, platform='subagent', effective_task_id='sa-0', turn_id=turn,
+                original_user_message='[opus-review] Review parser', messages=messages)
+        middleware.assert_not_called()
+        self.assertEqual(summary_call.call_count, 1)
+        self.assertTrue(reason.startswith('max_iterations_reached'), reason)
+        return final, transformed, pre_transform
+
+    def test_f04_n3_iteration_limit_summary_carries_one_marker_to_the_parent(self):
+        self._host_hook_manager()
+        for first_kind in ('reasoning', 'tool'):
+            with self.subTest(first_reply=first_kind):
+                turn = f'child-n3:sa-0:{first_kind}'
+                # The replacement's first reply; a tool call already carries the
+                # round-1 marker, which must not suppress the summary's own.
+                self._n1_call(self._n1_response(first_kind), 1, turn)
+                final, transformed, pre_transform = self._iteration_limit_turn(turn, 'child-n3')
+                entry = self._child_entry(final, completed=False)
+
+                self.assertEqual((entry['status'], entry['exit_reason'], entry['truncated']),
+                                 ('completed', 'max_iterations', True))
+                self.assertEqual(pre_transform, 'PASS: parser inspected')
+                self.assertTrue(transformed)
+                self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
+                marker = self._marker_line(entry['summary'])
+                self.assertEqual(marker['kind'], 'ordinary_replacement')
+                self.assertEqual(marker['failure_kind'], 'timeout')
+                self.assertEqual(marker['requested_review'], {'tier': 'opus', 'transport': 'claude_cli'})
+                self.assertEqual(marker['executed']['status'], 'unknown')
+                self.assertFalse(marker['satisfies_cross_provider_review'])
+                # post_llm_call runs after the transform and clears the turn's entry.
+                self.assertIsNone(router._pending_replacement_get(turn))
+
+    def test_f04_n3_non_substituted_iteration_summary_is_unchanged(self):
+        self._host_hook_manager()
+        final, transformed, _ = self._iteration_limit_turn('child-n3:sa-0:plain', 'child-n3')
+        entry = self._child_entry(final, completed=False)
+        self.assertEqual(final, 'PASS: parser inspected')
+        self.assertFalse(transformed)
+        self.assertEqual((entry['status'], entry['exit_reason'], entry['truncated'], entry['summary']),
+                         ('completed', 'max_iterations', True, 'PASS: parser inspected'))
+
+    @staticmethod
+    def _n4_response(status='completed', reason=None, phase='final_answer', item_status='completed',
+                     text='PASS: parser inspected'):
+        item = SimpleNamespace(type='message', status=item_status, role='assistant', phase=phase,
+                               content=[SimpleNamespace(type='output_text', text=text)])
+        return SimpleNamespace(output=[item], output_text=text, model='gpt-terra', provider='openai-codex',
+                               status=status,
+                               incomplete_details=SimpleNamespace(reason=reason) if reason else None)
+
+    def test_f04_n4_terminal_predicate_matches_the_installed_host_normalizer(self):
+        cases = {
+            'final_phase_max_output_tokens': dict(status='incomplete', reason='max_output_tokens'),
+            'phaseless_max_output_tokens': dict(status='incomplete', reason='max_output_tokens', phase=None),
+            'final_phase_content_filter': dict(status='incomplete', reason='content_filter'),
+            'queued': dict(status='queued'),
+            'in_progress': dict(status='in_progress'),
+            'item_incomplete': dict(item_status='incomplete'),
+            'item_in_progress': dict(item_status='in_progress'),
+            'commentary_only': dict(phase='commentary'),
+            'completed_final_phase': dict(),
+            'completed_phaseless': dict(phase=None),
+        }
+        expected_finish = {'final_phase_max_output_tokens': 'stop', 'final_phase_content_filter': 'content_filter',
+                           'completed_final_phase': 'stop', 'completed_phaseless': 'stop'}
+        for name, shape in cases.items():
+            with self.subTest(case=name):
+                host = self._codex_normalized(self._n4_response(**shape))
+                self.assertEqual(host.finish_reason, expected_finish.get(name, 'incomplete'))
+                self.assertEqual(router._provenance_shape(self._n4_response(**shape))['terminal'],
+                                 host.finish_reason == 'stop' and not host.tool_calls)
+
+    def test_f04_n4_final_phase_reply_on_incomplete_response_ends_turn_with_one_marker(self):
+        from agent.turn_finalizer import apply_llm_output_transform
+
+        self._host_hook_manager()
+        turn = 'child-n4:sa-0:status'
+        self._n1_call(self._n1_response('reasoning'), 1, turn)
+        before = self._codex_normalized(self._n4_response(status='incomplete', reason='max_output_tokens'))
+        delivered = self._n1_call(self._n4_response(status='incomplete', reason='max_output_tokens'), 2, turn)
+        normalized = self._codex_normalized(delivered)
+        self.assertEqual((before.finish_reason, normalized.finish_reason), ('stop', 'stop'),
+                         'the host finish reason changed')
+        # finish_text_response's seam: the host's once-per-turn output transform.
+        agent = SimpleNamespace(session_id='child-n4', model='gpt-terra', platform='subagent')
+        final, transformed, _ = apply_llm_output_transform(agent, normalized.content, turn_id=turn, logger=self.HOOK_LOG)
+        self.assertFalse(transformed, 'the final-output hook marked an already marked reply')
+        entry = self._child_entry(final, completed=True)
+        self.assertEqual((entry['status'], entry['exit_reason']), ('completed', 'completed'))
+        self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
+        marker = self._marker_line(entry['summary'])
+        self.assertEqual(marker['executed']['model'], 'gpt-terra')
+        self.assertEqual(marker['failure_kind'], 'timeout')
+
+    def test_f04_n4_unmarked_final_text_of_a_substituted_turn_gets_one_marker_at_delivery(self):
+        """Backstop: a final reply the middleware did not mark (any shape the
+        terminal mirror misjudges) still reaches the parent with one marker."""
+        from agent.turn_finalizer import apply_llm_output_transform
+
+        self._host_hook_manager()
+        turn = 'child-n4:sa-0:backstop'
+        self._n1_call(self._n1_response('reasoning'), 1, turn)
+        agent = SimpleNamespace(session_id='child-n4', model='gpt-terra', platform='subagent')
+        final, transformed, raw = apply_llm_output_transform(agent, 'PASS: parser inspected', turn_id=turn, logger=self.HOOK_LOG)
+        self.assertTrue(transformed)
+        self.assertEqual(raw, 'PASS: parser inspected')
+        self.assertEqual(self._marker_line(self._child_entry(final, completed=True)['summary'])['kind'],
+                         'ordinary_replacement')
+        # Another turn, and the same text with no retained entry, stay unchanged.
+        other = SimpleNamespace(session_id='other', model='gpt-terra', platform='subagent')
+        text = 'PASS: parser inspected'
+        unchanged, transformed, _ = apply_llm_output_transform(other, text, turn_id='other:sa-1:turn',
+                                                                logger=self.HOOK_LOG)
+        self.assertIs(unchanged, text)
+        self.assertFalse(transformed)
 
     # Audit H01: remove when F07 lands
     @unittest.expectedFailure

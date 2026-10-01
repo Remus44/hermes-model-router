@@ -4945,6 +4945,11 @@ def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
     return marker
 
 
+def _provenance_annotation(marker: Dict[str, Any]) -> str:
+    encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return _SUBSTITUTION_PROVENANCE_PREFIX + encoded
+
+
 class _AnnotatedResponseOverlay:
     """Read-through view of a response that cannot take the provenance carrier.
 
@@ -5027,12 +5032,25 @@ def _provenance_shape(result: Any) -> Optional[Dict[str, Any]]:
     # (stream-delivered answers), unless the text is commentary-only.
     aggregate_only = (not has_item_text and bool(aggregate.strip())
                       and (final_phase or not commentary))
+    # Same precedence as the host's ``_normalize_codex_response``: a queued or
+    # in-progress response, or an incomplete non-server item, always continues;
+    # a top-level ``incomplete`` (e.g. max_output_tokens) or commentary
+    # continues only without a final-phase message; an ``incomplete`` response
+    # whose reason is ``content_filter`` is a refusal, never a final ``stop``.
+    # The final-output hook (``on_transform_llm_output``) is the backstop when
+    # this mirror and the host ever disagree.
+    status = str(_provenance_field(result, "status") or "").casefold()
+    details = _provenance_field(result, "incomplete_details")
+    reason = str(_provenance_field(details, "reason") or "").strip().casefold() if details is not None else ""
+    item_incomplete = any(
+        str(_provenance_field(item, "status") or "").casefold() in _PROVENANCE_INCOMPLETE_STATUSES
+        and _provenance_field(item, "type") not in _PROVENANCE_SERVER_TOOL_ITEM_TYPES
+        for item in output)
     incomplete = (
-        str(_provenance_field(result, "status") or "").casefold() in _PROVENANCE_INCOMPLETE_STATUSES
-        or any(str(_provenance_field(item, "status") or "").casefold() in _PROVENANCE_INCOMPLETE_STATUSES
-               and _provenance_field(item, "type") not in _PROVENANCE_SERVER_TOOL_ITEM_TYPES
-               for item in output)
-        or (commentary and not final_phase)
+        (status == "incomplete" and reason == "content_filter")
+        or status in ("queued", "in_progress")
+        or item_incomplete
+        or ((status == "incomplete" or commentary) and not final_phase)
     )
     return {
         "output": output, "aggregate": aggregate, "phases": phases,
@@ -5064,8 +5082,7 @@ def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
     continues) is returned unannotated: marker-only text would turn it into a
     final ``stop``.
     """
-    encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    annotation = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
+    annotation = _provenance_annotation(marker)
 
     shape = _provenance_shape(result)
     if shape is None:
@@ -5202,47 +5219,61 @@ def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]
 # kept while the host may still continue the turn, removed when the turn ends
 # (post_llm_call), and bounded by a TTL and a size cap so an abandoned turn
 # cannot leak.
-_PENDING_REPLACEMENTS: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
+# Each entry is (monotonic stamp, replacement, marker lines the middleware has
+# already put on this turn's replies); the final-output hook uses the last one
+# to avoid marking a reply twice.
+_PENDING_REPLACEMENTS: "OrderedDict[str, Tuple[float, Dict[str, Any], set]]" = OrderedDict()
 _PENDING_REPLACEMENT_LOCK = threading.Lock()
 _PENDING_REPLACEMENT_MAX = 256
 _PENDING_REPLACEMENT_TTL_SECONDS = 6 * 3600.0
+_PENDING_REPLACEMENT_MARKERS_MAX = 8
 _pending_replacement_clock = time.monotonic
 
 
 def _pending_replacement_key(context: Dict[str, Any]) -> Optional[str]:
     # The host mints one turn id per turn (``<session>:<task>:<uuid>``, kept for
-    # every call of the turn) and passes it to the middleware and to
-    # post_llm_call. The session id is not part of the key: compression can
-    # rotate it in the middle of a turn, which would orphan the entry.
+    # every call of the turn) and passes it to the middleware, to
+    # transform_llm_output and to post_llm_call. The session id is not part of
+    # the key: compression can rotate it in the middle of a turn, which would
+    # orphan the entry.
     turn_id = str(context.get("turn_id") or "")
     return turn_id or None  # without a turn identity the state could not be scoped
 
 
 def _pending_replacement_prune(now: float) -> None:
     """Drop expired entries, then the oldest beyond the cap. Caller holds the lock."""
-    for key in [key for key, (stamp, _) in _PENDING_REPLACEMENTS.items()
-                if now - stamp > _PENDING_REPLACEMENT_TTL_SECONDS]:
+    for key in [key for key, entry in _PENDING_REPLACEMENTS.items()
+                if now - entry[0] > _PENDING_REPLACEMENT_TTL_SECONDS]:
         del _PENDING_REPLACEMENTS[key]
     while len(_PENDING_REPLACEMENTS) > max(0, int(_PENDING_REPLACEMENT_MAX)):
         _PENDING_REPLACEMENTS.popitem(last=False)
 
 
 def _pending_replacement_get(key: Optional[str]) -> Optional[Dict[str, Any]]:
+    entry = _pending_replacement_entry(key)
+    return entry[0] if entry else None
+
+
+def _pending_replacement_entry(key: Optional[str]) -> Optional[Tuple[Dict[str, Any], Tuple[str, ...]]]:
+    """(replacement, marker lines already delivered on this turn's replies), or None."""
     if key is None:
         return None
     with _PENDING_REPLACEMENT_LOCK:
         _pending_replacement_prune(_pending_replacement_clock())
         entry = _PENDING_REPLACEMENTS.get(key)
-        return entry[1] if entry else None
+        return (entry[1], tuple(entry[2])) if entry else None
 
 
-def _pending_replacement_put(key: Optional[str], replacement: Dict[str, Any]) -> None:
+def _pending_replacement_put(key: Optional[str], replacement: Dict[str, Any],
+                             marker_lines: Tuple[str, ...] = ()) -> None:
     if key is None:
         return
     with _PENDING_REPLACEMENT_LOCK:
         now = _pending_replacement_clock()
-        _PENDING_REPLACEMENTS.pop(key, None)
-        _PENDING_REPLACEMENTS[key] = (now, replacement)
+        previous = _PENDING_REPLACEMENTS.pop(key, None)
+        delivered = [*(previous[2] if previous else ()), *marker_lines]
+        _PENDING_REPLACEMENTS[key] = (now, replacement,
+                                      tuple(delivered[-max(1, int(_PENDING_REPLACEMENT_MARKERS_MAX)):]))
         _pending_replacement_prune(now)
 
 
@@ -5270,10 +5301,52 @@ def _deliver_replacement_result(result: Any, replacement: Dict[str, Any],
     shape = _provenance_shape(result)
     if shape is None:
         return _record_ordinary_replacement_result(result, replacement) if first_call else result
-    _pending_replacement_put(key, replacement)
     if first_call or shape["terminal"]:
-        return _record_ordinary_replacement_result(result, replacement)
+        annotated = _record_ordinary_replacement_result(result, replacement)
+        _pending_replacement_put(key, replacement, _provenance_marker_lines(annotated))
+        return annotated
+    _pending_replacement_put(key, replacement)
     return result
+
+
+def _provenance_marker_lines(result: Any) -> Tuple[str, ...]:
+    """Marker lines carried by a Responses result's message items."""
+    output = _provenance_field(result, "output")
+    lines = []
+    for item in (output if isinstance(output, list) else ()):
+        lines += [line.strip() for line in _provenance_item_text(item).splitlines()
+                  if line.strip().startswith(_SUBSTITUTION_PROVENANCE_PREFIX.strip())]
+    return tuple(lines)
+
+
+def on_transform_llm_output(response_text: Any = None, turn_id: Any = None, **_: Any) -> Optional[str]:
+    """Final-delivery backstop for a turn whose review was substituted (N3/N4).
+
+    The host fires ``transform_llm_output`` once per turn with the text that
+    becomes the turn's final response (and so a child's ``summary`` for its
+    parent), including text the execution middleware never saw: the
+    iteration-limit summary is a direct provider call, and a reply whose shape
+    the middleware's terminal mirror misjudged is passed through unmarked. When
+    this turn has retained replacement provenance and the final text does not
+    already carry a marker line this router delivered on the turn, one marker
+    line is appended. A turn with no retained entry gets ``None`` (text
+    unchanged). The executed provider/model of the final text is not observed
+    here, so it is reported ``unknown``/``not_observed``.
+    """
+    key = _pending_replacement_key({"turn_id": turn_id})
+    entry = _pending_replacement_entry(key)
+    if entry is None or not isinstance(response_text, str) or not response_text.strip():
+        return None
+    replacement, delivered = entry
+    present = {line.strip() for line in response_text.splitlines()}
+    if any(line in present for line in delivered):
+        return None  # the middleware already marked the reply that ends the turn
+    unobserved = {"model": "unknown", "model_source": "not_observed",
+                  "provider": "unknown", "provider_source": "not_observed", "status": "unknown"}
+    marker = _substitution_provenance("ordinary_replacement", identity=replacement.get("identity"),
+                                      substitution={}, replacement=replacement, executed=unobserved)
+    marker["carrier"] = "final_output"
+    return response_text.rstrip() + "\n\n" + _provenance_annotation(marker)
 
 
 def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> Optional[Any]:
@@ -6089,6 +6162,7 @@ def register(ctx: Any) -> None:
     from .execution_adapters import guard_legacy_tool_execution
     ctx.register_middleware("tool_execution", guard_legacy_tool_execution)
     ctx.register_hook("post_llm_call", on_post_llm_call)
+    ctx.register_hook("transform_llm_output", on_transform_llm_output)
     ctx.register_hook("subagent_start", on_subagent_start)
     ctx.register_hook("subagent_stop", on_subagent_stop)
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)

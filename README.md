@@ -336,7 +336,18 @@ When the replacement's first reply is only reasoning, commentary or a tool call
 and the child continues its turn, the router keeps the provenance for that turn
 (bounded, cleared at turn end) and appends the line to the reply that ends it;
 later interim replies are left unchanged. A refusal-only reply keeps its refusal text,
-with the line after it. It
+with the line after it. Text the host builds outside the provider middleware is
+covered at final delivery: the router's `transform_llm_output` hook appends the
+line once to the turn's final text when that turn still holds replacement
+provenance and the text does not already carry a line the router delivered. This
+covers the iteration-limit summary (the child is still reported
+`status: completed`, `exit_reason: max_iterations`, `truncated: true`, now with
+the line) and any final reply the middleware did not mark. That line records
+`"carrier": "final_output"` and reports the executed provider/model as `unknown`
+/ `not_observed`, because the hook sees only text. A turn with no replacement is
+left unchanged. Host error endings (an incomplete-continuation partial, a
+content-filter refusal) reach the parent as `status: failed` without the line;
+an interrupted turn skips the output hook. It
 carries the requested/resolved/observed review identity and evidence sources,
 effort requested/applied state, policy/reason, planned replacement and final
 ordinary provider/model observation. Missing provider or model evidence remains
