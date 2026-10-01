@@ -701,14 +701,24 @@ class AccountOfExecutionTests(unittest.TestCase):
             'unavailable Claude CLI': dict(which=None),
             'unavailable repository': dict(repo=None),
             'unavailable context': dict(goal='[sonnet-review] Review parser ' + 'x' * 9000),
-            'unknown capability': dict(patches=(
+            'unknown tier alias map': dict(patches=(
                 patch('model_router.claude_opus_bridge.CLAUDE_REVIEW_MODELS', {}),)),
+            # Tier/alias map stays known; only the exact_model capability status is unknown.
+            'unknown exact_model capability': dict(patches=(
+                patch('model_router.target_identity._cli_exact_capability',
+                      return_value=('unknown', 'fixture: no exact_model evidence')),)),
         }
         for name, options in cases.items():
             with self.subTest(refusal=name), tempfile.TemporaryDirectory() as directory:
                 run = self._exact_preselection_run(directory, **options)
                 self._assert_stopped_refusal(run)
                 self.assertEqual(run[5][0]['outcome'], 'refused')
+                if name == 'unknown exact_model capability':
+                    text = json.dumps(run[5][0]) + run[0].output_text
+                    self.assertIn('exact_model', text)
+                    self.assertNotIn('tier is unknown', text)
+                elif name == 'unknown tier alias map':
+                    self.assertIn('tier is unknown', json.dumps(run[5][0]))
 
     def test_exact_preselection_resolve_target_raise_still_stops(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -722,15 +732,16 @@ class AccountOfExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             routes = Path(directory) / 'routes.jsonl'
             audits = Path(directory) / 'claude-audit.jsonl'
-            with patch.object(router, '_log_decision') as route_log:
-                stopped, downstream, bridge = self._host_review_attempt(
-                    selection_mode='exact', log_path=audits, routes_path=routes,
-                    bridge_result=ClaudeBridgeFailure('wrong model', 'model-mismatch'))
+            # Real route logger and real audit logger; counted before the directory is removed.
+            stopped, downstream, bridge = self._host_review_attempt(
+                selection_mode='exact', log_path=audits, routes_path=routes,
+                bridge_result=ClaudeBridgeFailure('wrong model', 'model-mismatch'))
+            route_records = ([line for line in routes.read_text().splitlines() if line.strip()]
+                            if routes.exists() else [])
             audit_entries = [json.loads(line) for line in audits.read_text().splitlines()]
         downstream.assert_not_called()
         bridge.assert_called_once()
-        route_log.assert_not_called()
-        self.assertFalse(routes.exists())
+        self.assertEqual(route_records, [], 'A08 stop must persist no routed provider-call record')
         self.assertEqual([entry['outcome'] for entry in audit_entries], ['error'])
         self.assertNotIn('substitution', audit_entries[0])
         normalized = ResponsesApiTransport().normalize_response(stopped)
