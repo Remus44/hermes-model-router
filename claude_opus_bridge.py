@@ -210,19 +210,47 @@ def _legacy_identity(requested_alias: str, alias: str) -> Any:
 
     Requested comes from the explicit tier's alias map and resolved from the
     actual ``--model`` argument (an alias, not served-model proof). Provider is
-    pinned by the transport; account, effort and the observed model stay unknown
-    or not applicable until validated CLI evidence attaches an observation.
+    pinned by the transport; account and the observed model stay unknown until
+    validated CLI evidence attaches an observation. CLI effort has no observed
+    evidence, so its applied value remains unknown rather than not applicable.
     """
     if __package__:
-        from .execution_contracts import SELECTION_PREFERRED, UNKNOWN, ModelFact, TargetIdentity
+        from .execution_contracts import SELECTION_PREFERRED, UNKNOWN, EffortFact, ModelFact, TargetIdentity
     else:
-        from model_router.execution_contracts import SELECTION_PREFERRED, UNKNOWN, ModelFact, TargetIdentity
+        from model_router.execution_contracts import SELECTION_PREFERRED, UNKNOWN, EffortFact, ModelFact, TargetIdentity
     return TargetIdentity(
         "anthropic", UNKNOWN, "claude_cli", requested_alias, SELECTION_PREFERRED,
         requested=ModelFact(CLAUDE_REVIEW_MODELS[requested_alias],
                             f"cli_alias_map:claude_opus_bridge.CLAUDE_REVIEW_MODELS.{requested_alias}"),
         resolved=ModelFact(alias, "cli_alias_argument", canonical=False),
+        effort=EffortFact(applied=UNKNOWN),
     )
+
+
+def _transport_owner(alias: str) -> str:
+    """Resolve the execution provider through the shared transport-owner rule."""
+    if __package__:
+        from . import target_identity
+    else:
+        from model_router import target_identity
+    provider, _ = target_identity._provider(alias, _load_config(), "", "claude_cli")
+    return provider
+
+
+def _execution_identity(identity: Any, alias: str) -> Any:
+    """Pin execution facts to the Claude CLI owner while retaining model intent."""
+    owner = _transport_owner(alias)
+    if (getattr(identity, "selection_mode", "") == "exact"
+            and getattr(identity, "provider", "") != owner):
+        raise ClaudeBridgeFailure(
+            f"exact Claude CLI invocation refused before launch: identity names provider "
+            f"{getattr(identity, 'provider', '')!r}, but claude_cli executes on {owner!r}",
+            "capability", identity=identity, refused=True,
+        )
+    if getattr(identity, "provider", "") == owner:
+        return identity
+    from dataclasses import replace
+    return replace(identity, provider=owner)
 
 
 def _enforce_exact(identity: Any, alias: str, requested_alias: str) -> None:
@@ -305,6 +333,7 @@ def _prepare(task: str, repo: Path, *, write: bool = False, review: bool = False
         raise ValueError(f"unknown requested Claude tier {requested_alias!r}")
     if identity is None:
         identity = _legacy_identity(requested_alias, alias)
+    identity = _execution_identity(identity, alias)
     expected_model = CLAUDE_REVIEW_MODELS[alias]
     # A preferred admission may step Opus down to Sonnet. Validate the model the
     # admitted tier was asked to serve, while ``identity`` still records the

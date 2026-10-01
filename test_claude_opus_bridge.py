@@ -503,7 +503,7 @@ class CliEntrypointBoundaryTests(unittest.TestCase):
                                  {"value": "claude-sonnet-5-5", "source": "claude_cli.result.modelUsage",
                                   "canonical": True})
                 self.assertEqual(identity["account"], "unknown")
-                self.assertEqual(identity["effort"]["applied"], "not_applicable")
+                self.assertEqual(identity["effort"]["applied"], "unknown")
 
     def test_attempted_failures_record_one_terminal_receipt_and_no_route(self):
         cases = (("model-mismatch", "model-mismatch", "failed", "error"),
@@ -585,6 +585,33 @@ class CliEntrypointBoundaryTests(unittest.TestCase):
         self.assertEqual(out.result["identity"]["requested"]["source"], "caller_fixture")
         self.assertEqual(out.result["identity"]["resolved"]["source"], "caller_fixture_alias")
         self.assertEqual(len(out.receipts), 1)
+
+    def test_preferred_identity_reports_anthropic_transport_owner(self):
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        caller = TargetIdentity("openai-codex", "unknown", "claude_cli", "sonnet", "profile_preferred",
+                                requested=ModelFact("claude-sonnet-5-5", "caller_fixture"),
+                                resolved=ModelFact("sonnet", "caller_fixture_alias", canonical=False))
+        out = self._run("public", identity=caller)
+        self.assertIsNone(out.error)
+        out.run.assert_called_once()
+        self.assertEqual(len(out.receipts), 1)
+        self.assertEqual(out.result["identity"]["provider"], "anthropic")
+        self.assertEqual(out.result["identity"]["requested"]["source"], "caller_fixture")
+        self.assertEqual(out.result["identity"]["observed"]["value"], "claude-sonnet-5-5")
+
+    def test_exact_identity_with_wrong_provider_is_refused_before_launch(self):
+        identity = self._exact_identity()
+        from dataclasses import replace
+        wrong_provider = replace(identity, provider="openai-codex")
+        out = self._run("public", identity=wrong_provider, patches=(
+            patch("model_router.target_identity._cli_exact_capability",
+                  return_value=("supported", "fixture capability evidence")),))
+        self.assertEqual(type(out.error).__name__, "ClaudeBridgeFailure")
+        self.assertTrue(out.error.refused)
+        self.assertEqual(out.error.failure_class, "capability")
+        out.run.assert_not_called()
+        self.assertEqual(out.receipts, ())
+        self.assertEqual((out.events, out.routes), ([], []))
 
     def test_step_down_keeps_requested_admitted_and_observed_distinct(self):
         from model_router import claude_opus_bridge as cli
