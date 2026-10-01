@@ -327,10 +327,20 @@ requested, resolved and observed: a CLI alias is not proof of the served model.
 An `exact` review requires recorded `exact_model` capability evidence and is
 refused before the CLI starts when that evidence is absent. The default
 `profile_preferred` review may use the configured ordinary provider route after
-an attempted CLI failure, but its child prompt and Claude audit record the typed
-failure and planned replacement tier/model; the returned child response records
-the final replacement provider/model only when that response supplies observed
-evidence (otherwise those fields are explicitly `unknown`). An exact route that
+an attempted CLI failure. For a successful CLI step-down or a response-shaped
+ordinary replacement, the router appends one bounded, deterministic,
+plugin-owned `ROUTER SUBSTITUTION PROVENANCE v1` JSON line after the useful
+verdict. That content survives the supported Codex Responses normalization and
+child-result projection to the parent; arbitrary response attributes do not. It
+carries the requested/resolved/observed review identity and evidence sources,
+effort requested/applied state, policy/reason, planned replacement and final
+ordinary provider/model observation. Missing provider or model evidence remains
+explicitly `unknown`. The marker always says the result does **not** satisfy a
+cross-provider review requirement: a same-provider step-down or ordinary
+replacement is not independent review. Scalar legacy payloads with no supported
+response-content carrier remain byte-for-byte unchanged. The Claude audit keeps
+the typed failure and planned replacement separately; it is not the parent-facing
+provenance carrier. An exact route that
 cannot be admitted, or that fails after its one CLI attempt, stops at the
 execution-middleware boundary with a zero-token refusal response;
 the response states that no work was performed by that call. The direct bridge still
