@@ -168,6 +168,14 @@ class ResolutionTests(Base):
                            requested_model="claude-sonnet-5")
         self.assertEqual(res.status, "resolved")
 
+    # Audit A06: remove when F02 lands
+    @unittest.expectedFailure
+    def test_a06_hermes_claude_resolution_keeps_pinned_anthropic_provider(self):
+        resolution = identity.resolve_target('sonnet5', transport='hermes_claude', selection_mode='exact',
+            cfg={'tier_providers': {'sonnet5': 'openai-codex'}}, host_cfg={})
+        self.assertEqual(resolution.identity.provider, 'anthropic',
+            f'resolved status={resolution.status} falsely labels Claude transport')
+
     def test_hermes_claude_uses_tier_model_and_agrees_with_config(self):
         res = self.resolve("sonnet5", "hermes_claude", selection_mode="exact")
         self.assertEqual(res.status, "resolved")

@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import model_router as router
@@ -474,6 +475,127 @@ class AccountOfExecutionTests(unittest.TestCase):
             self.assertIn('ROUTER WORKER STOPPED', result.output_text)
             codex.assert_not_called()
             self.assertEqual(bridge.call_count, 0 if claude == 95 else 1)
+
+    # Audit A01: remove when F01 lands
+    @unittest.expectedFailure
+    def test_a01_exact_refusal_through_host_runner_does_not_dispatch(self):
+        from hermes_cli.middleware import run_llm_execution_middleware
+
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'sonnet5': True, 'opus5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {
+                'enabled': True, 'selection_mode': 'exact', 'requested_model': 'claude-sonnet-5-5',
+            }},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[sonnet-review] Review parser'}]}
+        downstream = Mock(return_value='ORDINARY PROVIDER EXECUTED')
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+             patch.object(router, '_load_config', return_value=cfg), \
+             patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
+             patch.object(router.claude_delegation, '_log'), \
+             patch.object(router, '_run_opus5_bridge') as bridge:
+            run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        bridge.assert_not_called()
+        self.assertEqual(downstream.call_count, 0, 'exact refusal failed open through the host runner')
+
+    # Audit A08: remove when F01 lands
+    @unittest.expectedFailure
+    def test_a08_exact_attempt_failure_does_not_substitute(self):
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+
+        # Future/conditional cell: injected support; the installed CLI remains unsupported.
+        identity = TargetIdentity('anthropic', 'unknown', 'claude_cli', 'sonnet', 'exact',
+            requested=ModelFact('claude-sonnet-5-5', 'fixture'))
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'sonnet5': True, 'opus5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {
+                'enabled': True, 'selection_mode': 'exact', 'requested_model': 'claude-sonnet-5-5',
+            }},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[sonnet-review] Review parser'}]}
+        downstream = Mock(return_value=SimpleNamespace(model='gpt-terra'))
+        with patch.object(router, '_load_config', return_value=cfg), \
+             patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
+             patch('model_router.target_identity.resolve_target', return_value=SimpleNamespace(
+                 status='resolved', identity=identity, reasons=())), \
+             patch.object(router.usage_guard, 'guarded', return_value=False), \
+             patch.object(router.worker_admission, 'refusal', return_value=''), \
+             patch.object(router.claude_delegation, '_log'), \
+             patch.object(router, '_run_opus5_bridge', side_effect=ClaudeBridgeFailure(
+                 'wrong model', 'model-mismatch', identity=identity)):
+            try:
+                router.run_llm_with_transient_failover(request=request, original_request=request,
+                    next_call=downstream, provider='openai-codex', api_mode='codex_responses',
+                    platform='subagent', turn_id='s:sa-1')
+            except ClaudeBridgeFailure:
+                pass
+        self.assertEqual(downstream.call_count, 0, 'exact attempted failure substituted on ordinary provider')
+
+    # Audit A02: remove when F04 lands
+    @unittest.expectedFailure
+    def test_a02_successful_cli_conversion_preserves_identity_and_substitution(self):
+        result = router._opus5_response({
+            'result': 'review verdict', 'effective_model': 'claude-sonnet-5-5',
+            'identity': {'requested': 'claude-opus-5-5', 'observed': 'claude-sonnet-5-5'},
+            'substitution': {'policy': 'profile_preferred', 'requested': 'claude-opus-5-5',
+                             'observed': 'claude-sonnet-5-5'},
+        })
+        self.assertIsNotNone(getattr(result, 'substitution', None),
+            'successful bridge response discarded substitution')
+
+    # Audit A02: remove when F04 lands
+    @unittest.expectedFailure
+    def test_a02_replacement_provenance_survives_host_normalization(self):
+        from agent.transports.codex import ResponsesApiTransport
+
+        result = router._opus5_response({'result': 'PASS', 'effective_model': 'claude-sonnet-5-5'})
+        result = router._record_ordinary_replacement_result(result, {
+            'policy': 'legacy_ordinary_provider_route', 'requested_review': {'tier': 'opus'},
+            'failure_kind': 'model-mismatch', 'planned': {'model': 'gpt-terra'},
+        })
+        normalized = ResponsesApiTransport().normalize_response(result)
+        self.assertTrue(getattr(normalized, 'replacement_provenance', None) or
+            (normalized.provider_data or {}).get('replacement_provenance'),
+            'host normalization dropped replacement provenance')
+
+    # Audit H01: remove when F07 lands
+    @unittest.expectedFailure
+    def test_h01_installed_host_runner_supports_retry_callback(self):
+        """H01 is inherited (existed at 70125ce)."""
+        from hermes_cli.middleware import run_llm_execution_middleware
+
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'sonnet5': True, 'opus5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[sonnet-review] Review parser'}]}
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        downstream = Mock(side_effect=[RuntimeError('temporary provider failure'), SimpleNamespace(model='gpt-spark')])
+        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+             patch.object(router, '_load_config', return_value=cfg), \
+             patch.object(router, '_maybe_run_opus5', return_value=None), \
+             patch.object(router.worker_admission, 'refusal', return_value=''), \
+             patch.object(router, '_is_transient_provider_failure', return_value=True), \
+             patch.object(router, '_record_tier_failure'), \
+             patch.object(router, '_log_decision'), \
+             patch.object(router, '_transient_fallback_model', return_value='gpt-spark'):
+            try:
+                run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                    api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            except Exception:
+                pass
+        self.assertEqual(downstream.call_count, 2, 'installed host runner did not supply a reusable retry callback')
 
     def test_exact_cli_route_without_capability_evidence_refuses_without_ordinary_provider_fallback(self):
         from model_router.claude_opus_bridge import ClaudeBridgeFailure

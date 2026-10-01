@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import types
 import unittest
@@ -1158,6 +1159,52 @@ class ReasoningScopeIsolationTests(unittest.TestCase):
         self.assertFalse(t2.is_alive())
         self.assertEqual(results["a"]["reasoning_config"], {"enabled": True, "effort": "high"})
         self.assertEqual(results["b"]["reasoning_config"], {"enabled": True, "effort": "low"})
+    def test_positive_real_host_scoped_effort_and_credentials_are_isolated(self):
+        from hermes_constants import parse_reasoning_effort
+        from tools import delegate_tool
+
+        parent = SimpleNamespace(model='gpt-parent', provider='openai-codex',
+            base_url='https://example.invalid/parent', api_mode='codex_responses',
+            reasoning_config={'effort': 'medium'}, api_key='dummy-parent-key')
+        before = dict(parent.__dict__)
+        before['reasoning_config'] = dict(parent.reasoning_config)
+        barrier = threading.Barrier(3)
+        results, errors = {}, []
+
+        def resolve(label, model, provider, effort):
+            def invoke():
+                barrier.wait(5)
+                results[label] = delegate_tool._resolve_child_runtime(parent, {}, 'dummy-parent-key', model=model,
+                    override_provider=provider, override_base_url='https://example.invalid/' + label,
+                    override_api_key='dummy-' + label, override_api_mode=None,
+                    override_acp_command=None, override_acp_args=None, routing_cfg={'fallback_providers': []})
+            try:
+                if effort:
+                    with claude_delegation.reasoning_scope(parent, label, model, parse_reasoning_effort(effort)):
+                        invoke()
+                else:
+                    invoke()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=resolve, args=values) for values in (
+            ('sonnet', 'claude-sonnet-5-5', 'anthropic', 'high'),
+            ('opus', 'claude-opus-5-5', 'anthropic', 'low'),
+            ('codex', 'gpt-terra', 'openai-codex', None),
+        )]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(6)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertFalse(errors, repr(errors))
+        for label, effort in (('sonnet', 'high'), ('opus', 'low')):
+            self.assertEqual(results[label]['reasoning_config'], parse_reasoning_effort(effort))
+            self.assertEqual(results[label]['provider'], 'anthropic')
+            self.assertEqual(results[label]['api_key'], 'dummy-' + label)
+        self.assertEqual(results['codex']['reasoning_config'], {'effort': 'medium'})
+        self.assertEqual(results['codex']['api_key'], 'dummy-codex')
+        self.assertEqual(parent.__dict__, before)
 
 
 import model_router  # noqa: E402

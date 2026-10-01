@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from claude_opus_bridge import (CANONICAL_OPUS_MODEL, ClaudeBridgeFailure, classify_coding_dispatch,
@@ -364,6 +365,22 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not serve"):
                 dispatch("[opus] Implement a parser test", Path(directory))
         log.assert_not_called()
+    # Audit A05: remove when F03 lands
+    @unittest.expectedFailure
+    def test_a05_public_cli_dispatch_crosses_adapter_boundary(self):
+        from model_router import claude_opus_bridge as cli
+        from model_router import execution_adapters as adapters
+
+        book = adapters.ReservationBook()
+        payload = {'subtype': 'success', 'result': 'verdict',
+                   'modelUsage': {'claude-sonnet-5-5': {}}, 'num_turns': 1}
+        with patch.object(adapters, 'RESERVATIONS', book), \
+             patch.object(cli, '_load_config', return_value={}), \
+             patch.object(cli, '_log_decision'), \
+             patch.object(cli.subprocess, 'run', return_value=SimpleNamespace(
+                 stdout=json.dumps(payload), stderr='', returncode=0)):
+            cli.dispatch('[sonnet-review] Review parser', Path('/tmp'), review=True, model='sonnet')
+        self.assertEqual(len(book.records()), 1, 'public CLI dispatch bypassed adapter journal')
 
 
 if __name__ == "__main__":

@@ -28,6 +28,19 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
     def snapshot(self, request=None):
         return runtime.snapshot(request if request is not None else delegate_task_request(), self.cfg)
 
+    # Audit A09: remove when F02 lands
+    @unittest.expectedFailure
+    def test_a09_runtime_diagnostic_recognizes_supported_prefixed_delegate_task(self):
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+        def snapshot(name):
+            return runtime.snapshot({'tools': [{'name': name,
+                'input_schema': DELEGATE_TASK_SCHEMA['parameters']}]}, {})
+        plain = snapshot('delegate_task').adapter('hermes_codex').capability('submission')
+        prefixed = snapshot('mcp__delegate_task').adapter('hermes_codex').capability('submission')
+        self.assertEqual(plain.status, 'supported')
+        self.assertEqual(prefixed.status, plain.status, f'prefixed diagnostic: {prefixed.reason}')
+
     def test_depth_one_refuses_nested_and_defaults_to_parent_direct(self):
         with host_delegation(depth=1):
             snap = self.snapshot()

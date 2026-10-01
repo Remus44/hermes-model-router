@@ -200,6 +200,22 @@ class LegacyBoundaryTests(unittest.TestCase):
         return adapters.dispatch_legacy(raw, transport=transport, scope="parent:shared", attempt_key=key,
             reservations=self.book)
 
+    # Audit A04: remove when F06 lands
+    @unittest.expectedFailure
+    def test_a04_native_iteration_exhaustion_is_not_normalized_as_success(self):
+        from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
+
+        entry = _build_result_entry(SimpleNamespace(model='gpt-terra'),
+            {'final_response': 'partial implementation', 'completed': False, 'api_calls': 3},
+            0, 1.0, _SchemaOutcome(None, None, [], 0))
+        self.assertEqual(entry['exit_reason'], 'max_iterations')
+        self.assertTrue(entry['truncated'])
+        book = adapters.ReservationBook()
+        adapters.dispatch_legacy(lambda: json.dumps({'results': [entry]}), transport='hermes_codex',
+            scope='parent', reservations=book)
+        self.assertNotEqual(book.records()[0].status, 'succeeded',
+            'real host partial/budget exhaustion became succeeded')
+
     def test_oversized_handle_is_not_silently_repaired_into_another_identifier(self):
         payload = json.dumps({"delegation_id": "d" * 300})
         self.assertIs(self.dispatch(lambda: payload), payload)
@@ -801,6 +817,59 @@ class PublicClaimIdentityTests(unittest.TestCase):
         reached, resume = self.event(), self.event()
         self.gates[goal] = (reached, resume)
         return reached, resume
+
+    # Audit A03: remove when F05 lands
+    @unittest.expectedFailure
+    def test_a03_concurrent_claude_lookup_miss_replays_final_public_response(self):
+        book = adapters.ReservationBook()
+        parent = SimpleNamespace(_delegate_depth=0, session_id='parent')
+        lookup = book._tool_response
+        second_missed = threading.Event()
+        first_done = threading.Event()
+        results, errors, calls = {}, [], []
+
+        def gated_lookup(*args):
+            answer = lookup(*args)
+            if threading.current_thread().name == 'second':
+                second_missed.set()
+                if not first_done.wait(5):
+                    raise RuntimeError('first caller stalled')
+            elif not second_missed.wait(5):
+                raise RuntimeError('second caller stalled')
+            return answer
+
+        def raw(**kwargs):
+            calls.append(kwargs)
+            claude._REASONING_SCOPE.get().applied[0] += 1
+            return json.dumps({'results': [{'status': 'completed', 'summary': 'done'}]})
+
+        def invoke(label):
+            try:
+                results[label] = adapters.guard_legacy_tool_execution(tool_name='delegate_claude',
+                    args={'tier': 'sonnet', 'goal': 'review'}, next_call=claude.handle_delegate_claude,
+                    session_id='wf', turn_id='turn', tool_call_id='same-call')
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if label == 'first':
+                    first_done.set()
+
+        with patch.object(adapters, 'RESERVATIONS', book), \
+             patch.object(book, '_tool_response', side_effect=gated_lookup), \
+             patch.object(router, '_load_config', return_value=_cfg()), \
+             patch.object(claude, '_host', return_value=(raw, lambda: parent)), \
+             patch.object(claude, 'install_reasoning_bridge', return_value=(True, '')), \
+             patch.object(claude.usage_guard, 'read', return_value=_reading(10)), \
+             patch.object(claude, '_log'):
+            second = threading.Thread(target=invoke, args=('second',), name='second')
+            second.start()
+            invoke('first')
+            second.join(6)
+        self.assertFalse(second.is_alive())
+        self.assertFalse(errors, repr(errors))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results['second'], results['first'],
+            f'concurrent replay was re-annotated: {results}')
 
     def test_old_public_completion_never_overwrites_or_unprotects_replacement_claim(self):
         # N3 interleaving from re-review 2, driven through the public middleware.
