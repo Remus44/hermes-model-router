@@ -5065,14 +5065,19 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
             except Exception:
                 route_reason = "the Claude CLI review route could not be established"
             from . import target_identity
-            resolution = target_identity.resolve_target(
-                requested_alias, transport="claude_cli", selection_mode=selection_mode,
-                requested_model=requested_model, cfg=cfg,
-            )
+            try:
+                resolution = target_identity.resolve_target(
+                    requested_alias, transport="claude_cli", selection_mode=selection_mode,
+                    requested_model=requested_model, cfg=cfg,
+                )
+                identity = resolution.identity
+            except Exception:
+                # Exact mode is mandatory: an unresolvable identity still stops.
+                identity = None
             refusal = "exact Claude CLI review route was refused before bridge selection: " + route_reason
             audit_refusal(refusal)
             from .claude_opus_bridge import ClaudeBridgeFailure
-            raise ClaudeBridgeFailure(refusal, "capability", identity=resolution.identity, refused=True)
+            raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
         if delegated is not None:
             repo, _requested_alias = delegated
             from . import target_identity

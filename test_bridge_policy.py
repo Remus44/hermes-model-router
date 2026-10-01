@@ -458,7 +458,8 @@ class AccountOfExecutionTests(unittest.TestCase):
                 platform='subagent' if worker else 'cli', turn_id='s:sa-1' if worker else 'root')
         return result, downstream, bridge, claude_read
 
-    def _host_review_attempt(self, *, selection_mode, bridge_result, alias='sonnet', log_path=None):
+    def _host_review_attempt(self, *, selection_mode, bridge_result, alias='sonnet', log_path=None,
+                             routes_path=None):
         from hermes_cli.middleware import run_llm_execution_middleware
         from model_router.execution_contracts import ModelFact, TargetIdentity
         from model_router.target_identity import RESOLVED
@@ -475,6 +476,8 @@ class AccountOfExecutionTests(unittest.TestCase):
         }
         if log_path is not None:
             cfg['claude_delegation'] = {'log_path': str(log_path)}
+        if routes_path is not None:
+            cfg['logging'] = {'enabled': True, 'path': str(routes_path)}
         request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
                    f'[{alias}-review] Review parser'}]}
         downstream = Mock(return_value=SimpleNamespace(model='gpt-terra', provider='openai-codex'))
@@ -636,6 +639,103 @@ class AccountOfExecutionTests(unittest.TestCase):
                 self.assertEqual(stopped.usage.total_tokens, 0)
                 self.assertTrue(router._router_stopped_summary(stopped.output_text),
                     'the parent-side stop detector must recognize every exact failure')
+
+    def _exact_preselection_run(self, directory, *, callable_sonnet=True, which='/claude', goal='[sonnet-review] Review parser',
+                                cooling=0, repo=Path('/tmp'), allowed=None, resolve_error=None, patches=()):
+        from contextlib import ExitStack
+        from hermes_cli.middleware import run_llm_execution_middleware
+
+        routes = Path(directory) / 'routes.jsonl'
+        audits = Path(directory) / 'claude-audit.jsonl'
+        policy = {'enabled': True, 'selection_mode': 'exact', 'requested_model': 'claude-sonnet-5-5',
+                  'max_chars': 8000}
+        if allowed is not None:
+            policy['models'] = allowed
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'sonnet5': callable_sonnet, 'opus5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': policy},
+            'logging': {'enabled': True, 'path': str(routes)},
+            'claude_delegation': {'log_path': str(audits)},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content': goal}]}
+        downstream = Mock(return_value='ORDINARY PROVIDER EXECUTED')
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        with ExitStack() as stack:
+            stack.enter_context(patch('hermes_cli.plugins._delivery_manager', return_value=manager))
+            stack.enter_context(patch.object(router, '_load_config', return_value=cfg))
+            stack.enter_context(patch.object(router.shutil, 'which', return_value=which))
+            stack.enter_context(patch.object(router, '_delegated_review_repository', return_value=repo))
+            stack.enter_context(patch.object(router, '_tier_cooldown_remaining',
+                                             return_value=cooling))
+            stack.enter_context(patch.object(router.worker_admission, 'refusal', return_value=''))
+            if resolve_error is not None:
+                stack.enter_context(patch('model_router.target_identity.resolve_target',
+                                          side_effect=resolve_error))
+            for item in patches:
+                stack.enter_context(item)
+            bridge = stack.enter_context(patch.object(router, '_run_opus5_bridge'))
+            launches = stack.enter_context(patch('model_router.claude_opus_bridge.subprocess.run'))
+            stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        audit_entries = [json.loads(line) for line in audits.read_text().splitlines()] if audits.exists() else []
+        return stopped, downstream, bridge, launches, routes, audit_entries
+
+    def _assert_stopped_refusal(self, run, expected_audits=1):
+        stopped, downstream, bridge, launches, routes, audit_entries = run
+        downstream.assert_not_called()
+        bridge.assert_not_called()
+        launches.assert_not_called()
+        self.assertEqual(stopped.usage.total_tokens, 0)
+        self.assertTrue(router._router_stopped_summary(stopped.output_text),
+                        'the parent detector must see the refusal as not completed')
+        self.assertFalse(routes.exists(), 'a refusal must not create a routed provider-call record')
+        self.assertEqual(len(audit_entries), expected_audits)
+        return stopped
+
+    def test_exact_preselection_refusals_stop_through_host_runner(self):
+        cases = {
+            'cooling tier': dict(cooling=30),
+            'disabled tier': dict(callable_sonnet=False),
+            'unavailable Claude CLI': dict(which=None),
+            'unavailable repository': dict(repo=None),
+            'unavailable context': dict(goal='[sonnet-review] Review parser ' + 'x' * 9000),
+            'unknown capability': dict(patches=(
+                patch('model_router.claude_opus_bridge.CLAUDE_REVIEW_MODELS', {}),)),
+        }
+        for name, options in cases.items():
+            with self.subTest(refusal=name), tempfile.TemporaryDirectory() as directory:
+                run = self._exact_preselection_run(directory, **options)
+                self._assert_stopped_refusal(run)
+                self.assertEqual(run[5][0]['outcome'], 'refused')
+
+    def test_exact_preselection_resolve_target_raise_still_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._exact_preselection_run(directory, repo=None, resolve_error=RuntimeError('boom'))
+            self._assert_stopped_refusal(run)
+
+    def test_a08_stopped_evidence_survives_normalizer_and_persists_only_audit(self):
+        from agent.transports.codex import ResponsesApiTransport
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        with tempfile.TemporaryDirectory() as directory:
+            routes = Path(directory) / 'routes.jsonl'
+            audits = Path(directory) / 'claude-audit.jsonl'
+            with patch.object(router, '_log_decision') as route_log:
+                stopped, downstream, bridge = self._host_review_attempt(
+                    selection_mode='exact', log_path=audits, routes_path=routes,
+                    bridge_result=ClaudeBridgeFailure('wrong model', 'model-mismatch'))
+            audit_entries = [json.loads(line) for line in audits.read_text().splitlines()]
+        downstream.assert_not_called()
+        bridge.assert_called_once()
+        route_log.assert_not_called()
+        self.assertFalse(routes.exists())
+        self.assertEqual([entry['outcome'] for entry in audit_entries], ['error'])
+        self.assertNotIn('substitution', audit_entries[0])
+        normalized = ResponsesApiTransport().normalize_response(stopped)
+        self.assertTrue(router._router_stopped_summary(normalized.content or ''),
+                        'normalization dropped the not-completed evidence')
 
     def test_preferred_attempt_failure_kinds_still_replace_once_through_host_runner(self):
         from model_router.claude_opus_bridge import ClaudeBridgeFailure
