@@ -784,32 +784,101 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(entries[0]['outcome'], 'error')
         self.assertNotIn('substitution', entries[0])
 
+    def _parent_visible_provenance(self, response):
+        from agent.transports.codex import ResponsesApiTransport
+        from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
+
+        normalized = ResponsesApiTransport().normalize_response(response)
+        entry = _build_result_entry(SimpleNamespace(model='parent-visible-fixture'), {
+            'final_response': normalized.content, 'completed': True, 'api_calls': 1,
+        }, 0, 0.1, _SchemaOutcome(None, None, [], 0))
+        prefix = '[ROUTER SUBSTITUTION PROVENANCE v1] '
+        self.assertIn(prefix, entry['summary'], 'parent-visible result lost substitution provenance')
+        visible, marker = entry['summary'].split(prefix, 1)
+        self.assertTrue(visible.strip(), 'provenance marker replaced useful verdict output')
+        return json.loads(marker.splitlines()[0])
+
     # Audit A02: remove when F04 lands
-    @unittest.expectedFailure
     def test_a02_successful_cli_conversion_preserves_identity_and_substitution(self):
         result = router._opus5_response({
             'result': 'review verdict', 'effective_model': 'claude-sonnet-5-5',
-            'identity': {'requested': 'claude-opus-5-5', 'observed': 'claude-sonnet-5-5'},
-            'substitution': {'policy': 'profile_preferred', 'requested': 'claude-opus-5-5',
-                             'observed': 'claude-sonnet-5-5'},
+            'identity': {
+                'schema_version': 1, 'provider': 'anthropic', 'account': 'unknown',
+                'transport': 'claude_cli', 'alias': 'sonnet', 'selection_mode': 'profile_preferred',
+                'requested': {'value': 'claude-opus-5-5', 'source': 'operator_request', 'canonical': True},
+                'resolved': {'value': 'sonnet', 'source': 'claude_cli.argv', 'canonical': False},
+                'observed': {'value': 'claude-sonnet-5-5', 'source': 'claude_cli.result.modelUsage', 'canonical': True},
+                'effort': {'requested': 'not_applicable', 'applied': 'unknown', 'source': 'not_observed'},
+            },
+            'substitution': {
+                'policy': 'profile_preferred', 'requested': 'claude-opus-5-5',
+                'resolved': 'sonnet', 'observed': 'claude-sonnet-5-5',
+                'reason': 'usage step-down',
+            },
         })
-        self.assertIsNotNone(getattr(result, 'substitution', None),
-            'successful bridge response discarded substitution')
+        provenance = self._parent_visible_provenance(result)
+        self.assertEqual(provenance['kind'], 'claude_cli_step_down')
+        self.assertEqual(provenance['identity']['requested']['value'], 'claude-opus-5-5')
+        self.assertEqual(provenance['identity']['resolved']['value'], 'sonnet')
+        self.assertEqual(provenance['identity']['observed']['source'], 'claude_cli.result.modelUsage')
+        self.assertEqual(provenance['identity']['effort']['applied'], 'unknown')
+        self.assertEqual(provenance['substitution']['policy'], 'profile_preferred')
+        self.assertFalse(provenance['satisfies_cross_provider_review'])
 
     # Audit A02: remove when F04 lands
-    @unittest.expectedFailure
     def test_a02_replacement_provenance_survives_host_normalization(self):
-        from agent.transports.codex import ResponsesApiTransport
-
-        result = router._opus5_response({'result': 'PASS', 'effective_model': 'claude-sonnet-5-5'})
-        result = router._record_ordinary_replacement_result(result, {
-            'policy': 'legacy_ordinary_provider_route', 'requested_review': {'tier': 'opus'},
-            'failure_kind': 'model-mismatch', 'planned': {'model': 'gpt-terra'},
+        verdict = SimpleNamespace(
+            output=[SimpleNamespace(type='message', status='completed', content=[
+                SimpleNamespace(type='output_text', text='PASS'),
+            ])],
+            output_text='PASS', status='completed', model='gpt-spark', provider='openai-codex',
+        )
+        result = router._record_ordinary_replacement_result(verdict, {
+            'policy': 'legacy_ordinary_provider_route',
+            'requested_review': {'tier': 'opus', 'transport': 'claude_cli'},
+            'failure_kind': 'model-mismatch',
+            'planned': {'tier': 'terra', 'model': 'gpt-terra', 'provider': 'openai-codex',
+                        'source': 'ordinary_provider.request_configuration'},
+            'identity': {'requested': {'value': 'claude-opus-5-5', 'source': 'operator_request', 'canonical': True},
+                         'resolved': {'value': 'claude-opus-5-5', 'source': 'configured_target', 'canonical': True},
+                         'observed': {'value': 'unknown', 'source': 'not_observed', 'canonical': True},
+                         'effort': {'requested': 'not_applicable', 'applied': 'unknown', 'source': 'not_observed'}},
         })
-        normalized = ResponsesApiTransport().normalize_response(result)
-        self.assertTrue(getattr(normalized, 'replacement_provenance', None) or
-            (normalized.provider_data or {}).get('replacement_provenance'),
-            'host normalization dropped replacement provenance')
+        provenance = self._parent_visible_provenance(result)
+        self.assertEqual(provenance['kind'], 'ordinary_replacement')
+        self.assertEqual(provenance['failure_kind'], 'model-mismatch')
+        self.assertEqual(provenance['executed']['model'], 'gpt-spark')
+        self.assertEqual(provenance['executed']['provider'], 'openai-codex')
+        self.assertEqual(provenance['identity']['observed']['value'], 'unknown')
+        self.assertFalse(provenance['satisfies_cross_provider_review'])
+
+    def test_replacement_provenance_survives_an_immutable_response(self):
+        class ImmutableResponse:
+            def __init__(self):
+                object.__setattr__(self, 'output', [SimpleNamespace(type='message', status='completed', content=[
+                    SimpleNamespace(type='output_text', text='immutable verdict'),
+                ])])
+                object.__setattr__(self, 'output_text', 'immutable verdict')
+                object.__setattr__(self, 'status', 'completed')
+                object.__setattr__(self, 'model', None)
+                object.__setattr__(self, 'provider', None)
+                object.__setattr__(self, '_sealed', True)
+
+            def __setattr__(self, name, value):
+                if getattr(self, '_sealed', False):
+                    raise TypeError('immutable fixture')
+                object.__setattr__(self, name, value)
+
+        result = router._record_ordinary_replacement_result(ImmutableResponse(), {
+            'policy': 'legacy_ordinary_provider_route',
+            'requested_review': {'tier': 'opus', 'transport': 'claude_cli'},
+            'failure_kind': 'timeout',
+            'planned': {'tier': 'terra', 'model': 'gpt-terra', 'provider': 'openai-codex',
+                        'source': 'ordinary_provider.request_configuration'},
+        })
+        provenance = self._parent_visible_provenance(result)
+        self.assertEqual(provenance['executed']['model'], 'unknown')
+        self.assertEqual(provenance['executed']['provider'], 'unknown')
 
     # Audit H01: remove when F07 lands
     @unittest.expectedFailure
@@ -924,7 +993,13 @@ class AccountOfExecutionTests(unittest.TestCase):
         }
         request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
                    '[sonnet-review] Review parser'}]}
-        response = SimpleNamespace(model='gpt-spark', provider='openai-codex')
+        response = SimpleNamespace(
+            model='gpt-spark', provider='openai-codex',
+            output=[SimpleNamespace(type='message', status='completed', content=[
+                SimpleNamespace(type='output_text', text='retry verdict'),
+            ])],
+            output_text='retry verdict', status='completed',
+        )
         downstream = Mock(side_effect=RuntimeError('temporary provider failure'))
         retry = Mock(return_value=response)
         failure = ClaudeBridgeFailure('Claude Code reached max turns', 'max-turn')
@@ -942,6 +1017,9 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(result.replacement_provenance['executed']['model_source'], 'ordinary_provider.response.model')
         self.assertEqual(result.replacement_provenance['executed']['provider'], 'openai-codex')
         self.assertIn('actual replacement executed on gpt-spark', result.route_reason)
+        provenance = self._parent_visible_provenance(result)
+        self.assertEqual(provenance['executed']['model'], 'gpt-spark')
+        self.assertEqual(provenance['executed']['provider'], 'openai-codex')
         retry.assert_called_once()
 
     def test_failed_review_bridge_keeps_one_route_call_and_records_visible_failure_audit(self):

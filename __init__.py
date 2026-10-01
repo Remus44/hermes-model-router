@@ -4877,6 +4877,138 @@ def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False
     )
 
 
+_SUBSTITUTION_PROVENANCE_PREFIX = "[ROUTER SUBSTITUTION PROVENANCE v1] "
+
+
+def _provenance_text(value: Any, fallback: str = "unknown") -> str:
+    return value[:128] if isinstance(value, str) and value else fallback
+
+
+def _provenance_fact(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    return {
+        "value": _provenance_text(value.get("value")),
+        "source": _provenance_text(value.get("source"), "not_observed"),
+        "canonical": bool(value.get("canonical", True)),
+    }
+
+
+def _provenance_identity(value: Any) -> Dict[str, Any]:
+    if hasattr(value, "as_dict"):
+        value = value.as_dict()
+    value = value if isinstance(value, dict) else {}
+    effort = value.get("effort") if isinstance(value.get("effort"), dict) else {}
+    return {
+        "provider": _provenance_text(value.get("provider")),
+        "account": _provenance_text(value.get("account")),
+        "transport": _provenance_text(value.get("transport")),
+        "alias": _provenance_text(value.get("alias")),
+        "selection_mode": _provenance_text(value.get("selection_mode"), "unknown"),
+        "requested": _provenance_fact(value.get("requested")),
+        "resolved": _provenance_fact(value.get("resolved")),
+        "observed": _provenance_fact(value.get("observed")),
+        "effort": {
+            "requested": _provenance_text(effort.get("requested"), "unknown"),
+            "applied": _provenance_text(effort.get("applied"), "unknown"),
+            "source": _provenance_text(effort.get("source"), "not_observed"),
+        },
+    }
+
+
+def _provenance_mapping(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key)[:64]: _provenance_text(item) for key, item in sorted(value.items())[:16]
+            if isinstance(key, str) and isinstance(item, str)}
+
+
+def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
+                             replacement: Any = None, executed: Any = None) -> Dict[str, Any]:
+    marker = {
+        "kind": kind,
+        "identity": _provenance_identity(identity),
+        "substitution": _provenance_mapping(substitution),
+        # A replacement or a same-provider step-down is not an independent,
+        # cross-provider review merely because its output contains this evidence.
+        "satisfies_cross_provider_review": False,
+    }
+    if isinstance(replacement, dict):
+        marker.update({
+            "policy": _provenance_text(replacement.get("policy")),
+            "reason": _provenance_text(replacement.get("reason")),
+            "failure_kind": _provenance_text(replacement.get("failure_kind")),
+            "requested_review": _provenance_mapping(replacement.get("requested_review")),
+            "planned": _provenance_mapping(replacement.get("planned")),
+        })
+    if isinstance(executed, dict):
+        marker["executed"] = _provenance_mapping(executed)
+    return marker
+
+
+def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
+    """Append bounded plugin-owned evidence to content the host actually carries.
+
+    The Codex normalizer and child-result projection retain output text but discard
+    arbitrary SDK attributes. Mutable responses keep their identity; immutable
+    responses receive a minimal response-shaped replacement rather than losing the
+    marker silently.
+    """
+    encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    annotation = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
+
+    def field(name: str) -> Any:
+        return result.get(name) if isinstance(result, dict) else getattr(result, name, None)
+
+    def set_field(name: str, value: Any) -> None:
+        if isinstance(result, dict):
+            result[name] = value
+        else:
+            setattr(result, name, value)
+
+    output = field("output")
+    try:
+        for item in output if isinstance(output, list) else ():
+            content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            for part in content if isinstance(content, list) else ():
+                part_type = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                if part_type == "output_text":
+                    text = part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+                    annotated = str(text or "").rstrip() + "\n\n" + annotation
+                    if isinstance(part, dict):
+                        part["text"] = annotated
+                    else:
+                        setattr(part, "text", annotated)
+                    set_field("output_text", annotated)
+                    return result
+        raise TypeError("response has no mutable output_text part")
+    except Exception:
+        if not isinstance(output, list):
+            # A scalar/non-Responses legacy value has no host-supported content
+            # carrier. Preserve its byte-for-byte contract rather than replacing
+            # it with an invented response-shaped object.
+            return result
+        text = str(field("output_text") or "").rstrip()
+        annotated = text + ("\n\n" if text else "") + annotation
+        copied = {}
+        if not isinstance(result, dict):
+            try:
+                copied.update(vars(result))
+            except TypeError:
+                pass
+        elif isinstance(result, dict):
+            copied.update(result)
+        copied.update({
+            "output": [SimpleNamespace(type="message", status="completed", content=[
+                SimpleNamespace(type="output_text", text=annotated),
+            ])],
+            "output_text": annotated,
+            "status": field("status") or "completed",
+            "model": field("model"),
+            "provider": field("provider"),
+        })
+        return SimpleNamespace(**copied)
+
+
 def _opus5_response(result: Dict[str, Any]) -> Any:
     """Adapt a verified Claude Code result to Hermes' Codex Responses contract."""
     from .claude_opus_bridge import CLAUDE_REVIEW_MODELS
@@ -4888,7 +5020,7 @@ def _opus5_response(result: Dict[str, Any]) -> Any:
     raw_usage = result.get("usage") or result.get("model_usage") or {}
     input_tokens = int(raw_usage.get("input_tokens", raw_usage.get("inputTokens", 0)) or 0)
     output_tokens = int(raw_usage.get("output_tokens", raw_usage.get("outputTokens", 0)) or 0)
-    return SimpleNamespace(
+    response = SimpleNamespace(
         output=[SimpleNamespace(
             type="message",
             status="completed",
@@ -4903,10 +5035,16 @@ def _opus5_response(result: Dict[str, Any]) -> Any:
         status="completed",
         model=model,
     )
+    substitution = result.get("substitution")
+    if isinstance(substitution, dict):
+        return _annotated_response(response, _substitution_provenance(
+            "claude_cli_step_down", identity=result.get("identity"), substitution=substitution,
+        ))
+    return response
 
 
 def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]) -> Any:
-    """Attach final ordinary-provider evidence without treating the wire route as served-model proof."""
+    """Carry final ordinary-provider evidence in normalizer-surviving content."""
     def field(name: str) -> Any:
         return result.get(name) if isinstance(result, dict) else getattr(result, name, None)
 
@@ -4927,18 +5065,21 @@ def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]
         f"{executed['model']} via {executed['provider']} "
         f"(model evidence: {executed['model_source']}; provider evidence: {executed['provider_source']})."
     )
-    if isinstance(result, dict):
-        result["replacement_provenance"] = provenance
-        result["route_reason"] = route_reason
-    else:
-        try:
-            setattr(result, "replacement_provenance", provenance)
-            setattr(result, "route_reason", route_reason)
-        except Exception:
-            # Host response objects are normally mutable; an immutable legacy
-            # value cannot carry a fabricated observation, so leave it unknown.
-            pass
-    return result
+    annotated = _annotated_response(result, _substitution_provenance(
+        "ordinary_replacement", identity=replacement.get("identity"), substitution={},
+        replacement=replacement, executed=executed,
+    ))
+    if annotated is result:
+        if isinstance(result, dict):
+            result["replacement_provenance"] = provenance
+            result["route_reason"] = route_reason
+        else:
+            try:
+                setattr(result, "replacement_provenance", provenance)
+                setattr(result, "route_reason", route_reason)
+            except Exception:
+                pass
+    return annotated
 
 
 def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> Optional[Any]:
@@ -4970,7 +5111,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
             else "nonzero-exit" if "exit " in message else "execution-error"
         )
 
-    def ordinary_replacement(error: BaseException) -> Dict[str, Any]:
+    def ordinary_replacement(error: BaseException, identity: Any = None) -> Dict[str, Any]:
         failure_kind = bridge_failure_kind(error)
         model = str(request.get("model") or "")
         tier = next((name for name, candidate in (cfg.get("models") or {}).items()
@@ -4981,6 +5122,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
             "provider": str(kwargs.get("provider") or cfg.get("provider") or "unknown"),
             "source": "ordinary_provider.request_configuration",
         }
+        identity_data = identity.as_dict() if hasattr(identity, "as_dict") else identity
         return {
             "policy": "legacy_ordinary_provider_route",
             "requested_review": {"tier": requested_alias, "transport": "claude_cli"},
@@ -4988,6 +5130,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
             "planned": planned,
             "reason": "attempted Claude CLI review failed; an ordinary provider replacement is planned, not observed",
             "failure_kind": failure_kind,
+            **({"identity": identity_data} if isinstance(identity_data, dict) else {}),
         }
 
     def audit_refusal(message: str) -> None:
@@ -5050,7 +5193,9 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                     "turn_id": str(kwargs.get("turn_id") or ""),
                 }
                 if selection_mode != "exact":
-                    replacement = ordinary_replacement(error)
+                    replacement = ordinary_replacement(
+                        error, getattr(error, "identity", None) or bridge_kwargs.get("identity"),
+                    )
                     failure["replacement"] = replacement
                     audit_event["substitution"] = replacement
                 claude_delegation._log(cfg, audit_event)
