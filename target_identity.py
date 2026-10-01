@@ -160,8 +160,15 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
         provider, found = _provider(alias, cfg, host_provider, transport)
         drift[:] = found
         return provider
-    effort_fact = (EffortFact(effort, UNKNOWN, "not_observed") if effort
-                   else EffortFact(NOT_APPLICABLE, NOT_APPLICABLE))
+    if effort:
+        effort_fact = EffortFact(effort, UNKNOWN, "not_observed")
+    elif transport == "claude_cli":
+        # Nothing was requested, but the CLI reports no effort evidence: what it
+        # applied is unknown, not a Haiku-style "not applicable". Same shape as
+        # the bridge's synthesised legacy identity.
+        effort_fact = EffortFact(NOT_APPLICABLE, UNKNOWN, "not_observed")
+    else:
+        effort_fact = EffortFact(NOT_APPLICABLE, NOT_APPLICABLE)
     cli_map = _cli_alias_map()
 
     # Requested: the operator's ask, else the model the router's own config names.

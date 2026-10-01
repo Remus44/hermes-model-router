@@ -583,7 +583,9 @@ class CliEntrypointBoundaryTests(unittest.TestCase):
         out = self._run("public", identity=caller)
         self.assertIsNone(out.error)
         self.assertEqual(out.result["identity"]["requested"]["source"], "caller_fixture")
-        self.assertEqual(out.result["identity"]["resolved"]["source"], "caller_fixture_alias")
+        self.assertEqual(out.result["identity"]["resolved"], {
+            "value": "sonnet", "source": "cli_alias_argument", "canonical": False,
+        })
         self.assertEqual(len(out.receipts), 1)
 
     def test_preferred_identity_reports_anthropic_transport_owner(self):

@@ -112,6 +112,13 @@ class IdentityRecordTests(Base):
         self.assertEqual(data["effort"]["requested"], "not_applicable")
         self.assertEqual(data["effort"]["applied"], "not_applicable")
 
+    def test_cli_without_effort_reports_applied_unknown_not_not_applicable(self):
+        # Review I4: no effort was requested, and the CLI gives no evidence of the
+        # effort it applied. Haiku-style "not_applicable" would be a false claim.
+        data = self.resolve("opus", "claude_cli").identity.as_dict()
+        self.assertEqual(data["effort"], {"requested": "not_applicable", "applied": "unknown",
+                                          "source": "not_observed"})
+
     def test_invalid_transport_mode_and_frozen_record(self):
         with self.assertRaises(ValueError):
             self.resolve("opus5", "carrier_pigeon")

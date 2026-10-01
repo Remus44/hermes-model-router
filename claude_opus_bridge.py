@@ -237,8 +237,35 @@ def _transport_owner(alias: str) -> str:
     return provider
 
 
+def admitted_invocation_identity(identity: Any, alias: str) -> Any:
+    """Identity facts for the CLI invocation admission actually chose.
+
+    ``requested`` keeps the caller's original intent (an Opus review stays an
+    Opus request). For a preferred selection ``resolved`` is the alias that goes
+    into ``claude --model``, so a usage step-down to Sonnet cannot be reported as
+    an Opus invocation on success, failure or replacement. Exact selection never
+    substitutes and passes its canonical model on argv, so its resolver facts
+    stay. The CLI reports no reasoning-effort evidence: applied effort is
+    unknown, never ``not_applicable`` (that claim belongs to Haiku-style tiers).
+    """
+    from dataclasses import is_dataclass, replace
+    if identity is None or not is_dataclass(identity) or not hasattr(identity, "effort"):
+        return identity
+    if __package__:
+        from .execution_contracts import NOT_APPLICABLE, SOURCE_NOT_OBSERVED, UNKNOWN, ModelFact
+    else:
+        from model_router.execution_contracts import NOT_APPLICABLE, SOURCE_NOT_OBSERVED, UNKNOWN, ModelFact
+    changes: dict[str, Any] = {}
+    if identity.selection_mode != "exact":
+        changes["resolved"] = ModelFact(alias, "cli_alias_argument", canonical=False)
+    effort = identity.effort
+    if effort.applied == NOT_APPLICABLE:
+        changes["effort"] = replace(effort, applied=UNKNOWN, source=SOURCE_NOT_OBSERVED)
+    return replace(identity, **changes) if changes else identity
+
+
 def _execution_identity(identity: Any, alias: str) -> Any:
-    """Pin execution facts to the Claude CLI owner while retaining model intent."""
+    """Pin execution facts to the transport owner and the admitted invocation."""
     owner = _transport_owner(alias)
     if (getattr(identity, "selection_mode", "") == "exact"
             and getattr(identity, "provider", "") != owner):
@@ -247,10 +274,10 @@ def _execution_identity(identity: Any, alias: str) -> Any:
             f"{getattr(identity, 'provider', '')!r}, but claude_cli executes on {owner!r}",
             "capability", identity=identity, refused=True,
         )
-    if getattr(identity, "provider", "") == owner:
-        return identity
     from dataclasses import replace
-    return replace(identity, provider=owner)
+    if getattr(identity, "provider", "") != owner:
+        identity = replace(identity, provider=owner)
+    return admitted_invocation_identity(identity, alias)
 
 
 def _enforce_exact(identity: Any, alias: str, requested_alias: str) -> None:

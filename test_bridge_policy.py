@@ -880,6 +880,259 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(provenance['executed']['model'], 'unknown')
         self.assertEqual(provenance['executed']['provider'], 'unknown')
 
+    # --- F04 fix round 1 (review I1-I4): real host normalizer, child projection,
+    # installed openai SDK types and the real resolver -> admission -> bridge chain.
+    PREFIX = '[ROUTER SUBSTITUTION PROVENANCE v1] '
+    REPLACEMENT = {
+        'policy': 'legacy_ordinary_provider_route',
+        'requested_review': {'tier': 'opus', 'transport': 'claude_cli'},
+        'failure_kind': 'timeout', 'planned': {'tier': 'terra', 'model': 'gpt-terra'},
+    }
+
+    def _normalized_and_summary(self, response):
+        from agent.transports.codex import ResponsesApiTransport
+        from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
+
+        normalized = ResponsesApiTransport().normalize_response(response)
+        entry = _build_result_entry(SimpleNamespace(model='parent-visible-fixture'), {
+            'final_response': normalized.content, 'completed': True, 'api_calls': 1,
+        }, 0, 0.1, _SchemaOutcome(None, None, [], 0))
+        return normalized, entry['summary']
+
+    def _marker_line(self, text):
+        """The marker must sit on its own line and be exactly one JSON object."""
+        lines = [line for line in text.splitlines() if self.PREFIX in line]
+        self.assertEqual(len(lines), 1, f'expected exactly one marker line in {text!r}')
+        self.assertTrue(lines[0].startswith(self.PREFIX), 'marker shares its line with other text')
+        return json.loads(lines[0][len(self.PREFIX):])
+
+    @staticmethod
+    def _tool_item():
+        return SimpleNamespace(type='function_call', id='fc_review', call_id='call_review',
+                               name='read_file', arguments='{"path":"parser.py"}', status='completed')
+
+    def test_f04_i1_installed_sdk_response_keeps_tool_call_usage_and_one_marker(self):
+        from openai.types.responses import (Response, ResponseFunctionToolCall,
+                                            ResponseOutputMessage, ResponseOutputText)
+        text = ResponseOutputText.model_construct(type='output_text', text='SDK verdict', annotations=[])
+        message = ResponseOutputMessage.model_construct(
+            type='message', status='completed', content=[text], role='assistant', id='msg_review')
+        call = ResponseFunctionToolCall.model_construct(
+            type='function_call', id='fc_review', call_id='call_review', name='read_file',
+            arguments='{"path":"parser.py"}', status='completed')
+        usage = SimpleNamespace(input_tokens=9, output_tokens=2, total_tokens=11)
+        response = Response.model_construct(output=[message, call], status='completed',
+                                            model='gpt-terra', usage=usage)
+        before, _ = self._normalized_and_summary(response)
+
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        normalized, summary = self._normalized_and_summary(annotated)
+
+        self.assertEqual(before.finish_reason, 'tool_calls')
+        self.assertEqual(normalized.finish_reason, 'tool_calls', 'annotation changed the finish reason')
+        self.assertEqual([c.function.name for c in normalized.tool_calls], ['read_file'])
+        self.assertEqual(summary.count(self.PREFIX), 1)
+        self.assertEqual(normalized.content.count(self.PREFIX), 1)
+        self.assertEqual(self._marker_line(summary)['kind'], 'ordinary_replacement')
+        self.assertTrue(summary.startswith('SDK verdict'))
+        self.assertIs(annotated.usage, usage)
+        self.assertEqual((annotated.status, annotated.model), ('completed', 'gpt-terra'))
+        # The caller's response object is never mutated.
+        self.assertEqual(len(response.output), 2)
+        self.assertEqual(response.output[0].content[0].text, 'SDK verdict')
+        self.assertNotIn(self.PREFIX, response.output_text)
+
+    def test_f04_i1_tool_only_replacement_keeps_tool_calls_finish_reason(self):
+        usage = SimpleNamespace(input_tokens=9, output_tokens=2, total_tokens=11)
+        response = SimpleNamespace(output=[self._tool_item()], output_text='', status='completed',
+                                   model='gpt-terra', usage=usage)
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        normalized, summary = self._normalized_and_summary(annotated)
+
+        self.assertEqual(normalized.finish_reason, 'tool_calls', 'tool-only reply was turned into a stop')
+        self.assertEqual(len(normalized.tool_calls), 1)
+        self.assertEqual(self._marker_line(summary)['kind'], 'ordinary_replacement')
+        self.assertIs(annotated.usage, usage)
+        self.assertEqual(response.output[0].type, 'function_call')
+
+    def test_f04_i1_slotted_immutable_response_keeps_items_usage_status_and_text(self):
+        from collections import namedtuple
+        Slotted = namedtuple('Slotted', 'output status model provider usage incomplete_details')
+        usage = SimpleNamespace(total_tokens=11)
+        output = [SimpleNamespace(type='message', status='completed', content=[
+                      SimpleNamespace(type='output_text', text='VERDICT'),
+                      SimpleNamespace(type='output_text', text='ACCEPTANCE EVIDENCE')]),
+                  self._tool_item()]
+        response = Slotted(output, 'completed', 'gpt-terra', 'openai-codex', usage, None)
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        normalized, summary = self._normalized_and_summary(annotated)
+
+        self.assertIs(getattr(annotated, 'usage', None), usage, 'token usage was dropped')
+        self.assertEqual((annotated.status, annotated.model, annotated.provider),
+                         ('completed', 'gpt-terra', 'openai-codex'))
+        self.assertEqual(normalized.finish_reason, 'tool_calls')
+        self.assertEqual(len(normalized.tool_calls), 1)
+        self.assertIn('VERDICTACCEPTANCE EVIDENCE', summary)
+        self.assertEqual(self._marker_line(summary)['executed']['model'], 'gpt-terra')
+        self.assertEqual(len(response.output), 2, 'the original output list was mutated')
+
+    def test_f04_i1_failed_aggregate_write_leaves_no_partial_annotation(self):
+        tool = self._tool_item()
+
+        class ReadOnlyAggregate:
+            def __init__(self):
+                self.output = [SimpleNamespace(type='message', status='completed', content=[
+                    SimpleNamespace(type='output_text', text='VERDICT')]), tool]
+                self.status, self.model, self.usage = 'completed', 'gpt-terra', SimpleNamespace(total_tokens=3)
+
+            @property
+            def output_text(self):
+                return 'VERDICT'
+
+        response = ReadOnlyAggregate()
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        normalized, summary = self._normalized_and_summary(annotated)
+
+        self.assertEqual(len(response.output), 2, 'items were appended before the failed write')
+        self.assertEqual(response.output[0].content[0].text, 'VERDICT')
+        self.assertEqual(summary.count(self.PREFIX), 1)
+        self.assertEqual(len(normalized.tool_calls), 1)
+        self.assertIs(annotated.usage, response.usage)
+
+    def test_f04_i1_reannotation_never_adds_a_second_marker(self):
+        response = SimpleNamespace(output=[SimpleNamespace(type='message', status='completed', content=[
+            SimpleNamespace(type='output_text', text='VERDICT')])], output_text='VERDICT', status='completed')
+        once = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        twice = router._record_ordinary_replacement_result(once, dict(self.REPLACEMENT))
+        _, summary = self._normalized_and_summary(twice)
+        self.assertEqual(summary.count(self.PREFIX), 1)
+
+    def test_f04_i1_reasoning_only_reply_is_not_turned_into_a_final_answer(self):
+        response = SimpleNamespace(output=[SimpleNamespace(type='reasoning', id='rs_1', summary=[
+            SimpleNamespace(type='summary_text', text='thinking')])], status='completed')
+        normalized_before, _ = self._normalized_and_summary(
+            SimpleNamespace(output=list(response.output), status='completed'))
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        from agent.transports.codex import ResponsesApiTransport
+        after = ResponsesApiTransport().normalize_response(annotated)
+        self.assertEqual(after.finish_reason, normalized_before.finish_reason)
+        self.assertNotIn(self.PREFIX, after.content or '')
+
+    def test_f04_i2_commentary_then_final_puts_marker_in_projected_final_answer(self):
+        commentary = SimpleNamespace(type='message', status='completed', phase='commentary', content=[
+            SimpleNamespace(type='output_text', text='Inspecting parser')])
+        final = SimpleNamespace(type='message', status='completed', phase='final_answer', content=[
+            SimpleNamespace(type='output_text', text='PASS: acceptance evidence')])
+        response = SimpleNamespace(output=[commentary, final],
+                                   output_text='Inspecting parser\nPASS: acceptance evidence',
+                                   status='completed', model='gpt-terra', provider='openai-codex')
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        normalized, summary = self._normalized_and_summary(annotated)
+
+        self.assertEqual(normalized.finish_reason, 'stop')
+        self.assertNotIn(self.PREFIX, normalized.reasoning or '', 'marker went to the commentary channel')
+        self.assertIn('Inspecting parser', normalized.reasoning or '')
+        visible, _ = summary.split(self.PREFIX, 1)
+        self.assertIn('PASS: acceptance evidence', visible, 'marker is not after the final text')
+        self.assertEqual(self._marker_line(summary)['kind'], 'ordinary_replacement')
+
+    def test_f04_i2_multipart_marker_is_its_own_parseable_line_after_all_text(self):
+        response = SimpleNamespace(output=[SimpleNamespace(type='message', status='completed', content=[
+            SimpleNamespace(type='output_text', text='VERDICT'),
+            SimpleNamespace(type='output_text', text='ACCEPTANCE EVIDENCE')])],
+            output_text='VERDICT\nACCEPTANCE EVIDENCE', status='completed')
+        annotated = router._record_ordinary_replacement_result(response, dict(self.REPLACEMENT))
+        _, summary = self._normalized_and_summary(annotated)
+
+        visible, _ = summary.split(self.PREFIX, 1)
+        self.assertIn('ACCEPTANCE EVIDENCE', visible)
+        self.assertEqual(self._marker_line(summary)['kind'], 'ordinary_replacement')
+        self.assertTrue(summary.rstrip().endswith('}'), 'text follows the marker line')
+
+    def test_f04_i3_i4_real_resolution_step_down_reports_admitted_alias(self):
+        from model_router import claude_opus_bridge as bridge, target_identity
+
+        cfg = {'coding_agent': {}, 'models': {}}
+        identity = target_identity.resolve_target('opus', transport='claude_cli', cfg=cfg).identity
+        payload = {'type': 'result', 'subtype': 'success', 'result': 'PASS: parser inspected',
+                   'modelUsage': {'claude-sonnet-5-5': {'inputTokens': 9}}, 'num_turns': 1}
+        with tempfile.TemporaryDirectory() as repo, \
+             patch.object(bridge, '_load_config', return_value=cfg), \
+             patch.object(bridge.subprocess, 'run', return_value=SimpleNamespace(
+                 stdout=json.dumps(payload), stderr='', returncode=0)) as raw, \
+             patch.object(bridge, '_log_decision'), patch.object(bridge, '_append_lifecycle'):
+            result = bridge.dispatch('[opus-review] Review parser', Path(repo), review=True,
+                                     model='sonnet', requested_alias='opus',
+                                     adjustment='usage step-down', identity=identity)
+        command = raw.call_args.args[0]
+        provenance = self._marker_line(self._normalized_and_summary(router._opus5_response(result))[1])
+
+        self.assertEqual(command[command.index('--model') + 1], 'sonnet')
+        self.assertEqual(provenance['kind'], 'claude_cli_step_down')
+        self.assertEqual(provenance['identity']['requested']['value'], 'claude-opus-5-5')
+        self.assertEqual(provenance['identity']['resolved'],
+                         {'value': 'sonnet', 'source': 'cli_alias_argument', 'canonical': False})
+        self.assertEqual(provenance['identity']['observed']['value'], 'claude-sonnet-5-5')
+        self.assertEqual(provenance['identity']['provider'], 'anthropic')
+        self.assertEqual(provenance['identity']['effort']['applied'], 'unknown')
+        self.assertNotEqual(provenance['identity']['effort']['requested'], 'unknown')
+
+    def _middleware_step_down_failure(self, run_effect):
+        """Real resolver -> real admission branch (Sonnet step-down) -> real public
+        bridge with only subprocess/log I/O stubbed; the review then fails and the
+        ordinary provider replies."""
+        from model_router import claude_opus_bridge as bridge
+
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'opus5': True, 'sonnet5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
+        }
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[opus-review] Review parser'}]}
+        response = SimpleNamespace(
+            model='gpt-terra', provider='openai-codex', status='completed',
+            output=[SimpleNamespace(type='message', status='completed', content=[
+                SimpleNamespace(type='output_text', text='ordinary verdict')])],
+            output_text='ordinary verdict')
+        with tempfile.TemporaryDirectory() as repo, \
+             patch('model_router._load_config', return_value=cfg), \
+             patch.object(bridge, '_load_config', return_value=cfg), \
+             patch('model_router._verified_delegated_claude_review', return_value=(Path(repo), 'opus')), \
+             patch('model_router.usage_guard.guarded', return_value=True), \
+             patch('model_router.usage_guard.read', return_value=None), \
+             patch('model_router.usage_guard.apply', return_value=SimpleNamespace(
+                 refused='', tier='sonnet5', adjusted='opus5→sonnet5')), \
+             patch('model_router.claude_delegation._log') as audit, \
+             patch.object(bridge.subprocess, 'run', side_effect=run_effect) as raw, \
+             patch.object(bridge, '_log_decision'), patch.object(bridge, '_append_lifecycle'):
+            result = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=Mock(return_value=response),
+                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        return result, raw, audit
+
+    def test_f04_i3_i4_step_down_failure_replacement_reports_admitted_alias(self):
+        timeout = subprocess.TimeoutExpired(['claude'], 600)
+        payload = {'type': 'result', 'subtype': 'error_max_turns', 'is_error': True,
+                   'modelUsage': {'claude-sonnet-5-5': {'inputTokens': 9}}, 'num_turns': 16}
+        max_turns = lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps(payload), stderr='', returncode=1)
+        for name, effect in (('timeout', timeout), ('max-turn', max_turns)):
+            with self.subTest(failure=name):
+                result, raw, audit = self._middleware_step_down_failure(effect)
+                command = raw.call_args.args[0]
+                self.assertEqual(command[command.index('--model') + 1], 'sonnet')
+                provenance = self._marker_line(self._normalized_and_summary(result)[1])
+                self.assertEqual(provenance['kind'], 'ordinary_replacement')
+                self.assertEqual(provenance['failure_kind'], name, audit.call_args_list)
+                self.assertEqual(provenance['identity']['requested']['value'], 'claude-opus-5-5')
+                self.assertEqual(provenance['identity']['resolved']['value'], 'sonnet')
+                self.assertEqual(provenance['identity']['resolved']['source'], 'cli_alias_argument')
+                self.assertEqual(provenance['identity']['effort']['applied'], 'unknown')
+                self.assertEqual(provenance['executed']['model'], 'gpt-terra')
+                audited = audit.call_args.args[1]['substitution']['identity']
+                self.assertEqual(audited['resolved']['value'], 'sonnet')
+                self.assertEqual(audited['effort']['applied'], 'unknown')
+
     # Audit H01: remove when F07 lands
     @unittest.expectedFailure
     def test_h01_installed_host_runner_supports_retry_callback(self):

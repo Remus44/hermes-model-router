@@ -4945,68 +4945,133 @@ def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
     return marker
 
 
-def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
-    """Append bounded plugin-owned evidence to content the host actually carries.
+class _AnnotatedResponseOverlay:
+    """Read-through view of a response that cannot take the provenance carrier.
 
-    The Codex normalizer and child-result projection retain output text but discard
-    arbitrary SDK attributes. Mutable responses keep their identity; immutable
-    responses receive a minimal response-shaped replacement rather than losing the
-    marker silently.
+    ``output`` and ``output_text`` are the overlay's own values; every other
+    attribute (usage, status, incomplete details, error, id, ...) is read from
+    the untouched original, so nothing the host reads is dropped.
+    """
+
+    def __init__(self, original: Any, output: list, output_text: str) -> None:
+        self._original = original
+        self.output = output
+        self.output_text = output_text
+
+    def __getattr__(self, name: str) -> Any:
+        original = self.__dict__.get("_original")
+        if original is None:
+            raise AttributeError(name)
+        if isinstance(original, dict):
+            try:
+                return original[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+        return getattr(original, name)
+
+
+_PROVENANCE_TOOL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call"})
+_PROVENANCE_COMMENTARY_PHASES = frozenset({"commentary", "analysis"})
+_PROVENANCE_FINAL_PHASES = frozenset({"final_answer", "final"})
+
+
+def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
+    """Add one parent-visible provenance carrier without changing execution semantics.
+
+    The carrier is a separate assistant message appended after every original
+    output item, holding only the marker line. The host normalizer joins message
+    texts with a newline, so the marker lands on its own line after all useful
+    final text (multipart text cannot run into the JSON), and a final-phase
+    carrier stays in the projected final answer when an earlier commentary
+    message is routed to reasoning. No original item is mutated, removed or
+    reordered: tool calls, reasoning, statuses and usage survive, and the
+    finish reason the host derives is unchanged.
+
+    Never partially applied: an SDK model (computed read-only ``output_text``)
+    gets a copy with the extra item; a mutable response gets the aggregate
+    written first (the only step that can fail) and then the item appended; any
+    other response gets a read-through overlay. A response with neither final
+    text nor a tool call (reasoning- or commentary-only, which the host
+    continues) is returned unannotated: marker-only text would turn it into a
+    final ``stop``.
     """
     encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     annotation = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
 
-    def field(name: str) -> Any:
-        return result.get(name) if isinstance(result, dict) else getattr(result, name, None)
+    def field(obj: Any, name: str) -> Any:
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
 
-    def set_field(name: str, value: Any) -> None:
-        if isinstance(result, dict):
-            result[name] = value
-        else:
-            setattr(result, name, value)
+    output = field(result, "output")
+    if not isinstance(output, list):
+        # A scalar/non-Responses legacy value has no host-supported content
+        # carrier. Preserve its byte-for-byte contract rather than replacing it.
+        return result
 
-    output = field("output")
+    def item_text(item: Any) -> str:
+        if field(item, "type") != "message":
+            return ""
+        content = field(item, "content")
+        return "".join(text for part in (content if isinstance(content, list) else ())
+                       if field(part, "type") in ("output_text", "text")
+                       and isinstance(text := field(part, "text"), str))
+
+    aggregate = field(result, "output_text")
+    if not isinstance(aggregate, str):
+        aggregate = "\n".join(text for text in map(item_text, output) if text)
+    phases = [str(field(item, "phase") or "").casefold() for item in output
+              if field(item, "type") == "message"]
+    has_tool_call = any(field(item, "type") in _PROVENANCE_TOOL_ITEM_TYPES for item in output)
+    has_final_text = any(item_text(item).strip()
+                         and str(field(item, "phase") or "").casefold() not in _PROVENANCE_COMMENTARY_PHASES
+                         for item in output)
+    # Stream-delivered answers can arrive as ``output_text`` with no items; the
+    # host synthesises a message from it, so carry that text as an item too.
+    leading = []
+    if not output and aggregate.strip():
+        leading, has_final_text = [("text", aggregate.strip())], True
+    if not (has_final_text or has_tool_call):
+        return result
+    if any(_SUBSTITUTION_PROVENANCE_PREFIX in item_text(item) for item in output):
+        return result  # already carries one; never add a second marker
+    # Mirror the response's own phase convention: final_answer only when the
+    # response already declares a final phase. Adding one to a phase-less or
+    # commentary-only response would change the host's finish reason.
+    phase = "final_answer" if any(p in _PROVENANCE_FINAL_PHASES for p in phases) else None
+    annotated_text = aggregate.rstrip() + ("\n\n" if aggregate.strip() else "") + annotation
+    # The leading newlines keep a computed SDK ``output_text`` (parts joined with
+    # no separator) parseable too; the normalizer strips them from content.
+    carrier_text = "\n\n" + annotation
+
+    model_copy = getattr(result, "model_copy", None)
+    if callable(model_copy) and not isinstance(result, dict):
+        try:
+            from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+
+            def sdk_message(text: str, item_phase: Optional[str]) -> Any:
+                return ResponseOutputMessage.model_construct(
+                    id="", type="message", role="assistant", status="completed", phase=item_phase,
+                    content=[ResponseOutputText.model_construct(type="output_text", text=text,
+                                                                annotations=[])])
+            extra = [sdk_message(text, None) for _, text in leading]
+            copied = model_copy(update={"output": [*output, *extra, sdk_message(carrier_text, phase)]})
+            if isinstance(getattr(copied, "output", None), list):
+                return copied
+        except Exception:
+            pass  # fall through to the overlay; the original is untouched
+
+    def message(text: str, item_phase: Optional[str]) -> Any:
+        return SimpleNamespace(type="message", role="assistant", status="completed", phase=item_phase,
+                               content=[SimpleNamespace(type="output_text", text=text)])
+    added = [message(text, None) for _, text in leading] + [message(carrier_text, phase)]
     try:
-        for item in output if isinstance(output, list) else ():
-            content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
-            for part in content if isinstance(content, list) else ():
-                part_type = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
-                if part_type == "output_text":
-                    text = part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
-                    annotated = str(text or "").rstrip() + "\n\n" + annotation
-                    if isinstance(part, dict):
-                        part["text"] = annotated
-                    else:
-                        setattr(part, "text", annotated)
-                    set_field("output_text", annotated)
-                    return result
-        raise TypeError("response has no mutable output_text part")
+        if isinstance(result, dict):
+            result["output_text"] = annotated_text
+        else:
+            setattr(result, "output_text", annotated_text)
     except Exception:
-        if not isinstance(output, list):
-            # A scalar/non-Responses legacy value has no host-supported content
-            # carrier. Preserve its byte-for-byte contract rather than replacing
-            # it with an invented response-shaped object.
-            return result
-        text = str(field("output_text") or "").rstrip()
-        annotated = text + ("\n\n" if text else "") + annotation
-        copied = {}
-        if not isinstance(result, dict):
-            try:
-                copied.update(vars(result))
-            except TypeError:
-                pass
-        elif isinstance(result, dict):
-            copied.update(result)
-        copied.update({
-            "output": [SimpleNamespace(type="message", status="completed", content=[
-                SimpleNamespace(type="output_text", text=annotated),
-            ])],
-            "output_text": annotated,
-            "status": field("status") or "completed",
-            "model": field("model"),
-            "provider": field("provider"),
-        })
-        return SimpleNamespace(**copied)
+        return _AnnotatedResponseOverlay(result, [*output, *added], annotated_text)
+    output.extend(added)
+    return result
 
 
 def _opus5_response(result: Dict[str, Any]) -> Any:
@@ -5069,16 +5134,15 @@ def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]
         "ordinary_replacement", identity=replacement.get("identity"), substitution={},
         replacement=replacement, executed=executed,
     ))
-    if annotated is result:
-        if isinstance(result, dict):
-            result["replacement_provenance"] = provenance
-            result["route_reason"] = route_reason
-        else:
-            try:
-                setattr(result, "replacement_provenance", provenance)
-                setattr(result, "route_reason", route_reason)
-            except Exception:
-                pass
+    if isinstance(annotated, dict):
+        annotated["replacement_provenance"] = provenance
+        annotated["route_reason"] = route_reason
+    else:
+        try:
+            setattr(annotated, "replacement_provenance", provenance)
+            setattr(annotated, "route_reason", route_reason)
+        except Exception:
+            pass
     return annotated
 
 
@@ -5267,6 +5331,11 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                     from .claude_opus_bridge import ClaudeBridgeFailure
                     raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
                 return None
+            # From here on, ``resolved`` names the alias admission actually put on
+            # argv (requested stays the original ask), so success, pre-launch
+            # failure and replacement provenance all describe the real invocation.
+            from .claude_opus_bridge import admitted_invocation_identity
+            identity = admitted_invocation_identity(identity, alias)
             return bridge_response(
                 review=True,
                 repo=str(repo),
