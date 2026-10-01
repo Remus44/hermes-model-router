@@ -293,8 +293,6 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(outcome.failure.failure_class, "exact-route-mismatch")
         self.assertEqual(self.result(validation_evidence=("verification failed",)).terminal_status, "succeeded")
 
-    # Audit A07: remove when F02 lands
-    @unittest.expectedFailure
     def test_a07_exact_worker_result_rejects_known_account_mismatch(self):
         wanted = contracts.TargetIdentity(
             'anthropic', 'account-A', 'hermes_claude', 'sonnet', 'exact',
@@ -306,6 +304,22 @@ class ReviewRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             contracts.WorkerResult('wf', 'task', 'attempt', 'handle', 'succeeded', 'done',
                 contracts.OutputReference('done'), wanted, other, other)
+
+    def test_a07_exact_worker_result_rejects_known_transport_mismatch(self):
+        wanted = self.result().requested_target
+        other = replace(wanted, transport='claude_cli')
+        with self.assertRaisesRegex(ValueError, 'exact'):
+            self.result(resolved_target=other, observed_target=other)
+
+    def test_a07_exact_worker_result_accepts_unknown_account_observation(self):
+        wanted = self.result().requested_target
+        unknown = replace(wanted, account=contracts.UNKNOWN)
+        self.assertEqual(self.result(resolved_target=unknown, observed_target=unknown).terminal_status, 'succeeded')
+
+    def test_a07_exact_worker_result_accepts_matching_account_and_transport(self):
+        wanted = self.result().requested_target
+        matching = replace(wanted, observed=contracts.ModelFact())
+        self.assertEqual(self.result(resolved_target=matching, observed_target=matching).terminal_status, 'succeeded')
 
     def test_exact_authoritative_request_checks_resolved_model_and_provider(self):
         for changes in ({"resolved": contracts.ModelFact("other", "host")},
