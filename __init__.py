@@ -5040,11 +5040,27 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         or ":sa-" in str(kwargs.get("turn_id", ""))
     ):
         delegated = _verified_delegated_claude_review(routing_text, cfg, request=source_request)
+        policy = coding_cfg.get("delegated_review") or {}
+        selection_mode = str(policy.get("selection_mode") or "profile_preferred")
+        requested_model = str(policy.get("requested_model") or "").strip() or None
+        if delegated is None and selection_mode == "exact" and review_model_alias(routing_text) is not None:
+            try:
+                _route, route_reason = _delegated_claude_review_status(
+                    routing_text, cfg, request=source_request,
+                )
+            except Exception:
+                route_reason = "the Claude CLI review route could not be established"
+            from . import target_identity
+            resolution = target_identity.resolve_target(
+                requested_alias, transport="claude_cli", selection_mode=selection_mode,
+                requested_model=requested_model, cfg=cfg,
+            )
+            refusal = "exact Claude CLI review route was refused before bridge selection: " + route_reason
+            audit_refusal(refusal)
+            from .claude_opus_bridge import ClaudeBridgeFailure
+            raise ClaudeBridgeFailure(refusal, "capability", identity=resolution.identity, refused=True)
         if delegated is not None:
             repo, _requested_alias = delegated
-            policy = coding_cfg.get("delegated_review") or {}
-            selection_mode = str(policy.get("selection_mode") or "profile_preferred")
-            requested_model = str(policy.get("requested_model") or "").strip() or None
             from . import target_identity
             resolution = target_identity.resolve_target(
                 requested_alias, transport="claude_cli", selection_mode=selection_mode,
@@ -5222,13 +5238,25 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
                 )
             raise
 
+    def stopped_exact_response(error: BaseException) -> Optional[Any]:
+        """Translate mandatory-exact bridge failures at the host callback boundary."""
+        identity = getattr(error, "identity", None)
+        if getattr(error, "refused", False) or getattr(identity, "selection_mode", "") == "exact":
+            message = str(getattr(error, "route_reason", "") or error).strip() or "exact Claude CLI review was refused"
+            return worker_admission.stopped_response(
+                "Exact Claude CLI review was not completed: " + message,
+                str(request.get("model", "")),
+            )
+        return None
+
     opus_context = {key: value for key, value in kwargs.items() if key not in {"request", "next_call", "retry_call"}}
     replacement_provenance = None
     try:
         opus_response = _maybe_run_opus5(request, cfg, **opus_context)
     except Exception as error:
-        if getattr(error, "refused", False):
-            raise
+        stopped = stopped_exact_response(error)
+        if stopped is not None:
+            return stopped
         # Failures before an attempt are not attributed to the CLI; attempted
         # reviews write a separate audit with the concrete reason.
         _logger.warning("Claude bridge did not complete; falling back to the normal route", exc_info=True)

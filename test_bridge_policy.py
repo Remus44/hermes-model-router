@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import tempfile
@@ -476,8 +477,6 @@ class AccountOfExecutionTests(unittest.TestCase):
             codex.assert_not_called()
             self.assertEqual(bridge.call_count, 0 if claude == 95 else 1)
 
-    # Audit A01: remove when F01 lands
-    @unittest.expectedFailure
     def test_a01_exact_refusal_through_host_runner_does_not_dispatch(self):
         from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -498,14 +497,55 @@ class AccountOfExecutionTests(unittest.TestCase):
              patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
              patch.object(router.claude_delegation, '_log'), \
              patch.object(router, '_run_opus5_bridge') as bridge:
-            run_llm_execution_middleware(request, downstream, provider='openai-codex',
+            stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
                 api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
         bridge.assert_not_called()
         self.assertEqual(downstream.call_count, 0, 'exact refusal failed open through the host runner')
+        self.assertEqual(stopped.usage.total_tokens, 0)
+        self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
+        self.assertIn('No work was performed', stopped.output_text)
+        from agent.transports.codex import ResponsesApiTransport
+        normalized = ResponsesApiTransport().normalize_response(stopped)
+        self.assertIn('ROUTER WORKER STOPPED', normalized.content or '')
 
-    # Audit A08: remove when F01 lands
-    @unittest.expectedFailure
+    def test_exact_preselection_refusal_does_not_fall_through_when_no_review_route_exists(self):
+        from hermes_cli.middleware import run_llm_execution_middleware
+        from model_router.hermes_paths import hermes_home
+
+        with tempfile.TemporaryDirectory() as directory:
+            routes = Path(directory) / 'routes.jsonl'
+            audits = hermes_home() / 'f01-claude.jsonl'
+            cfg = {
+                'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+                'callable': {'sonnet5': False, 'opus5': True},
+                'coding_agent': {'enabled': False, 'delegated_review': {
+                    'enabled': True, 'selection_mode': 'exact', 'requested_model': 'claude-sonnet-5-5',
+                }},
+                'logging': {'enabled': True, 'path': str(routes)},
+                'claude_delegation': {'log_path': '~/.hermes/f01-claude.jsonl'},
+            }
+            request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                       '[sonnet-review] Review parser'}]}
+            downstream = Mock(return_value='ORDINARY PROVIDER EXECUTED')
+            manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                      _report_hook_failure=Mock())
+            with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+                 patch.object(router, '_load_config', return_value=cfg), \
+                 patch.object(router, '_verified_delegated_claude_review', return_value=None), \
+                 patch.object(router, '_run_opus5_bridge') as bridge:
+                stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                    api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            audit_entries = [json.loads(line) for line in audits.read_text().splitlines()] if audits.exists() else []
+        downstream.assert_not_called()
+        bridge.assert_not_called()
+        self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
+        self.assertFalse(routes.exists(), 'refusal must not create a routed provider-call record')
+        self.assertTrue(audits.exists(), 'refusal must persist a Claude audit record')
+        self.assertEqual(len(audit_entries), 1)
+        self.assertEqual(audit_entries[0]['outcome'], 'refused')
+
     def test_a08_exact_attempt_failure_does_not_substitute(self):
+        from hermes_cli.middleware import run_llm_execution_middleware
         from model_router.claude_opus_bridge import ClaudeBridgeFailure
         from model_router.execution_contracts import ModelFact, TargetIdentity
 
@@ -522,7 +562,10 @@ class AccountOfExecutionTests(unittest.TestCase):
         request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
                    '[sonnet-review] Review parser'}]}
         downstream = Mock(return_value=SimpleNamespace(model='gpt-terra'))
-        with patch.object(router, '_load_config', return_value=cfg), \
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+             patch.object(router, '_load_config', return_value=cfg), \
              patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
              patch('model_router.target_identity.resolve_target', return_value=SimpleNamespace(
                  status='resolved', identity=identity, reasons=())), \
@@ -530,14 +573,13 @@ class AccountOfExecutionTests(unittest.TestCase):
              patch.object(router.worker_admission, 'refusal', return_value=''), \
              patch.object(router.claude_delegation, '_log'), \
              patch.object(router, '_run_opus5_bridge', side_effect=ClaudeBridgeFailure(
-                 'wrong model', 'model-mismatch', identity=identity)):
-            try:
-                router.run_llm_with_transient_failover(request=request, original_request=request,
-                    next_call=downstream, provider='openai-codex', api_mode='codex_responses',
-                    platform='subagent', turn_id='s:sa-1')
-            except ClaudeBridgeFailure:
-                pass
+                 'wrong model', 'model-mismatch', identity=identity)) as bridge:
+            stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        bridge.assert_called_once()
         self.assertEqual(downstream.call_count, 0, 'exact attempted failure substituted on ordinary provider')
+        self.assertEqual(stopped.usage.total_tokens, 0)
+        self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
 
     # Audit A02: remove when F04 lands
     @unittest.expectedFailure
@@ -615,15 +657,13 @@ class AccountOfExecutionTests(unittest.TestCase):
              patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
              patch('model_router._run_opus5_bridge') as bridge, \
              patch('model_router.claude_delegation._log') as audit:
-            with self.assertRaises(ClaudeBridgeFailure) as raised:
-                router.run_llm_with_transient_failover(
-                    request=request, original_request=request, next_call=downstream,
-                    provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            stopped = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=downstream,
+                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
         bridge.assert_not_called()
         downstream.assert_not_called()
-        self.assertEqual(raised.exception.failure_kind, 'capability')
-        self.assertTrue(raised.exception.refused)
-        self.assertIn('exact canonical CLI selection needs exact_model evidence', raised.exception.route_reason)
+        self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
+        self.assertIn('exact canonical CLI selection needs exact_model evidence', stopped.output_text)
         self.assertEqual(audit.call_args.args[1]['outcome'], 'refused')
         self.assertEqual(audit.call_args.args[1]['tier_used'], 'none')
         self.assertIn('exact canonical CLI selection needs exact_model evidence', audit.call_args.args[1]['message'])
@@ -655,12 +695,11 @@ class AccountOfExecutionTests(unittest.TestCase):
              patch('model_router.usage_guard.guarded', return_value=True), \
              patch('model_router.usage_guard.apply', return_value=SimpleNamespace(
                  refused='', tier='sonnet5', adjusted='opus5→sonnet5')):
-            with self.assertRaises(ClaudeBridgeFailure) as raised:
-                router.run_llm_with_transient_failover(
-                    request=request, original_request=request, next_call=downstream,
-                    provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
-        self.assertTrue(raised.exception.refused)
-        self.assertIn('cannot substitute', raised.exception.route_reason)
+            stopped = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=downstream,
+                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
+        self.assertIn('cannot substitute', stopped.output_text)
         downstream.assert_not_called()
 
     def test_failed_review_records_actual_replacement_result_after_transient_failover(self):
