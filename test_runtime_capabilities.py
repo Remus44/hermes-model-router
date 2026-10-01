@@ -28,8 +28,69 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
     def snapshot(self, request=None):
         return runtime.snapshot(request if request is not None else delegate_task_request(), self.cfg)
 
-    # Audit A09: remove when F02 lands
-    @unittest.expectedFailure
+    def _shapes(self, name):
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+        params = DELEGATE_TASK_SCHEMA['parameters']
+        return {
+            'flat': {'name': name, 'parameters': params},
+            'openai': {'type': 'function', 'function': {'name': name, 'parameters': params}},
+            'anthropic': {'name': name, 'input_schema': params},
+        }
+
+    def test_a09_supported_delegate_task_names_across_shapes(self):
+        for name in ('delegate_task', 'mcp__delegate_task'):
+            for shape, tool in self._shapes(name).items():
+                with self.subTest(name=name, shape=shape):
+                    runtime.clear_cache()
+                    cap = runtime.snapshot({'tools': [tool]}, {}).adapter('hermes_codex').capability('submission')
+                    self.assertEqual(cap.status, 'supported', cap.reason)
+                    mp = runtime.snapshot({'tools': [tool]}, {}).adapter('hermes_codex').capability('model_parameter')
+                    # The installed host schema is batch-only: no model parameter.
+                    self.assertEqual(mp.status, 'unsupported', mp.reason)
+
+    def test_a09_supported_delegate_claude_names_across_shapes(self):
+        for name in ('delegate_claude', 'mcp__delegate_claude'):
+            for shape, tool in self._shapes(name).items():
+                with self.subTest(name=name, shape=shape):
+                    runtime.clear_cache()
+                    with patch.object(claude_delegation, 'is_active', return_value=True):
+                        cap = runtime.snapshot({'tools': [tool]}, self.cfg).adapter('hermes_claude').capability('submission')
+                    self.assertEqual(cap.status, 'supported', cap.reason)
+
+    def test_a09_arbitrary_prefix_and_unrelated_tools_do_not_count(self):
+        for name in ('other__delegate_task', 'mcp__x__delegate_task', 'MCP__delegate_task',
+                     'mcp__delegate_task_extra', 'delegate_claude', 'mcp__delegate_claude'):
+            tool = self._shapes(name)['flat']
+            runtime.clear_cache()
+            cap = runtime.snapshot({'tools': [tool]}, {}).adapter('hermes_codex').capability('submission')
+            self.assertEqual(cap.status, 'unknown', f'{name}: {cap.reason}')
+        runtime.clear_cache()
+        with patch.object(claude_delegation, 'is_active', return_value=True):
+            cap = runtime.snapshot({'tools': [self._shapes('other__delegate_claude')['flat']]}, self.cfg
+                                   ).adapter('hermes_claude').capability('submission')
+        self.assertEqual(cap.status, 'unknown', cap.reason)
+
+    def test_a09_missing_malformed_and_deferred_are_unknown(self):
+        malformed = {'tools': [{'name': 'mcp__delegate_task', 'input_schema': 'nope'}]}
+        no_props = {'tools': [{'function': {'name': 'mcp__delegate_task', 'parameters': {}}}]}
+        for label, req in (('missing', {'tools': []}), ('deferred', {'tools': [{'name': 'terminal'}],
+                           'deferred_tools': ['mcp__delegate_task']}), ('malformed', malformed),
+                           ('no_props', no_props)):
+            runtime.clear_cache()
+            cap = runtime.snapshot(req, {}).adapter('hermes_codex').capability('submission')
+            self.assertEqual(cap.status, 'unknown', f'{label}: {cap.reason}')
+        runtime.clear_cache()
+        self.assertIn('absent or deferred',
+                      runtime.snapshot({'tools': []}, {}).adapter('hermes_codex').capability('submission').reason)
+        self.assertIn('missing or malformed',
+                      runtime.snapshot(malformed, {}).adapter('hermes_codex').capability('submission').reason)
+
+    def test_a09_prefixed_name_changes_fingerprint(self):
+        runtime.clear_cache()
+        a = runtime.snapshot({'tools': [self._shapes('mcp__delegate_task')['flat']]}, {})
+        b = runtime.snapshot({'tools': []}, {})
+        self.assertNotEqual(a.fingerprint, b.fingerprint)
+
     def test_a09_runtime_diagnostic_recognizes_supported_prefixed_delegate_task(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
 

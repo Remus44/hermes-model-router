@@ -38,7 +38,8 @@ TOPOLOGIES = ("parent_direct", "nested_conductor")
 TRANSPORTS = ("hermes_codex", "hermes_claude", "claude_cli")
 DEFAULT_TOPOLOGY = "parent_direct"
 
-_DELEGATE_NAMES = ("delegate_task",)
+_DELEGATE_NAMES = ("delegate_task", "mcp__delegate_task")
+_CLAUDE_NAMES = ("delegate_claude", "mcp__delegate_claude")
 _HOST_SEAMS = ("delegate_task", "_resolve_child_toolsets", "_build_child_agent")
 _CONFIG_KEYS = ("orchestration", "callable", "claude_delegation")
 
@@ -293,7 +294,7 @@ def _build_adapters(g: Dict[str, Any]) -> Tuple[AdapterCapabilities, ...]:
         claude_submission = (UNSUPPORTED, submission[1])
     elif not g["claude_active"]:
         claude_submission = (UNSUPPORTED, "Claude delegation is not active")
-    elif claude_name in g["tool_names"]:
+    elif claude_name in g["tool_names"] or any(n in g["tool_names"] for n in _CLAUDE_NAMES):
         claude_submission = (SUPPORTED, f"{claude_name} is visible in the request")
     else:
         claude_submission = (UNKNOWN, f"{claude_name} not visible in this request (deferred or absent)")
