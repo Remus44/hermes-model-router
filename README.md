@@ -303,9 +303,9 @@ the final replacement provider/model only when that response supplies observed
 evidence (otherwise those fields are explicitly `unknown`). An exact route that
 cannot be admitted, or that fails after its one CLI attempt, stops at the
 execution-middleware boundary with a zero-token refusal response;
-the response explicitly states that no Claude review or ordinary replacement ran.
-The direct bridge still carries its typed failure evidence internally. Neither
-response counts as a Claude review.
+the response states that no work was performed by that call. The direct bridge still
+carries its typed failure evidence internally. Neither response counts as a Claude
+review.
 
 ### A parent on a fallback account still orchestrates
 

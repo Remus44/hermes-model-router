@@ -4951,13 +4951,16 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
     adjustment = ""
     admission_refusal = ""
 
-    def ordinary_replacement(error: BaseException) -> Dict[str, Any]:
+    def bridge_failure_kind(error: BaseException) -> str:
         message = str(error).casefold()
-        failure_kind = str(getattr(error, "failure_kind", "")) or (
+        return str(getattr(error, "failure_kind", "")) or (
             "max-turn" if "max turn" in message else "budget" if "budget" in message
             else "timeout" if "timed out" in message else "malformed-json" if "json" in message
             else "nonzero-exit" if "exit " in message else "execution-error"
         )
+
+    def ordinary_replacement(error: BaseException) -> Dict[str, Any]:
+        failure_kind = bridge_failure_kind(error)
         model = str(request.get("model") or "")
         tier = next((name for name, candidate in (cfg.get("models") or {}).items()
                      if str(candidate) == model), "ordinary")
@@ -5015,20 +5018,31 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         except Exception as error:
             if review:
                 message = str(error).strip()[:300] or type(error).__name__
-                replacement = ordinary_replacement(error)
-                failure = {"message": message, "replacement": replacement,
-                           "failure_kind": replacement["failure_kind"],
-                           "identity": getattr(error, "identity", None)}
+                identity = bridge_kwargs.get("identity")
+                selection_mode = str(getattr(identity, "selection_mode", ""))
+                failure_kind = bridge_failure_kind(error)
+                failure = {"message": message, "failure_kind": failure_kind,
+                           "identity": getattr(error, "identity", None),
+                           "selection_mode": selection_mode}
+                # The bridge can fail before it attaches an identity (for example
+                # process start, invalid repository or malformed response). Carry
+                # the selection decision made before the attempt, not an optional
+                # exception attribute, across the middleware boundary.
+                setattr(error, "_bridge_selection_mode", selection_mode)
                 setattr(error, "_bridge_review_failure", failure)
-                claude_delegation._log(cfg, {
+                audit_event = {
                     "event": "bridge_claude", "outcome": "error", "message": message,
-                    "failure_kind": replacement["failure_kind"],
+                    "failure_kind": failure_kind,
                     "failure_class": str(getattr(error, "failure_class", "execution-error")),
-                    "substitution": replacement,
                     "tier_requested": requested_alias, "tier_used": requested_alias,
                     "session_id": str(kwargs.get("session_id") or ""),
                     "turn_id": str(kwargs.get("turn_id") or ""),
-                })
+                }
+                if selection_mode != "exact":
+                    replacement = ordinary_replacement(error)
+                    failure["replacement"] = replacement
+                    audit_event["substitution"] = replacement
+                claude_delegation._log(cfg, audit_event)
             raise
 
     # A delegated review leaf runs on Claude and returns its verdict as the
@@ -5241,7 +5255,9 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     def stopped_exact_response(error: BaseException) -> Optional[Any]:
         """Translate mandatory-exact bridge failures at the host callback boundary."""
         identity = getattr(error, "identity", None)
-        if getattr(error, "refused", False) or getattr(identity, "selection_mode", "") == "exact":
+        selection_mode = str(getattr(error, "_bridge_selection_mode", "")
+                             or getattr(identity, "selection_mode", ""))
+        if getattr(error, "refused", False) or selection_mode == "exact":
             message = str(getattr(error, "route_reason", "") or error).strip() or "exact Claude CLI review was refused"
             return worker_admission.stopped_response(
                 "Exact Claude CLI review was not completed: " + message,

@@ -458,6 +458,40 @@ class AccountOfExecutionTests(unittest.TestCase):
                 platform='subagent' if worker else 'cli', turn_id='s:sa-1' if worker else 'root')
         return result, downstream, bridge, claude_read
 
+    def _host_review_attempt(self, *, selection_mode, bridge_result, alias='sonnet', log_path=None):
+        from hermes_cli.middleware import run_llm_execution_middleware
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        from model_router.target_identity import RESOLVED
+
+        identity = TargetIdentity('anthropic', 'unknown', 'claude_cli', alias, selection_mode,
+            requested=ModelFact(f'claude-{alias}-5-5', 'fixture'))
+        cfg = {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'sonnet5': True, 'opus5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {
+                'enabled': True, 'selection_mode': selection_mode,
+                'requested_model': f'claude-{alias}-5-5',
+            }},
+        }
+        if log_path is not None:
+            cfg['claude_delegation'] = {'log_path': str(log_path)}
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   f'[{alias}-review] Review parser'}]}
+        downstream = Mock(return_value=SimpleNamespace(model='gpt-terra', provider='openai-codex'))
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+             patch.object(router, '_load_config', return_value=cfg), \
+             patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), alias)), \
+             patch('model_router.target_identity.resolve_target', return_value=SimpleNamespace(
+                 status=RESOLVED, identity=identity, reasons=())), \
+             patch.object(router.usage_guard, 'guarded', return_value=False), \
+             patch.object(router.worker_admission, 'refusal', return_value=''), \
+             patch.object(router, '_run_opus5_bridge', side_effect=bridge_result) as bridge:
+            response = run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        return response, downstream, bridge
+
     def test_closed_codex_does_not_block_healthy_claude(self):
         result, codex, bridge, _ = self._route(codex=95, claude=10)
         self.assertEqual(result.model, 'claude-sonnet-5-5')
@@ -581,6 +615,64 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(stopped.usage.total_tokens, 0)
         self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
 
+    def test_exact_attempt_failure_kinds_stop_through_host_runner_without_identity(self):
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        failures = (
+            ('timeout', ClaudeBridgeFailure('Claude Code timed out', 'timeout')),
+            ('malformed-output', {'result': '', 'effective_model': 'claude-sonnet-5-5'}),
+            ('model-mismatch', ClaudeBridgeFailure('wrong model', 'model-mismatch')),
+            ('budget', ClaudeBridgeFailure('Claude Code exhausted its budget', 'budget')),
+            ('max-turn', ClaudeBridgeFailure('Claude Code reached max turns', 'max-turn')),
+            ('nonzero-exit', ClaudeBridgeFailure('Claude Code failed with exit 1: ' + ('x' * 500), 'nonzero-exit')),
+            ('process-start', FileNotFoundError('claude')),
+        )
+        for name, failure in failures:
+            with self.subTest(failure=name):
+                stopped, downstream, bridge = self._host_review_attempt(
+                    selection_mode='exact', bridge_result=failure)
+                bridge.assert_called_once()
+                downstream.assert_not_called()
+                self.assertEqual(stopped.usage.total_tokens, 0)
+                self.assertTrue(router._router_stopped_summary(stopped.output_text),
+                    'the parent-side stop detector must recognize every exact failure')
+
+    def test_preferred_attempt_failure_kinds_still_replace_once_through_host_runner(self):
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        failures = (
+            ('timeout', ClaudeBridgeFailure('Claude Code timed out', 'timeout')),
+            ('malformed-output', {'result': '', 'effective_model': 'claude-sonnet-5-5'}),
+            ('model-mismatch', ClaudeBridgeFailure('wrong model', 'model-mismatch')),
+            ('budget', ClaudeBridgeFailure('Claude Code exhausted its budget', 'budget')),
+            ('max-turn', ClaudeBridgeFailure('Claude Code reached max turns', 'max-turn')),
+            ('nonzero-exit', ClaudeBridgeFailure('Claude Code failed with exit 1', 'nonzero-exit')),
+            ('process-start', FileNotFoundError('claude')),
+        )
+        for name, failure in failures:
+            with self.subTest(failure=name):
+                response, downstream, bridge = self._host_review_attempt(
+                    selection_mode='profile_preferred', bridge_result=failure)
+                bridge.assert_called_once()
+                downstream.assert_called_once()
+                self.assertEqual(response.model, 'gpt-terra')
+
+    def test_exact_attempt_failure_audit_has_no_planned_replacement(self):
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        with tempfile.TemporaryDirectory() as directory:
+            audit_path = Path(directory) / 'claude-audit.jsonl'
+            stopped, downstream, bridge = self._host_review_attempt(
+                selection_mode='exact', bridge_result=ClaudeBridgeFailure('wrong model', 'model-mismatch'),
+                log_path=audit_path)
+            entries = [json.loads(line) for line in audit_path.read_text().splitlines()]
+        bridge.assert_called_once()
+        downstream.assert_not_called()
+        self.assertTrue(router._router_stopped_summary(stopped.output_text))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['outcome'], 'error')
+        self.assertNotIn('substitution', entries[0])
+
     # Audit A02: remove when F04 lands
     @unittest.expectedFailure
     def test_a02_successful_cli_conversion_preserves_identity_and_substitution(self):
@@ -640,7 +732,7 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(downstream.call_count, 2, 'installed host runner did not supply a reusable retry callback')
 
     def test_exact_cli_route_without_capability_evidence_refuses_without_ordinary_provider_fallback(self):
-        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+        from hermes_cli.middleware import run_llm_execution_middleware
 
         cfg = {
             'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
@@ -653,13 +745,15 @@ class AccountOfExecutionTests(unittest.TestCase):
         request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
                    '[sonnet-review] Review parser'}]}
         downstream = Mock(return_value='Codex ran')
-        with patch('model_router._load_config', return_value=cfg), \
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+             patch('model_router._load_config', return_value=cfg), \
              patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')), \
              patch('model_router._run_opus5_bridge') as bridge, \
              patch('model_router.claude_delegation._log') as audit:
-            stopped = router.run_llm_with_transient_failover(
-                request=request, original_request=request, next_call=downstream,
-                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
         bridge.assert_not_called()
         downstream.assert_not_called()
         self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
@@ -669,6 +763,7 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertIn('exact canonical CLI selection needs exact_model evidence', audit.call_args.args[1]['message'])
 
     def test_exact_cli_route_refuses_a_usage_step_down_without_ordinary_provider_fallback(self):
+        from hermes_cli.middleware import run_llm_execution_middleware
         from types import SimpleNamespace
         from model_router.execution_contracts import ModelFact, TargetIdentity
         from model_router.target_identity import RESOLVED
@@ -688,16 +783,20 @@ class AccountOfExecutionTests(unittest.TestCase):
         request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
                    '[opus-review] Review parser'}]}
         downstream = Mock(return_value='Codex ran')
-        with patch('model_router._load_config', return_value=cfg), \
+        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                  _report_hook_failure=Mock())
+        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+             patch('model_router._load_config', return_value=cfg), \
              patch('model_router._verified_delegated_claude_review', return_value=(Path('/tmp'), 'opus')), \
              patch('model_router.target_identity.resolve_target', return_value=SimpleNamespace(
                  status=RESOLVED, identity=identity, reasons=())), \
              patch('model_router.usage_guard.guarded', return_value=True), \
              patch('model_router.usage_guard.apply', return_value=SimpleNamespace(
-                 refused='', tier='sonnet5', adjusted='opus5→sonnet5')):
-            stopped = router.run_llm_with_transient_failover(
-                request=request, original_request=request, next_call=downstream,
-                provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+                 refused='', tier='sonnet5', adjusted='opus5→sonnet5')), \
+             patch('model_router._run_opus5_bridge') as bridge:
+            stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        bridge.assert_not_called()
         self.assertIn('ROUTER WORKER STOPPED', stopped.output_text)
         self.assertIn('cannot substitute', stopped.output_text)
         downstream.assert_not_called()

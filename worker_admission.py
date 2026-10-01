@@ -122,7 +122,7 @@ def stopped_response(message, model):
     Returning a final message instead stops the worker without contacting the
     provider or inventing task results.
     """
-    text = "[ROUTER WORKER STOPPED] " + message + " Re-dispatch this task on an available account. No work was performed by this call."
+    text = "[ROUTER WORKER STOPPED] No work was performed by this call. " + message + " Re-dispatch this task on an available account."
     usage = SimpleNamespace(input_tokens=0, output_tokens=0, total_tokens=0,
                             prompt_tokens=0, completion_tokens=0)
     return SimpleNamespace(
