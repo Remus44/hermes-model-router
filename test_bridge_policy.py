@@ -1133,6 +1133,193 @@ class AccountOfExecutionTests(unittest.TestCase):
                 self.assertEqual(audited['resolved']['value'], 'sonnet')
                 self.assertEqual(audited['effort']['applied'], 'unknown')
 
+    # --- F04 fix round 2 (re-review N1/N2): provenance across a host continuation
+    # and on refusal-only final text, through the real middleware, the real host
+    # normalizer and the real child projection.
+    N1_CFG = {
+        'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+        'callable': {'opus5': True, 'sonnet5': True},
+        'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
+    }
+
+    @staticmethod
+    def _n1_response(kind, text='PASS: parser inspected'):
+        if kind == 'reasoning':
+            item = SimpleNamespace(type='reasoning', id='rs_n1', summary=[
+                SimpleNamespace(type='summary_text', text='still inspecting')])
+        elif kind == 'tool':
+            item = SimpleNamespace(type='function_call', id='fc_n1', call_id='call_n1', name='read_file',
+                                   arguments='{"path":"parser.py"}', status='completed')
+        else:
+            part = (SimpleNamespace(type='refusal', refusal=text) if kind == 'refusal'
+                    else SimpleNamespace(type='output_text', text=text))
+            item = SimpleNamespace(type='message', status='completed', role='assistant',
+                                   phase='commentary' if kind == 'commentary' else None, content=[part])
+        output_text = text if kind in ('final', 'commentary') else ''
+        return SimpleNamespace(output=[item], output_text=output_text, model='gpt-terra',
+                               provider='openai-codex', status='completed')
+
+    def _n1_call(self, response, api_call_count, turn_id, session_id='child-n1', cfg=None):
+        """One real middleware call; the CLI review fails on API call 1."""
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+
+        if not getattr(self, '_n1_state_reset', False):
+            # Module state outlives a test: start and end each test with none.
+            self._n1_state_reset = True
+            pending = getattr(router, '_PENDING_REPLACEMENTS', None)
+            if pending is not None:
+                pending.clear()
+                self.addCleanup(pending.clear)
+
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content': '[opus-review] Review parser'}]}
+        with patch.object(router, '_load_config', return_value=cfg or self.N1_CFG), \
+             patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), 'opus')), \
+             patch.object(router, '_run_opus5_bridge',
+                          side_effect=ClaudeBridgeFailure('Claude Code timed out', 'timeout')) as bridge, \
+             patch.object(router.claude_delegation, '_log'), \
+             patch.object(router.worker_admission, 'refusal', return_value=''), \
+             patch.object(router.usage_guard, 'guarded', return_value=False):
+            result = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=Mock(return_value=response),
+                api_call_count=api_call_count, provider='openai-codex', api_mode='codex_responses',
+                platform='subagent', session_id=session_id, turn_id=turn_id)
+        self.assertEqual(bridge.call_count, 1 if api_call_count == 1 else 0)
+        return result
+
+    def _codex_normalized(self, response):
+        from agent.transports.codex import ResponsesApiTransport
+        return ResponsesApiTransport().normalize_response(response, issuer_kind='codex_backend')
+
+    def _projected(self, response):
+        from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
+
+        normalized = self._codex_normalized(response)
+        entry = _build_result_entry(SimpleNamespace(model='configured-child'), {
+            'final_response': normalized.content, 'completed': True, 'api_calls': 2,
+        }, 0, 0.1, _SchemaOutcome(None, None, [], 0))
+        return normalized, entry
+
+    def test_f04_n1_reasoning_or_commentary_interim_keeps_provenance_in_final_answer(self):
+        for kind in ('reasoning', 'commentary'):
+            with self.subTest(kind=kind):
+                turn = f'child-n1:task:{kind}'
+                first = self._codex_normalized(self._n1_call(self._n1_response(kind, 'still inspecting'), 1, turn))
+                # The interim reply stays a continuation, never a marker-only answer.
+                self.assertEqual((first.finish_reason, first.content), ('incomplete', ''))
+                self.assertNotIn(self.PREFIX, first.reasoning or '')
+
+                normalized, entry = self._projected(self._n1_call(self._n1_response('final'), 2, turn))
+                self.assertEqual(normalized.finish_reason, 'stop')
+                self.assertEqual(entry['status'], 'completed')
+                self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
+                marker = self._marker_line(entry['summary'])
+                self.assertEqual(marker['kind'], 'ordinary_replacement')
+                self.assertEqual(marker['failure_kind'], 'timeout')
+                self.assertEqual(marker['requested_review'], {'tier': 'opus', 'transport': 'claude_cli'})
+                self.assertEqual(marker['executed']['model'], 'gpt-terra')
+                self.assertFalse(marker['satisfies_cross_provider_review'])
+
+    def test_f04_n1_tool_call_continuation_keeps_provenance_in_final_answer(self):
+        turn = 'child-n1:task:tool'
+        first = self._codex_normalized(self._n1_call(self._n1_response('tool'), 1, turn))
+        self.assertEqual(first.finish_reason, 'tool_calls')
+        self.assertEqual(len(first.tool_calls), 1)
+        interim = self._codex_normalized(self._n1_call(self._n1_response('reasoning'), 2, turn))
+        self.assertEqual((interim.finish_reason, interim.content), ('incomplete', ''))
+
+        normalized, entry = self._projected(self._n1_call(self._n1_response('final'), 3, turn))
+        self.assertEqual(normalized.finish_reason, 'stop')
+        self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
+        self.assertEqual(self._marker_line(entry['summary'])['kind'], 'ordinary_replacement')
+
+    def test_f04_n1_retained_provenance_is_scoped_to_its_turn_and_cleared(self):
+        def marked(response):
+            return self.PREFIX in self._projected(response)[1]['summary']
+
+        final = lambda: self._n1_response('final')
+        self._n1_call(self._n1_response('reasoning'), 1, 'child-n1:task:turn-a')
+        self.assertFalse(marked(self._n1_call(final(), 2, 'other-child:task:turn-x', session_id='other-child')),
+                         'provenance leaked into another session')
+        self.assertFalse(marked(self._n1_call(final(), 2, 'child-n1:task:turn-b')),
+                         'provenance leaked into another turn')
+        self.assertFalse(marked(self._n1_call(final(), 2, 'parent:task:turn-p', session_id='parent')),
+                         'provenance leaked into the parent')
+        # Compression may rotate the session id inside the turn; the turn id stays.
+        self.assertTrue(marked(self._n1_call(final(), 2, 'child-n1:task:turn-a', session_id='child-n1-compressed')),
+                        'final answer of the turn lost provenance')
+        # The host can still continue after a terminal-looking reply (ack/stall
+        # nudges); the reply that really ends the turn keeps the marker.
+        self.assertTrue(marked(self._n1_call(final(), 3, 'child-n1:task:turn-a')),
+                        'a nudged continuation lost provenance')
+        # The turn-end hook clears the entry; nothing reaches the next turn.
+        with patch.object(router, '_load_config', return_value=self.N1_CFG):
+            router.on_post_llm_call(session_id='child-n1', turn_id='child-n1:task:turn-a', assistant_response='')
+        self.assertEqual(len(router._PENDING_REPLACEMENTS), 0)
+        self.assertFalse(marked(self._n1_call(final(), 4, 'child-n1:task:turn-a')),
+                         'state was not cleared at turn end')
+
+        # An undelivered entry (interim only) is cleared at turn end too.
+        self._n1_call(self._n1_response('reasoning'), 1, 'child-n1:task:turn-c')
+        with patch.object(router, '_load_config', return_value=self.N1_CFG):
+            router.on_post_llm_call(session_id='child-n1', turn_id='child-n1:task:turn-c', assistant_response='')
+        self.assertFalse(marked(self._n1_call(final(), 2, 'child-n1:task:turn-c')),
+                         'turn end did not clear the entry')
+
+    def test_f04_n1_retained_provenance_is_bounded_by_size_and_age(self):
+        final = lambda: self._n1_response('final')
+        marked = lambda response: self.PREFIX in self._projected(response)[1]['summary']
+        clock = [1000.0]
+        with patch.object(router, '_PENDING_REPLACEMENT_MAX', 2, create=True), \
+             patch.object(router, '_PENDING_REPLACEMENT_TTL_SECONDS', 100.0, create=True), \
+             patch.object(router, '_pending_replacement_clock', lambda: clock[0], create=True):
+            for turn in ('bound-1', 'bound-2', 'bound-3'):
+                self._n1_call(self._n1_response('reasoning'), 1, turn)
+            self.assertTrue(marked(self._n1_call(final(), 2, 'bound-3')), 'newest entry missing')
+            self.assertFalse(marked(self._n1_call(final(), 2, 'bound-1')), 'oldest entry was not evicted')
+            self._n1_call(self._n1_response('reasoning'), 1, 'age-1')
+            self._n1_call(self._n1_response('reasoning'), 1, 'age-2')
+            clock[0] += 99.0
+            self.assertTrue(marked(self._n1_call(final(), 2, 'age-1')), 'entry expired before its TTL')
+            clock[0] += 2.0
+            self.assertFalse(marked(self._n1_call(final(), 2, 'age-2')), 'entry outlived its TTL')
+        self.assertLessEqual(len(getattr(router, '_PENDING_REPLACEMENTS', {})), 2)
+
+    def test_f04_n1_final_on_host_fallback_provider_keeps_provenance(self):
+        """A reasoning-only stall makes the host switch provider for the rest of the turn."""
+        turn = 'child-n1:task:fallback'
+        self._n1_call(self._n1_response('reasoning'), 1, turn)
+        final = SimpleNamespace(output=[SimpleNamespace(type='message', status='completed', role='assistant',
+                                                        content=[SimpleNamespace(type='output_text', text='PASS')])],
+                                output_text='PASS', model='fallback-model', provider='other-provider',
+                                status='completed')
+        request = {'model': 'fallback-model', 'messages': [{'role': 'user', 'content': '[opus-review] Review parser'}]}
+        with patch.object(router, '_load_config', return_value=self.N1_CFG), \
+             patch.object(router.worker_admission, 'refusal', return_value=''):
+            result = router.run_llm_with_transient_failover(
+                request=request, original_request=request, next_call=Mock(return_value=final),
+                api_call_count=4, provider='other-provider', api_mode='codex_responses',
+                platform='subagent', session_id='child-n1', turn_id=turn)
+        _, entry = self._projected(result)
+        marker = self._marker_line(entry['summary'])
+        self.assertEqual(marker['executed']['model'], 'fallback-model')
+        self.assertEqual(marker['executed']['provider'], 'other-provider')
+        self.assertEqual(len(router._PENDING_REPLACEMENTS), 1)  # kept until the turn ends
+
+    def test_f04_n2_refusal_only_replacement_keeps_refusal_and_one_marker(self):
+        refusal = 'I cannot review this request.'
+        response = self._n1_response('refusal', refusal)
+        original_part = response.output[0].content[0]
+        normalized, entry = self._projected(self._n1_call(response, 1, 'child-n1:task:refusal'))
+
+        self.assertEqual(normalized.finish_reason, 'stop')
+        self.assertEqual(entry['status'], 'completed')
+        self.assertTrue(entry['summary'].startswith(refusal), 'refusal text was not kept first')
+        marker = self._marker_line(entry['summary'])
+        self.assertEqual(marker['kind'], 'ordinary_replacement')
+        self.assertEqual(marker['executed']['model'], 'gpt-terra')
+        self.assertIs(response.output[0].content[0], original_part)
+        self.assertEqual((original_part.type, original_part.refusal), ('refusal', refusal))
+
     # Audit H01: remove when F07 lands
     @unittest.expectedFailure
     def test_h01_installed_host_runner_supports_retry_callback(self):

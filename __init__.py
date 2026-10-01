@@ -4973,6 +4973,75 @@ class _AnnotatedResponseOverlay:
 _PROVENANCE_TOOL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call"})
 _PROVENANCE_COMMENTARY_PHASES = frozenset({"commentary", "analysis"})
 _PROVENANCE_FINAL_PHASES = frozenset({"final_answer", "final"})
+# Mirrors the host normalizer (agent/codex_responses_adapter.py): these statuses
+# make it continue the turn, except on server-side tool items, which xAI leaves
+# ``in_progress`` inside completed responses.
+_PROVENANCE_INCOMPLETE_STATUSES = frozenset({"queued", "in_progress", "incomplete"})
+_PROVENANCE_SERVER_TOOL_ITEM_TYPES = frozenset({
+    "web_search_call", "file_search_call", "code_interpreter_call",
+    "image_generation_call", "computer_call", "local_shell_call", "mcp_call",
+})
+
+
+def _provenance_field(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _provenance_item_text(item: Any) -> str:
+    """Assistant text of one Responses message item, as the host reads it.
+
+    A ``refusal`` part carries its text in ``refusal``; the host treats it as
+    final assistant text, so it counts as final text here too.
+    """
+    if _provenance_field(item, "type") != "message":
+        return ""
+    content = _provenance_field(item, "content")
+    chunks = []
+    for part in (content if isinstance(content, list) else ()):
+        kind = _provenance_field(part, "type")
+        text = (_provenance_field(part, "refusal") if kind == "refusal"
+                else _provenance_field(part, "text") if kind in ("output_text", "text") else None)
+        if isinstance(text, str):
+            chunks.append(text)
+    return "".join(chunks)
+
+
+def _provenance_shape(result: Any) -> Optional[Dict[str, Any]]:
+    """What the host normalizer will make of a Responses result, or None."""
+    output = _provenance_field(result, "output")
+    if not isinstance(output, list):
+        return None
+    aggregate = _provenance_field(result, "output_text")
+    if not isinstance(aggregate, str):
+        aggregate = "\n".join(text for text in map(_provenance_item_text, output) if text)
+    phases = [str(_provenance_field(item, "phase") or "").casefold() for item in output
+              if _provenance_field(item, "type") == "message"]
+    commentary = any(phase in _PROVENANCE_COMMENTARY_PHASES for phase in phases)
+    final_phase = any(phase in _PROVENANCE_FINAL_PHASES for phase in phases)
+    has_tool_call = any(_provenance_field(item, "type") in _PROVENANCE_TOOL_ITEM_TYPES for item in output)
+    has_item_text = any(_provenance_item_text(item).strip()
+                        and str(_provenance_field(item, "phase") or "").casefold()
+                        not in _PROVENANCE_COMMENTARY_PHASES
+                        for item in output)
+    # The host falls back to the aggregate when no item carries final text
+    # (stream-delivered answers), unless the text is commentary-only.
+    aggregate_only = (not has_item_text and bool(aggregate.strip())
+                      and (final_phase or not commentary))
+    incomplete = (
+        str(_provenance_field(result, "status") or "").casefold() in _PROVENANCE_INCOMPLETE_STATUSES
+        or any(str(_provenance_field(item, "status") or "").casefold() in _PROVENANCE_INCOMPLETE_STATUSES
+               and _provenance_field(item, "type") not in _PROVENANCE_SERVER_TOOL_ITEM_TYPES
+               for item in output)
+        or (commentary and not final_phase)
+    )
+    return {
+        "output": output, "aggregate": aggregate, "phases": phases,
+        "has_tool_call": has_tool_call, "has_final_text": has_item_text or aggregate_only,
+        "aggregate_only": aggregate_only,
+        # A reply the host ends the turn with: final text, no tool call, nothing
+        # that makes the normalizer report ``incomplete``.
+        "terminal": (has_item_text or aggregate_only) and not has_tool_call and not incomplete,
+    }
 
 
 def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
@@ -4998,41 +5067,20 @@ def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
     encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     annotation = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
 
-    def field(obj: Any, name: str) -> Any:
-        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
-
-    output = field(result, "output")
-    if not isinstance(output, list):
+    shape = _provenance_shape(result)
+    if shape is None:
         # A scalar/non-Responses legacy value has no host-supported content
         # carrier. Preserve its byte-for-byte contract rather than replacing it.
         return result
-
-    def item_text(item: Any) -> str:
-        if field(item, "type") != "message":
-            return ""
-        content = field(item, "content")
-        return "".join(text for part in (content if isinstance(content, list) else ())
-                       if field(part, "type") in ("output_text", "text")
-                       and isinstance(text := field(part, "text"), str))
-
-    aggregate = field(result, "output_text")
-    if not isinstance(aggregate, str):
-        aggregate = "\n".join(text for text in map(item_text, output) if text)
-    phases = [str(field(item, "phase") or "").casefold() for item in output
-              if field(item, "type") == "message"]
-    has_tool_call = any(field(item, "type") in _PROVENANCE_TOOL_ITEM_TYPES for item in output)
-    has_final_text = any(item_text(item).strip()
-                         and str(field(item, "phase") or "").casefold() not in _PROVENANCE_COMMENTARY_PHASES
-                         for item in output)
-    # Stream-delivered answers can arrive as ``output_text`` with no items; the
-    # host synthesises a message from it, so carry that text as an item too.
-    leading = []
-    if not output and aggregate.strip():
-        leading, has_final_text = [("text", aggregate.strip())], True
-    if not (has_final_text or has_tool_call):
+    output, aggregate, phases = shape["output"], shape["aggregate"], shape["phases"]
+    if not (shape["has_final_text"] or shape["has_tool_call"]):
         return result
-    if any(_SUBSTITUTION_PROVENANCE_PREFIX in item_text(item) for item in output):
+    if any(_SUBSTITUTION_PROVENANCE_PREFIX in _provenance_item_text(item) for item in output):
         return result  # already carries one; never add a second marker
+    # Stream-delivered answers can arrive as ``output_text`` with no item final
+    # text; the host reads that aggregate, so carry it as an item too (once an
+    # item carries text the host stops reading the aggregate).
+    leading = [("text", aggregate.strip())] if shape["aggregate_only"] else []
     # Mirror the response's own phase convention: final_answer only when the
     # response already declares a final phase. Adding one to a phase-less or
     # commentary-only response would change the host's finish reason.
@@ -5144,6 +5192,88 @@ def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]
         except Exception:
             pass
     return annotated
+
+
+# Replacement provenance retained across the API calls of one child turn (N1).
+# A failed review's ordinary replacement can end its first call on reasoning,
+# commentary or a tool call; the host then continues the same turn, and only the
+# eventual final reply reaches the parent. The entry is keyed on the turn id
+# the host passes to every middleware call of that turn (and to post_llm_call),
+# kept while the host may still continue the turn, removed when the turn ends
+# (post_llm_call), and bounded by a TTL and a size cap so an abandoned turn
+# cannot leak.
+_PENDING_REPLACEMENTS: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
+_PENDING_REPLACEMENT_LOCK = threading.Lock()
+_PENDING_REPLACEMENT_MAX = 256
+_PENDING_REPLACEMENT_TTL_SECONDS = 6 * 3600.0
+_pending_replacement_clock = time.monotonic
+
+
+def _pending_replacement_key(context: Dict[str, Any]) -> Optional[str]:
+    # The host mints one turn id per turn (``<session>:<task>:<uuid>``, kept for
+    # every call of the turn) and passes it to the middleware and to
+    # post_llm_call. The session id is not part of the key: compression can
+    # rotate it in the middle of a turn, which would orphan the entry.
+    turn_id = str(context.get("turn_id") or "")
+    return turn_id or None  # without a turn identity the state could not be scoped
+
+
+def _pending_replacement_prune(now: float) -> None:
+    """Drop expired entries, then the oldest beyond the cap. Caller holds the lock."""
+    for key in [key for key, (stamp, _) in _PENDING_REPLACEMENTS.items()
+                if now - stamp > _PENDING_REPLACEMENT_TTL_SECONDS]:
+        del _PENDING_REPLACEMENTS[key]
+    while len(_PENDING_REPLACEMENTS) > max(0, int(_PENDING_REPLACEMENT_MAX)):
+        _PENDING_REPLACEMENTS.popitem(last=False)
+
+
+def _pending_replacement_get(key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if key is None:
+        return None
+    with _PENDING_REPLACEMENT_LOCK:
+        _pending_replacement_prune(_pending_replacement_clock())
+        entry = _PENDING_REPLACEMENTS.get(key)
+        return entry[1] if entry else None
+
+
+def _pending_replacement_put(key: Optional[str], replacement: Dict[str, Any]) -> None:
+    if key is None:
+        return
+    with _PENDING_REPLACEMENT_LOCK:
+        now = _pending_replacement_clock()
+        _PENDING_REPLACEMENTS.pop(key, None)
+        _PENDING_REPLACEMENTS[key] = (now, replacement)
+        _pending_replacement_prune(now)
+
+
+def _pending_replacement_discard(key: Optional[str]) -> None:
+    if key is None:
+        return
+    with _PENDING_REPLACEMENT_LOCK:
+        _PENDING_REPLACEMENTS.pop(key, None)
+
+
+def _deliver_replacement_result(result: Any, replacement: Dict[str, Any],
+                                key: Optional[str], *, first_call: bool) -> Any:
+    """Annotate a replacement reply and keep its provenance for the rest of the turn.
+
+    The reply that failed over keeps the round-1 behaviour (a final or tool-call
+    reply carries the marker). A later reply of the same turn is annotated only
+    when it would end the turn, so interim reasoning, commentary and tool calls
+    stay exactly as the provider sent them; a reasoning- or commentary-only
+    reply is never turned into a marker-only answer. The entry is kept even
+    after a terminal reply, because the host can still continue the turn (ack,
+    stall or degenerate-final nudges) and only its last reply reaches the
+    parent; it is removed when the turn ends (``on_post_llm_call``) or by the
+    TTL/size bounds.
+    """
+    shape = _provenance_shape(result)
+    if shape is None:
+        return _record_ordinary_replacement_result(result, replacement) if first_call else result
+    _pending_replacement_put(key, replacement)
+    if first_call or shape["terminal"]:
+        return _record_ordinary_replacement_result(result, replacement)
+    return result
 
 
 def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> Optional[Any]:
@@ -5466,7 +5596,7 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
         # none of that, and skipping it here is why a Qwen weekly-quota 429 left
         # no cooldown -- the conductor was still being told that account was idle.
         try:
-            return next_call(request)
+            response = next_call(request)
         except Exception as error:
             if _is_quota_exhaustion(error) or _is_transient_provider_failure(error):
                 failing_model = str(request.get("model", ""))
@@ -5481,6 +5611,14 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
                     error=error,
                 )
             raise
+        # A turn whose review failed on the configured provider can end on the
+        # host's own fallback provider (e.g. after a reasoning-only stall); its
+        # final reply still carries the retained provenance.
+        pending_key = _pending_replacement_key(kwargs)
+        pending = _pending_replacement_get(pending_key)
+        if pending:
+            return _deliver_replacement_result(response, pending, pending_key, first_call=False)
+        return response
 
     def stopped_exact_response(error: BaseException) -> Optional[Any]:
         """Translate mandatory-exact bridge failures at the host callback boundary."""
@@ -5497,6 +5635,8 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
 
     opus_context = {key: value for key, value in kwargs.items() if key not in {"request", "next_call", "retry_call"}}
     replacement_provenance = None
+    pending_key = _pending_replacement_key(kwargs)
+    first_replacement_call = False
     try:
         opus_response = _maybe_run_opus5(request, cfg, **opus_context)
     except Exception as error:
@@ -5510,6 +5650,7 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
         review_failure = getattr(error, "_bridge_review_failure", None)
         if review_failure:
             replacement_provenance = review_failure["replacement"]
+            first_replacement_call = True
             request = deepcopy(request)
             _append_user_instruction(
                 request,
@@ -5521,15 +5662,23 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             )
     if opus_response is not None:
         return opus_response
+    if replacement_provenance is None:
+        # A later call of a turn whose review failed earlier: the provenance
+        # retained for this turn goes onto its final reply.
+        replacement_provenance = _pending_replacement_get(pending_key)
+
+    def delivered(response: Any) -> Any:
+        if not replacement_provenance:
+            return response
+        return _deliver_replacement_result(response, replacement_provenance, pending_key,
+                                           first_call=first_replacement_call)
 
     stopped = stop_if_closed()
     if stopped is not None:
         return stopped
 
     try:
-        ordinary_response = next_call(request)
-        return (_record_ordinary_replacement_result(ordinary_response, replacement_provenance)
-                if replacement_provenance else ordinary_response)
+        return delivered(next_call(request))
     except Exception as error:
         active_model = str(request.get("model", ""))
         quota_exhausted = _is_quota_exhaustion(error)
@@ -5595,12 +5744,13 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             cfg,
         )
         retry_response = retry_call(fallback_request)
-        return (_record_ordinary_replacement_result(retry_response, replacement_provenance)
-                if replacement_provenance else retry_response)
+        return delivered(retry_response)
 
 
 def on_post_llm_call(**kwargs: Any) -> None:
     """Persist supervisor checkpoints and the legacy disabled benchmark lifecycle."""
+    # The turn has ended: provenance retained for it can no longer reach a reply.
+    _pending_replacement_discard(_pending_replacement_key(kwargs))
     cfg = _load_config()
     turn_id = str(kwargs.get("turn_id") or "")
     orchestrated = _orchestration_forced_event(cfg, turn_id)

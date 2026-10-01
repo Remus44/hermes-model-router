@@ -331,7 +331,12 @@ an attempted CLI failure. For a successful CLI step-down or a response-shaped
 ordinary replacement, the router appends one bounded, deterministic,
 plugin-owned `ROUTER SUBSTITUTION PROVENANCE v1` JSON line after the useful
 verdict. That content survives the supported Codex Responses normalization and
-child-result projection to the parent; arbitrary response attributes do not. It
+child-result projection to the parent; arbitrary response attributes do not.
+When the replacement's first reply is only reasoning, commentary or a tool call
+and the child continues its turn, the router keeps the provenance for that turn
+(bounded, cleared at turn end) and appends the line to the reply that ends it;
+later interim replies are left unchanged. A refusal-only reply keeps its refusal text,
+with the line after it. It
 carries the requested/resolved/observed review identity and evidence sources,
 effort requested/applied state, policy/reason, planned replacement and final
 ordinary provider/model observation. Missing provider or model evidence remains
