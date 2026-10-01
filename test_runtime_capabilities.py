@@ -57,6 +57,40 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                         cap = runtime.snapshot({'tools': [tool]}, self.cfg).adapter('hermes_claude').capability('submission')
                     self.assertEqual(cap.status, 'supported', cap.reason)
 
+    def test_claude_submission_rejects_malformed_or_missing_schema_across_names_and_shapes(self):
+        for name in ('delegate_claude', 'mcp__delegate_claude'):
+            for shape in ('flat', 'openai', 'anthropic'):
+                malformed = self._shapes(name)[shape]
+                missing = self._shapes(name)[shape]
+                if shape == 'openai':
+                    malformed['function']['parameters'] = 'malformed'
+                    missing['function'].pop('parameters')
+                elif shape == 'anthropic':
+                    malformed['input_schema'] = 'malformed'
+                    missing.pop('input_schema')
+                else:
+                    malformed['parameters'] = 'malformed'
+                    missing.pop('parameters')
+                for label, tool in (('malformed', malformed), ('missing', missing)):
+                    with self.subTest(name=name, shape=shape, label=label), host_delegation(depth=2), \
+                         patch.object(claude_delegation, 'is_active', return_value=True):
+                        runtime.clear_cache()
+                        snap = self.snapshot({'tools': [tool]})
+                        cap = snap.adapter('hermes_claude').capability('submission')
+                        choice = runtime.resolve_topology(snap, 'nested_conductor', transport='hermes_claude')
+                        self.assertEqual(cap.status, 'unknown')
+                        self.assertEqual(cap.reason, 'delegate_claude schema is missing or malformed')
+                        self.assertEqual((choice.status, choice.selected), ('unsupported', 'parent_direct'))
+
+    def test_claude_submission_deferred_tool_is_unknown_and_refuses_nested_topology(self):
+        with host_delegation(depth=2), patch.object(claude_delegation, 'is_active', return_value=True):
+            snap = self.snapshot({'tools': [{'name': 'terminal'}], 'deferred_tools': ['mcp__delegate_claude']})
+            cap = snap.adapter('hermes_claude').capability('submission')
+            choice = runtime.resolve_topology(snap, 'nested_conductor', transport='hermes_claude')
+        self.assertEqual(cap.status, 'unknown')
+        self.assertEqual(cap.reason, 'request does not carry delegate_claude (absent or deferred)')
+        self.assertEqual((choice.status, choice.selected), ('unsupported', 'parent_direct'))
+
     def test_a09_arbitrary_prefix_and_unrelated_tools_do_not_count(self):
         for name in ('other__delegate_task', 'mcp__x__delegate_task', 'MCP__delegate_task',
                      'mcp__delegate_task_extra', 'delegate_claude', 'mcp__delegate_claude'):
@@ -132,7 +166,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
         with host_delegation(depth=2), patch.object(claude_delegation, "is_active", return_value=True):
             for tools, expected in ((DIRECT_CLAUDE_TOOLS, "supported"), (DEFERRED_CLAUDE_TOOLS, "unknown")):
                 request = delegate_task_request()
-                request["tools"].extend({"name": n, "parameters": {}} for n in tools if n != "delegate_task")
+                request["tools"].extend(self._shapes(n)['flat'] for n in tools if n != "delegate_task")
                 snap = self.snapshot(request)
                 self.assertEqual(snap.adapter("hermes_claude").capability("submission").status, expected)
                 if expected == "unknown":
@@ -228,7 +262,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
     def test_claude_cancellation_and_async_are_unknown_without_a_claude_seam(self):
         with patch.object(claude_delegation, "is_active", return_value=True):
             request = delegate_task_request()
-            request["tools"].append({"name": "delegate_claude", "parameters": {}})
+            request["tools"].append(self._shapes("delegate_claude")['flat'])
             adapter = self.snapshot(request).adapter("hermes_claude")
             self.assertEqual(adapter.capability("submission").status, "supported")
             for name in ("cancellation", "async_delivery"):
@@ -285,7 +319,7 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             codex_parent = {c + "/" + t: s for c, t, s in
                             ((r["case"], r["transport"], r["status"]) for r in self._matrix(delegate_task_request("model-param")))}
             claude_request = delegate_task_request("model-param", wire="anthropic")
-            claude_request["tools"].append({"name": "delegate_claude", "parameters": {}})
+            claude_request["tools"].append(self._shapes("delegate_claude")['flat'])
             claude_parent = {c + "/" + t: s for c, t, s in
                              ((r["case"], r["transport"], r["status"]) for r in self._matrix(claude_request))}
         # parent that can reach delegate_claude vs one that cannot

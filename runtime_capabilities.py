@@ -133,7 +133,7 @@ def _fact(getter_module: Any, getter: str, coerce) -> Fact:
         return Fact(UNKNOWN, None, f"{getter} failed: {type(exc).__name__}")
 
 
-def _delegate_tool(request: Any) -> Optional[Dict[str, Any]]:
+def _named_tool(request: Any, names: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
     if not isinstance(request, dict):
         return None
     for tool in request.get("tools") or []:
@@ -141,9 +141,17 @@ def _delegate_tool(request: Any) -> Optional[Dict[str, Any]]:
             continue
         fn = tool.get("function")
         name = tool.get("name") or (fn.get("name") if isinstance(fn, dict) else None)
-        if isinstance(name, str) and name in _DELEGATE_NAMES:
+        if isinstance(name, str) and name in names:
             return tool
     return None
+
+
+def _delegate_tool(request: Any) -> Optional[Dict[str, Any]]:
+    return _named_tool(request, _DELEGATE_NAMES)
+
+
+def _claude_tool(request: Any) -> Optional[Dict[str, Any]]:
+    return _named_tool(request, _CLAUDE_NAMES)
 
 
 def _tool_names(request: Any) -> Tuple[str, ...]:
@@ -189,6 +197,8 @@ def _gather(request: Any, cfg: Any) -> Dict[str, Any]:
                   for name in _HOST_SEAMS)
     tool = _delegate_tool(request)
     props = _schema_properties(tool)
+    claude_tool = _claude_tool(request)
+    claude_props = _schema_properties(claude_tool)
     try:
         bridge_ok, bridge_reason = claude_delegation.reasoning_bridge_status()
     except Exception as exc:
@@ -202,6 +212,8 @@ def _gather(request: Any, cfg: Any) -> Dict[str, Any]:
         "host": host, "host_cfg": host_cfg, "seams": seams,
         "tool_present": tool is not None,
         "properties": None if props is None else tuple(sorted(props)),
+        "claude_tool_present": claude_tool is not None,
+        "claude_properties": None if claude_props is None else tuple(sorted(claude_props)),
         "tool_names": names,
         "bridge": (bool(bridge_ok), str(bridge_reason)),
         "claude_active": claude_active,
@@ -294,10 +306,12 @@ def _build_adapters(g: Dict[str, Any]) -> Tuple[AdapterCapabilities, ...]:
         claude_submission = (UNSUPPORTED, submission[1])
     elif not g["claude_active"]:
         claude_submission = (UNSUPPORTED, "Claude delegation is not active")
-    elif claude_name in g["tool_names"] or any(n in g["tool_names"] for n in _CLAUDE_NAMES):
-        claude_submission = (SUPPORTED, f"{claude_name} is visible in the request")
+    elif not g["claude_tool_present"]:
+        claude_submission = (UNKNOWN, "request does not carry delegate_claude (absent or deferred)")
+    elif g["claude_properties"] is None:
+        claude_submission = (UNKNOWN, "delegate_claude schema is missing or malformed")
     else:
-        claude_submission = (UNKNOWN, f"{claude_name} not visible in this request (deferred or absent)")
+        claude_submission = (SUPPORTED, f"{claude_name} schema present and host seams callable")
 
     if claude_submission[0] == UNSUPPORTED:
         claude_fallback = (UNSUPPORTED, claude_submission[1])
@@ -331,7 +345,8 @@ def _fingerprint(g: Dict[str, Any], depth: Fact, conc: Fact, orch: Fact) -> str:
     return _digest({
         "v": SCHEMA_VERSION, "depth": [depth.status, depth.value], "conc": [conc.status, conc.value],
         "orch": [orch.status, orch.value], "seams": g["seams"], "tool": g["tool_present"],
-        "props": g["properties"], "names": g["tool_names"], "bridge": g["bridge"],
+        "props": g["properties"], "claude_tool": g["claude_tool_present"],
+        "claude_props": g["claude_properties"], "names": g["tool_names"], "bridge": g["bridge"],
         "claude": g["claude_active"], "interrupt": g["interrupt"], "async": g["async_getter"], "stop_hook": g["stop_hook"],
         "config": g["config"], "host": g["host"] is not None,
     })
