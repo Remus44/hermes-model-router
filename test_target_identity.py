@@ -168,13 +168,72 @@ class ResolutionTests(Base):
                            requested_model="claude-sonnet-5")
         self.assertEqual(res.status, "resolved")
 
-    # Audit A06: remove when F02 lands
-    @unittest.expectedFailure
     def test_a06_hermes_claude_resolution_keeps_pinned_anthropic_provider(self):
         resolution = identity.resolve_target('sonnet5', transport='hermes_claude', selection_mode='exact',
             cfg={'tier_providers': {'sonnet5': 'openai-codex'}}, host_cfg={})
         self.assertEqual(resolution.identity.provider, 'anthropic',
             f'resolved status={resolution.status} falsely labels Claude transport')
+
+    def test_a06_conflicting_tier_provider_is_kept_as_drift_evidence(self):
+        for transport in ("hermes_claude", "claude_cli"):
+            with self.subTest(transport=transport):
+                self.cfg["tier_providers"]["sonnet5"] = "openai-codex"
+                res = self.resolve("sonnet5", transport)
+                self.assertEqual(res.identity.provider, "anthropic")
+                self.assertEqual(res.identity.account, "unknown")
+                self.assertEqual(len(res.provider_drift), 1)
+                drift = res.provider_drift[0]
+                self.assertEqual(drift["kind"], "provider_drift")
+                self.assertEqual(drift["configured"], {"owner": "router_config",
+                                                       "key": "tier_providers.sonnet5",
+                                                       "value": "openai-codex"})
+                self.assertEqual(drift["actual"]["value"], "anthropic")
+                self.assertIn(transport, drift["actual"]["owner"])
+                json.dumps(res.as_dict())
+                self.assertEqual(res.as_dict()["provider_drift"], list(res.provider_drift))
+
+    def test_a06_agreeing_tier_provider_records_no_drift(self):
+        for transport in ("hermes_claude", "claude_cli", "hermes_codex"):
+            with self.subTest(transport=transport):
+                alias = "terra" if transport == "hermes_codex" else "sonnet5"
+                self.assertEqual(self.resolve(alias, transport).provider_drift, ())
+
+    def test_a06_codex_uses_host_route_not_router_preference(self):
+        self.cfg["tier_providers"]["terra"] = "anthropic"
+        res = self.resolve("terra", "hermes_codex")
+        self.assertEqual(res.status, "resolved")
+        self.assertEqual(res.identity.provider, "openai-codex")
+        self.assertEqual(res.provider_drift[0]["configured"]["value"], "anthropic")
+        self.assertEqual(res.provider_drift[0]["actual"]["value"], "openai-codex")
+        self.assertEqual(res.provider_drift[0]["actual"]["owner"], "host_config")
+
+    def test_a06_codex_without_host_provider_is_unknown_not_router_preference(self):
+        self.host["delegation"]["targets"]["terra"].pop("provider")
+        res = self.resolve("terra", "hermes_codex")
+        self.assertEqual(res.identity.provider, "unknown")
+        self.assertEqual(res.provider_drift, ())
+
+    def test_a06_exact_incompatible_provider_constraint_is_refused(self):
+        res = self.resolve("sonnet5", "hermes_claude", selection_mode="exact",
+                           requested_provider="openai-codex")
+        self.assertEqual(res.status, "unsupported")
+        self.assertEqual(res.failure_class, "capability")
+        self.assertEqual(res.identity.provider, "anthropic")
+        self.assertTrue(any("openai-codex" in r and "anthropic" in r for r in res.reasons))
+        cli = self.resolve("sonnet5", "claude_cli", selection_mode="exact",
+                           requested_provider="openai-codex")
+        self.assertEqual(cli.status, "unsupported")
+        self.assertEqual(cli.identity.provider, "anthropic")
+        codex = self.resolve("terra", "hermes_codex", selection_mode="exact",
+                             requested_provider="anthropic")
+        self.assertEqual(codex.status, "unsupported")
+        self.assertEqual(codex.identity.provider, "openai-codex")
+
+    def test_a06_exact_compatible_provider_constraint_resolves(self):
+        res = self.resolve("sonnet5", "hermes_claude", selection_mode="exact",
+                           requested_provider="Anthropic")
+        self.assertEqual(res.status, "resolved")
+        self.assertEqual(res.identity.provider, "anthropic")
 
     def test_hermes_claude_uses_tier_model_and_agrees_with_config(self):
         res = self.resolve("sonnet5", "hermes_claude", selection_mode="exact")

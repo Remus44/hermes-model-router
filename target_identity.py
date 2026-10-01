@@ -53,12 +53,14 @@ class ResolutionResult:
     reasons: Tuple[str, ...] = ()
     mismatch: Optional[ExactRouteMismatch] = None
     substitution: Optional[Dict[str, Any]] = None
+    provider_drift: Tuple[Dict[str, Any], ...] = ()
 
     def as_dict(self) -> Dict[str, Any]:
         return {"status": self.status, "failure_class": self.failure_class,
                 "reasons": list(self.reasons), "identity": self.identity.as_dict(),
                 "mismatch": self.mismatch.as_dict() if self.mismatch else None,
-                "substitution": dict(self.substitution) if self.substitution else None}
+                "substitution": dict(self.substitution) if self.substitution else None,
+                "provider_drift": [dict(d) for d in self.provider_drift]}
 
 
 # ------------------------------------------------------------------- helpers
@@ -100,15 +102,32 @@ def _host_target(host_cfg: Mapping[str, Any], name: str) -> Optional[Tuple[str, 
     return None
 
 
-def _provider(alias: str, cfg: Mapping[str, Any], host_provider: str, transport: str) -> str:
-    mapped = str(((cfg or {}).get("tier_providers") or {}).get(_router_target(alias)) or "").strip()
-    if mapped:
-        return mapped
-    if host_provider:
-        return host_provider
-    if transport in ("hermes_claude", "claude_cli"):
-        return "anthropic"
-    return str((cfg or {}).get("provider") or UNKNOWN)
+_TRANSPORT_PINNED_PROVIDER = {"hermes_claude": "anthropic", "claude_cli": "anthropic"}
+
+
+def _provider(alias: str, cfg: Mapping[str, Any], host_provider: str, transport: str
+              ) -> Tuple[str, Tuple[Dict[str, Any], ...]]:
+    """(provider, drift evidence) taken from the actual transport owner.
+
+    Native Claude and the Claude CLI are pinned to Anthropic. Hermes/Codex uses the
+    host route's provider (``unknown`` when the host names none). The router's
+    ``tier_providers`` value is a preference: a conflicting one is returned as
+    configuration-drift evidence and never relabels execution.
+    """
+    pinned = _TRANSPORT_PINNED_PROVIDER.get(transport)
+    if pinned:
+        provider, owner = pinned, f"transport:{transport}"
+    else:
+        provider, owner = (host_provider or UNKNOWN), ("host_config" if host_provider else "unresolved")
+    key = _router_target(alias)
+    configured = str(((cfg or {}).get("tier_providers") or {}).get(key) or "").strip()
+    drift: Tuple[Dict[str, Any], ...] = ()
+    if configured and provider != UNKNOWN and configured.casefold() != provider.casefold():
+        drift = ({"kind": "provider_drift", "alias": alias, "transport": transport,
+                  "configured": {"owner": "router_config", "key": f"tier_providers.{key}",
+                                 "value": configured},
+                  "actual": {"owner": owner, "value": provider}},)
+    return provider, drift
 
 
 def _cli_exact_capability(snapshot: Optional[runtime_capabilities.RuntimeSnapshot],
@@ -129,12 +148,18 @@ def _substitution(requested: ModelFact, resolved: ModelFact, policy: str, reason
 
 # ----------------------------------------------------------------- resolution
 def _compute(alias: str, transport: str, mode: str, requested_model: str, effort: str,
-             account: str, cfg: Mapping[str, Any], host_cfg: Mapping[str, Any],
-             cli_exact: Tuple[str, str]) -> ResolutionResult:
+             account: str, requested_provider: str, cfg: Mapping[str, Any],
+             host_cfg: Mapping[str, Any], cli_exact: Tuple[str, str]) -> ResolutionResult:
     tier = _tier_of(alias)
     target = _router_target(alias)
     reasons: List[str] = []
+    drift: List[Dict[str, Any]] = []
     host_hit = _host_target(host_cfg, target)
+
+    def provider_of(host_provider: str) -> str:
+        provider, found = _provider(alias, cfg, host_provider, transport)
+        drift[:] = found
+        return provider
     effort_fact = (EffortFact(effort, UNKNOWN, "not_observed") if effort
                    else EffortFact(NOT_APPLICABLE, NOT_APPLICABLE))
     cli_map = _cli_alias_map()
@@ -159,10 +184,11 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
                               effort=effort_fact)
 
     def refuse(resolved: ModelFact, provider: str, why: str) -> ResolutionResult:
-        return ResolutionResult(build(resolved, provider), UNSUPPORTED, FAILURE_CAPABILITY, tuple(reasons + [why]))
+        return ResolutionResult(build(resolved, provider), UNSUPPORTED, FAILURE_CAPABILITY,
+                                tuple(reasons + [why]), provider_drift=tuple(drift))
 
     if transport == "claude_cli":
-        provider = _provider(alias, cfg, "anthropic", transport)
+        provider = provider_of("anthropic")
         if not tier or tier not in cli_map:
             return refuse(ModelFact(), provider, f"claude_cli has no alias for {alias!r}")
         if mode == SELECTION_EXACT:
@@ -182,7 +208,7 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
             resolved = ModelFact(tier, "cli_alias_argument", canonical=False)
             reasons.append(f"CLI alias {tier!r} to canonical model is not verified until observed")
     elif transport == "hermes_claude":
-        provider = _provider(alias, cfg, "anthropic", transport)
+        provider = provider_of("anthropic")
         if not tier:
             return refuse(ModelFact(), provider, f"hermes_claude has no Claude tier for {alias!r}")
         model, source = _tier_model(tier, cfg)
@@ -191,12 +217,16 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
             return refuse(resolved, provider, f"no model configured for Claude tier {tier!r}")
     else:  # hermes_codex: delegate_task(model=alias) resolves through the host's named target
         if not requested.known and not host_hit:
-            return refuse(ModelFact(), _provider(alias, cfg, "", transport), f"unknown alias {alias!r}")
-        provider = _provider(alias, cfg, host_hit[1] if host_hit else "", transport)
+            return refuse(ModelFact(), provider_of(""), f"unknown alias {alias!r}")
+        provider = provider_of(host_hit[1] if host_hit else "")
         if not host_hit:
             return refuse(ModelFact(), provider, f"host has no delegation target {target!r}")
         resolved = ModelFact(host_hit[0], host_hit[2])
 
+    if mode == SELECTION_EXACT and requested_provider and requested_provider.casefold() != provider.casefold():
+        return refuse(resolved, provider,
+                      f"exact request names provider {requested_provider!r} but {transport} "
+                      f"executes on {provider!r}")
     identity = build(resolved, provider)
     if mode == SELECTION_EXACT and not requested.known:
         return refuse(resolved, provider, "exact selection has no known requested model identity")
@@ -205,18 +235,20 @@ def _compute(alias: str, transport: str, mode: str, requested_model: str, effort
         return ResolutionResult(identity, EXACT_MISMATCH, FAILURE_EXACT_ROUTE_MISMATCH,
                                 tuple(reasons + [f"exact request {mismatch.requested!r} resolves to "
                                                  f"{mismatch.actual!r} via {mismatch.actual_source}"]),
-                                mismatch=mismatch)
+                                mismatch=mismatch, provider_drift=tuple(drift))
     substitution = None
     if (mode == SELECTION_PREFERRED and requested.known and resolved.canonical
             and resolved.value != requested.value):
         substitution = _substitution(requested, resolved, SELECTION_PREFERRED,
                                      "resolved model differs from the requested model")
-    return ResolutionResult(identity, RESOLVED, "", tuple(reasons), substitution=substitution)
+    return ResolutionResult(identity, RESOLVED, "", tuple(reasons), substitution=substitution,
+                            provider_drift=tuple(drift))
 
 
 def resolve_target(alias: str, *, transport: str, selection_mode: str = SELECTION_PREFERRED,
                    requested_model: Optional[str] = None, effort: Optional[str] = None,
-                   account: str = UNKNOWN, cfg: Optional[Mapping[str, Any]] = None,
+                   account: str = UNKNOWN, requested_provider: Optional[str] = None,
+                   cfg: Optional[Mapping[str, Any]] = None,
                    host_cfg: Optional[Mapping[str, Any]] = None,
                    snapshot: Optional[runtime_capabilities.RuntimeSnapshot] = None) -> ResolutionResult:
     """Resolve an operator alias on one transport into a typed identity record.
@@ -238,7 +270,8 @@ def resolve_target(alias: str, *, transport: str, selection_mode: str = SELECTIO
     cli_exact = (_cli_exact_capability(snapshot, cfg)
                  if transport == "claude_cli" and selection_mode == SELECTION_EXACT else ("n/a", ""))
     args = (alias, transport, selection_mode, str(requested_model or "").strip(),
-            str(effort or "").strip(), str(account or UNKNOWN))
+            str(effort or "").strip(), str(account or UNKNOWN),
+            str(requested_provider or "").strip())
     key = _fingerprint({
         "args": args, "cli_exact": cli_exact, "cli_map": _cli_alias_map(),
         "router": {k: (cfg or {}).get(k) for k in ("provider", "models", "tier_providers")},
