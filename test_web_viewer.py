@@ -320,6 +320,35 @@ class ModelRouterDashboardTests(DashboardProbeMixin, unittest.TestCase):
         self.assertEqual(observed["routes"].count("terra · medium"), 32)
         self.assertEqual(observed["routes"].count("spark · medium"), 96)
 
+    def test_pricing_copy_lifecycle_replays_count_once(self):
+        """Eight completion calls for one delegation must not inflate the total."""
+        source = self.execution_source()
+        group = [{"tier": "terra", "api_call_count": 1}, {"tier": "terra", "api_call_count": 2}]
+        system = [{
+            "event_kind": "async_delegation_completion",
+            "delegation_id": "deleg_pricing",
+            "turn_id": "parent:completion",
+            "tier": "terra",
+            "prompt_preview": "Delegált feladat befejezési eseménye",
+            "api_call_count": index,
+        } for index in range(1, 9)]
+        parent = {"session_id": "parent", "children": [
+            {"id": "conductor", "routed_calls": [{"tier": "terra"}] * 40, "children": []},
+            {"id": "recon", "routed_calls": [{"tier": "sonnet5"}] * 10, "children": []},
+            {"id": "worker", "routed_calls": [{"tier": "grok"}] * 40, "children": []},
+        ]}
+        probe = (
+            self.i18n_runtime() + source
+            + "\nconst scope=executionScope(" + json.dumps(group) + ","
+            + json.dumps(system) + "," + json.dumps(parent) + ");"
+            + "const lifecycle=scope.nodes.filter(node=>node.kind==='LIFECYCLE').flatMap(executionCalls);"
+            + "console.log(JSON.stringify({lifecycle:lifecycle.length,total:scope.calls.length}));"
+        )
+        result = subprocess.run(["node", "-e", probe], check=True, text=True, capture_output=True)
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["lifecycle"], 1)
+        self.assertEqual(observed["total"], 93)
+
     def test_scope_model_filter_reaches_nested_workers_and_prunes_other_calls(self):
         source = self.execution_source()
         group = [{"tier": "terra", "effort": "medium"}] * 4

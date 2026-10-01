@@ -153,6 +153,17 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "rescue_min_calls": 6,
         "path": "~/.hermes/logs/terra-spark-orchestration.jsonl",
     },
+    # A short, clear request must not pay for a planner plus a recursive tree of
+    # workers.  This guard applies only to bounded low-risk dispatches; complex
+    # and consequential work keeps the normal host limits and explicit workflow.
+    "task_budget": {
+        "enabled": True,
+        "low_risk_max_chars": 1200,
+        "max_routing_decisions": 1,
+        "max_depth": 1,
+        "require_evidence_for_second_worker": True,
+        "path": "~/.hermes/logs/model-router-task-budget.jsonl",
+    },
     # A tier that just rejected a call for quota is not a candidate for the next
     # one. Held on disk because the interactive TUI and the gateway are separate
     # processes: an in-memory note would not be seen by the other one.
@@ -3352,6 +3363,17 @@ def _orchestration_event(cfg: Dict[str, Any], event: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _SHADOW_LOCK:
+            # Hooks may be replayed by the gateway/desktop lifecycle.  A child
+            # session identifies one real lifecycle transition, so emitting it
+            # twice turns accounting noise into an apparent extra worker.
+            # A replay has the same lifecycle *phase*.  Different phases for the
+            # same turn (for example initial preflight and later rescue) are real
+            # transitions and must remain observable.
+            identity_keys = ("event", "phase", "plan_id", "turn_id", "child_session_id")
+            identity = tuple(event.get(key) for key in identity_keys)
+            if path.exists() and any(identity == tuple(record.get(key) for key in identity_keys)
+                                     for record in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())):
+                return
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
     except Exception:
@@ -5527,6 +5549,79 @@ def _hermes_worker_fallback_configured() -> bool:
 _CONDUCTOR_CONTRACT = re.compile(r"^You are the \S+ planning conductor\.")
 
 
+def _task_budget_path(cfg: Dict[str, Any]) -> Optional[Path]:
+    configured = str((cfg.get("task_budget") or {}).get("path") or "").strip()
+    return hermes_path(configured) if configured else None
+
+
+def _bounded_low_risk_dispatch(args: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    """Whether this dispatch is small enough for the one-worker safety budget."""
+    policy = cfg.get("task_budget") or {}
+    if not policy.get("enabled"):
+        return False
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else [args]
+    if len(tasks) != 1 or not isinstance(tasks[0], dict):
+        return False
+    goal = str(tasks[0].get("goal") or args.get("goal") or "").strip()
+    if not goal or len(goal) > max(1, int(policy.get("low_risk_max_chars", 1200) or 1200)):
+        return False
+    affirmative = _without_negated_safety_constraints(goal)
+    # "production" alone is not a risk signal: the pricing-copy incident was a
+    # small copy fix on a production page, and exempting the word let it fan out
+    # into a conductor plus two workers.  Consequential *actions* stay exempt.
+    return not (
+        _is_design_request(goal)
+        or _is_consequential_spark_request(goal)
+        or re.search(r"\b(deploy|migration|security|credential|password|payment|database|ssh|sudo)\b", _normalise(affirmative))
+    )
+
+
+def _bounded_dispatch_block(args: Dict[str, Any], cfg: Dict[str, Any], turn_id: str) -> str:
+    """Persist and enforce a one-worker, one-depth budget for a small clear task."""
+    if not _bounded_low_risk_dispatch(args, cfg):
+        return ""
+    policy = cfg.get("task_budget") or {}
+    max_depth = max(1, int(policy.get("max_depth", 1) or 1))
+    # The budget belongs to the user's root turn, not to each child turn: a
+    # child worker's own spawns must draw on the same allowance.
+    root_turn = str(turn_id).split(":sa-", 1)[0]
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else [args]
+    evidence = str((tasks[0] if tasks and isinstance(tasks[0], dict) else {}).get("escalation_evidence") or args.get("escalation_evidence") or "").strip()
+    # Hermes encodes each child boundary as :sa-N:.  A low-risk leaf may not
+    # create another child: that is the recursive escalation the budget exists to stop.
+    if str(turn_id).count(":sa-") >= max_depth:
+        return "Low-risk task depth budget reached; complete this bounded task directly instead of delegating again. Nothing was spawned."
+    path = _task_budget_path(cfg)
+    if path is None:
+        return ""
+    max_decisions = max(1, int(policy.get("max_routing_decisions", 1) or 1))
+    try:
+        with _SHADOW_LOCK:
+            records = []
+            if path.exists():
+                records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            prior = [record for record in records if record.get("turn_id") == root_turn]
+            allowed = max_decisions + (1 if evidence and policy.get("require_evidence_for_second_worker", True) else 0)
+            if len(prior) >= allowed:
+                return (
+                    "Low-risk task routing budget reached: a second worker or cross-provider handoff "
+                    "requires an `escalation_evidence` field naming a failed test or concrete blocker, "
+                    "and this bounded task permits at most one such escalation. Nothing was spawned."
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                    "event": "bounded_worker_admitted", "turn_id": root_turn,
+                    "escalated": bool(evidence),
+                    "max_routing_decisions": max_decisions, "max_depth": max_depth,
+                }) + "\n")
+    except Exception as exc:
+        # Observability persistence cannot turn a safe direct task into an outage.
+        _logger.warning("task budget state unavailable; leaving delegation unchanged: %s", exc)
+    return ""
+
+
 def _declined_conductor_goal(args: Dict[str, Any], cfg: Dict[str, Any], turn_id: str = "") -> str:
     """Refusal text when a forced conductor's composed goal is too small to plan.
 
@@ -5565,7 +5660,7 @@ def _declined_conductor_goal(args: Dict[str, Any], cfg: Dict[str, Any], turn_id:
 
 
 def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **_: Any) -> Optional[Dict[str, str]]:
-    """Refuse a ``delegate_task`` that names a target switched off or cooling down.
+    """Apply the worker budget and refuse unavailable delegation targets.
 
     ``delegate_task`` offers every entry of Hermes's ``delegation.targets``, so a
     conductor can name ``model: "qwen"`` while the dashboard has Qwen off. The
@@ -5580,16 +5675,26 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
     is empty -- with one, Hermes can still move the child to another account,
     which the router's own failover (one provider only) cannot.
     """
-    if tool_name != "delegate_task" or not isinstance(args, dict):
+    # ``delegate_claude`` is a worker spawn too.  Leaving it outside this hook
+    # would let a small task evade its one-worker budget by changing provider.
+    if tool_name not in {"delegate_task", claude_delegation.TOOL_NAME} or not isinstance(args, dict):
         return None
     try:
         cfg = _load_config()
+        bounded = _bounded_dispatch_block(args, cfg, str(_.get("turn_id") or ""))
+        if bounded:
+            return {"action": "block", "message": bounded}
         declined = _declined_conductor_goal(args, cfg, str(_.get("turn_id") or ""))
         if declined:
             return {"action": "block", "message": declined}
         switched_on = cfg.get("callable") or {}
         rescued = None
         blocked = []
+        # Claude's tool resolves its own tier; availability is enforced by its
+        # implementation.  The generic target check is only meaningful for
+        # delegate_task's model argument.
+        if tool_name == claude_delegation.TOOL_NAME:
+            return None
         for name in _requested_delegation_targets(args, cfg):
             if _is_callable_tier(name, cfg):
                 continue

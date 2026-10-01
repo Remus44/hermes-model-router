@@ -238,6 +238,32 @@ def _fill_prompt_previews(entries: List[Dict], state_db: Path = DEFAULT_STATE_DB
             entry["prompt_preview"] = timeline[1][index]
 
 
+def _collapse_completion_replays(entries: List[Dict]) -> List[Dict]:
+    """One async-delegation completion is one routing decision.
+
+    The gateway may replay a completion turn once per parent call, so the same
+    delegation_id appears many times.  Keep the last row (highest call count)
+    at the position of the first, so accounting counts the delivery once.
+    """
+    merged: Dict[tuple, int] = {}
+    result: List[Dict] = []
+    for entry in entries:
+        is_completion = entry.get("event_kind") == "async_delegation_completion" or bool(_completion_delegation_id(entry.get("prompt_preview")))
+        delegation_id = _entry_completion_delegation_id(entry) if is_completion else ""
+        if not delegation_id:
+            result.append(entry)
+            continue
+        key = (entry.get("turn_id"), delegation_id)
+        if key in merged:
+            position = merged[key]
+            if int(entry.get("api_call_count") or 0) >= int(result[position].get("api_call_count") or 0):
+                result[position] = {**entry, "timestamp": result[position]["timestamp"]}
+        else:
+            merged[key] = len(result)
+            result.append(entry)
+    return result
+
+
 def load_entries(path: Path) -> List[Dict]:
     entries: List[Dict] = []
     if not path.exists():
@@ -252,6 +278,7 @@ def load_entries(path: Path) -> List[Dict]:
             continue
         entry["timestamp"] = _second_timestamp(entry.get("timestamp", ""))
         entries.append(entry)
+    entries = _collapse_completion_replays(entries)
     _attach_lifecycle_provenance(entries)
     _fill_prompt_previews(entries)
     _annotate_internal_prompts(entries)

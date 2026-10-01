@@ -153,6 +153,36 @@ The router advertises a `model` parameter only when the host exposes it; otherwi
 Codex labels choose models within the configured provider and Claude workers use
 `delegate_claude`.
 
+#### Small-task budget
+
+A short, clear task must not pay for a planner plus a tree of workers. The
+`task_budget` guard applies to a single-task `delegate_task` or `delegate_claude`
+dispatch whose goal is at most `low_risk_max_chars` (default 1200) and is not a
+design request or a consequential action (deploy, migration, security, credential,
+password, payment, database, ssh, sudo). The word "production" alone is not a
+risk signal. Such a task gets:
+
+- one worker per **root user turn** (`max_routing_decisions`, default 1). The
+  allowance belongs to the root turn, so a child's own spawns draw on the same
+  budget rather than a fresh one;
+- no recursive delegation (`max_depth`, default 1);
+- one further worker only when the call carries `escalation_evidence` naming a
+  failed test or a concrete blocker, and never more than that one escalation.
+
+```yaml
+task_budget:
+  enabled: true
+  low_risk_max_chars: 1200
+  max_routing_decisions: 1
+  max_depth: 1
+  require_evidence_for_second_worker: true
+```
+
+Blocked dispatches return `Nothing was spawned.` Complex and consequential work keeps
+the normal host limits. The lifecycle log deduplicates replays by event, phase, plan,
+turn and child session, and the dashboard counts an async-delegation completion once
+per `delegation_id` instead of once per replayed row.
+
 ### Claude targets
 
 Claude is reached like any other delegation target — `model: "opus5"` or
@@ -1627,6 +1657,15 @@ to import at all. Keep new tests in a `TestCase`; a bare `def test_*` is silentl
 skipped here.
 
 ## Version
+
+**1.24.0** — Small-task budget and exact lifecycle accounting, after a pricing-copy
+fix fanned out into a conductor plus two workers (about 100 routing decisions).
+`task_budget` is now keyed on the root user turn, no longer exempts a goal for
+mentioning "production", accepts one further worker only with `escalation_evidence`,
+and covers `delegate_claude` as well as `delegate_task`. `low_risk_max_chars` is 1200.
+The orchestration log keeps distinct phases of a turn, and `view_log` and the
+dashboard collapse replayed async-delegation completions to one routing decision.
+The gateway must be restarted to load the new `__init__.py`.
 
 **1.23.0** — The Sol tier runs GPT-6.1 Sol (`gpt-6.1-sol`) instead of GPT-6 Sol.
 The live Codex model list for the account offers it (first by priority). Only the
