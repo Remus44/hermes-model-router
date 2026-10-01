@@ -820,11 +820,11 @@ class AccountOfExecutionTests(unittest.TestCase):
         })
         provenance = self._parent_visible_provenance(result)
         self.assertEqual(provenance['kind'], 'claude_cli_step_down')
-        self.assertEqual(provenance['identity']['requested']['value'], 'claude-opus-5-5')
-        self.assertEqual(provenance['identity']['resolved']['value'], 'sonnet')
-        self.assertEqual(provenance['identity']['observed']['source'], 'claude_cli.result.modelUsage')
-        self.assertEqual(provenance['identity']['effort']['applied'], 'unknown')
-        self.assertEqual(provenance['substitution']['policy'], 'profile_preferred')
+        self.assertEqual(provenance['carrier'], 'middleware')
+        self.assertEqual(provenance['requested'], 'claude-opus-5-5')
+        self.assertEqual(provenance['resolved'], 'sonnet')
+        self.assertEqual(provenance['actual'], {'model': 'unknown', 'provider': 'unknown'})
+        self.assertTrue(provenance['ref'])
         self.assertFalse(provenance['satisfies_cross_provider_review'])
 
     # Audit A02: remove when F04 lands
@@ -848,10 +848,10 @@ class AccountOfExecutionTests(unittest.TestCase):
         })
         provenance = self._parent_visible_provenance(result)
         self.assertEqual(provenance['kind'], 'ordinary_replacement')
-        self.assertEqual(provenance['failure_kind'], 'model-mismatch')
-        self.assertEqual(provenance['executed']['model'], 'gpt-spark')
-        self.assertEqual(provenance['executed']['provider'], 'openai-codex')
-        self.assertEqual(provenance['identity']['observed']['value'], 'unknown')
+        self.assertEqual(provenance['reason'], 'model-mismatch')
+        self.assertEqual(provenance['actual']['model'], 'gpt-spark')
+        self.assertEqual(provenance['actual']['provider'], 'openai-codex')
+        self.assertEqual(provenance['requested'], 'claude-opus-5-5')
         self.assertFalse(provenance['satisfies_cross_provider_review'])
 
     def test_replacement_provenance_survives_an_immutable_response(self):
@@ -879,8 +879,8 @@ class AccountOfExecutionTests(unittest.TestCase):
                         'source': 'ordinary_provider.request_configuration'},
         })
         provenance = self._parent_visible_provenance(result)
-        self.assertEqual(provenance['executed']['model'], 'unknown')
-        self.assertEqual(provenance['executed']['provider'], 'unknown')
+        self.assertEqual(provenance['actual']['model'], 'unknown')
+        self.assertEqual(provenance['actual']['provider'], 'unknown')
 
     # --- F04 fix round 1 (review I1-I4): real host normalizer, child projection,
     # installed openai SDK types and the real resolver -> admission -> bridge chain.
@@ -975,7 +975,7 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(normalized.finish_reason, 'tool_calls')
         self.assertEqual(len(normalized.tool_calls), 1)
         self.assertIn('VERDICTACCEPTANCE EVIDENCE', summary)
-        self.assertEqual(self._marker_line(summary)['executed']['model'], 'gpt-terra')
+        self.assertEqual(self._marker_line(summary)['actual']['model'], 'gpt-terra')
         self.assertEqual(len(response.output), 2, 'the original output list was mutated')
 
     def test_f04_i1_failed_aggregate_write_leaves_no_partial_annotation(self):
@@ -1071,13 +1071,9 @@ class AccountOfExecutionTests(unittest.TestCase):
 
         self.assertEqual(command[command.index('--model') + 1], 'sonnet')
         self.assertEqual(provenance['kind'], 'claude_cli_step_down')
-        self.assertEqual(provenance['identity']['requested']['value'], 'claude-opus-5-5')
-        self.assertEqual(provenance['identity']['resolved'],
-                         {'value': 'sonnet', 'source': 'cli_alias_argument', 'canonical': False})
-        self.assertEqual(provenance['identity']['observed']['value'], 'claude-sonnet-5-5')
-        self.assertEqual(provenance['identity']['provider'], 'anthropic')
-        self.assertEqual(provenance['identity']['effort']['applied'], 'unknown')
-        self.assertNotEqual(provenance['identity']['effort']['requested'], 'unknown')
+        self.assertEqual(provenance['requested'], 'claude-opus-5-5')
+        self.assertEqual(provenance['resolved'], 'sonnet')
+        self.assertEqual(provenance['actual'], {'model': 'unknown', 'provider': 'unknown'})
 
     def _middleware_step_down_failure(self, run_effect):
         """Real resolver -> real admission branch (Sonnet step-down) -> real public
@@ -1125,12 +1121,10 @@ class AccountOfExecutionTests(unittest.TestCase):
                 self.assertEqual(command[command.index('--model') + 1], 'sonnet')
                 provenance = self._marker_line(self._normalized_and_summary(result)[1])
                 self.assertEqual(provenance['kind'], 'ordinary_replacement')
-                self.assertEqual(provenance['failure_kind'], name, audit.call_args_list)
-                self.assertEqual(provenance['identity']['requested']['value'], 'claude-opus-5-5')
-                self.assertEqual(provenance['identity']['resolved']['value'], 'sonnet')
-                self.assertEqual(provenance['identity']['resolved']['source'], 'cli_alias_argument')
-                self.assertEqual(provenance['identity']['effort']['applied'], 'unknown')
-                self.assertEqual(provenance['executed']['model'], 'gpt-terra')
+                self.assertEqual(provenance['reason'], name, audit.call_args_list)
+                self.assertEqual(provenance['requested'], 'claude-opus-5-5')
+                self.assertEqual(provenance['resolved'], 'sonnet')
+                self.assertEqual(provenance['actual']['model'], 'gpt-terra')
                 audited = audit.call_args.args[1]['substitution']['identity']
                 self.assertEqual(audited['resolved']['value'], 'sonnet')
                 self.assertEqual(audited['effort']['applied'], 'unknown')
@@ -1216,9 +1210,9 @@ class AccountOfExecutionTests(unittest.TestCase):
                 self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
                 marker = self._marker_line(entry['summary'])
                 self.assertEqual(marker['kind'], 'ordinary_replacement')
-                self.assertEqual(marker['failure_kind'], 'timeout')
-                self.assertEqual(marker['requested_review'], {'tier': 'opus', 'transport': 'claude_cli'})
-                self.assertEqual(marker['executed']['model'], 'gpt-terra')
+                self.assertEqual(marker['reason'], 'timeout')
+                self.assertEqual(marker['requested'], 'claude-opus-5-5')
+                self.assertEqual(marker['actual']['model'], 'gpt-terra')
                 self.assertFalse(marker['satisfies_cross_provider_review'])
 
     def test_f04_n1_tool_call_continuation_keeps_provenance_in_final_answer(self):
@@ -1303,8 +1297,8 @@ class AccountOfExecutionTests(unittest.TestCase):
                 platform='subagent', session_id='child-n1', turn_id=turn)
         _, entry = self._projected(result)
         marker = self._marker_line(entry['summary'])
-        self.assertEqual(marker['executed']['model'], 'fallback-model')
-        self.assertEqual(marker['executed']['provider'], 'other-provider')
+        self.assertEqual(marker['actual']['model'], 'fallback-model')
+        self.assertEqual(marker['actual']['provider'], 'other-provider')
         self.assertEqual(len(router._PENDING_REPLACEMENTS), 1)  # kept until the turn ends
 
     def test_f04_n2_refusal_only_replacement_keeps_refusal_and_one_marker(self):
@@ -1318,7 +1312,7 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertTrue(entry['summary'].startswith(refusal), 'refusal text was not kept first')
         marker = self._marker_line(entry['summary'])
         self.assertEqual(marker['kind'], 'ordinary_replacement')
-        self.assertEqual(marker['executed']['model'], 'gpt-terra')
+        self.assertEqual(marker['actual']['model'], 'gpt-terra')
         self.assertIs(response.output[0].content[0], original_part)
         self.assertEqual((original_part.type, original_part.refusal), ('refusal', refusal))
 
@@ -1405,9 +1399,10 @@ class AccountOfExecutionTests(unittest.TestCase):
                 self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
                 marker = self._marker_line(entry['summary'])
                 self.assertEqual(marker['kind'], 'ordinary_replacement')
-                self.assertEqual(marker['failure_kind'], 'timeout')
-                self.assertEqual(marker['requested_review'], {'tier': 'opus', 'transport': 'claude_cli'})
-                self.assertEqual(marker['executed']['status'], 'unknown')
+                self.assertEqual(marker['carrier'], 'final_output')
+                self.assertEqual(marker['reason'], 'timeout')
+                self.assertEqual(marker['requested'], 'claude-opus-5-5')
+                self.assertEqual(marker['actual'], {'model': 'unknown', 'provider': 'unknown'})
                 self.assertFalse(marker['satisfies_cross_provider_review'])
                 # post_llm_call runs after the transform and clears the turn's entry.
                 self.assertIsNone(router._pending_replacement_get(turn))
@@ -1471,8 +1466,8 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual((entry['status'], entry['exit_reason']), ('completed', 'completed'))
         self.assertTrue(entry['summary'].startswith('PASS: parser inspected'))
         marker = self._marker_line(entry['summary'])
-        self.assertEqual(marker['executed']['model'], 'gpt-terra')
-        self.assertEqual(marker['failure_kind'], 'timeout')
+        self.assertEqual(marker['actual']['model'], 'gpt-terra')
+        self.assertEqual(marker['reason'], 'timeout')
 
     def test_f04_n4_unmarked_final_text_of_a_substituted_turn_gets_one_marker_at_delivery(self):
         """Backstop: a final reply the middleware did not mark (any shape the
@@ -1495,6 +1490,113 @@ class AccountOfExecutionTests(unittest.TestCase):
                                                                 logger=self.HOOK_LOG)
         self.assertIs(unchanged, text)
         self.assertFalse(transformed)
+
+    # --- F04 fix round 4 (re-review N5): the child summary returned to the
+    # parent is budgeted after child projection. At the host's 2,000-character
+    # floor, both a middleware carrier and the final-output backstop carrier
+    # must leave exactly one complete compact marker in the returned tail,
+    # whether or not the full summary spill succeeds.
+    def _parent_at_summary_floor(self):
+        return SimpleNamespace(
+            context_compressor=SimpleNamespace(context_length=200000, max_tokens=4000),
+            _last_prompt_size_tokens=199000,
+        )
+
+    def _finalize_parent_summary(self, entry, *, spill_fails):
+        from tools import delegate_tool_results as results
+
+        patches = [
+            patch('tools.delegate_tool._load_config', return_value={'max_summary_chars': 24000}),
+            patch.object(results, '_notify_memory_manager'),
+            patch.object(results, '_fire_subagent_stop_hooks', return_value=0),
+        ]
+        if spill_fails:
+            patches.append(patch.object(results, '_spill_summary_to_file', return_value=None))
+        with patches[0], patches[1], patches[2]:
+            if spill_fails:
+                with patches[3]:
+                    results._finalize_child_results([entry], [{'goal': 'review parser'}], [],
+                                                     self._parent_at_summary_floor())
+            else:
+                results._finalize_child_results([entry], [{'goal': 'review parser'}], [],
+                                                 self._parent_at_summary_floor())
+        return entry
+
+    def test_f04_n5_compact_marker_is_hard_bounded_at_worst_case_field_lengths(self):
+        huge = 'x' * 4096
+        marker = router._substitution_provenance(
+            huge,
+            identity={
+                'requested': {'value': huge, 'source': huge},
+                'resolved': {'value': huge, 'source': huge},
+            },
+            substitution={huge: huge},
+            replacement={
+                'policy': huge, 'reason': huge, 'failure_kind': huge,
+                'requested_review': {'tier': huge, 'transport': huge},
+                'planned': {'tier': huge, 'model': huge, 'provider': huge},
+            },
+            executed={'model': huge, 'provider': huge},
+        )
+        line = router._provenance_annotation(marker)
+        bound = getattr(router, '_PARENT_VISIBLE_PROVENANCE_MAX_CHARS', 400)
+        value_bound = getattr(router, '_PARENT_PROVENANCE_VALUE_MAX_CHARS', 32)
+        self.assertEqual(bound, 400)
+        self.assertLessEqual(len(line), bound)
+        parsed = json.loads(line[len(self.PREFIX):])
+        self.assertEqual(parsed['v'], 1)
+        self.assertEqual(parsed['requested'], 'x' * value_bound)
+        self.assertEqual(parsed['resolved'], 'x' * value_bound)
+        self.assertEqual(parsed['actual']['model'], 'x' * value_bound)
+        self.assertFalse(parsed['satisfies_cross_provider_review'])
+
+    def test_f04_n5_middleware_marker_survives_parent_budget_with_or_without_spill(self):
+        for spill_fails in (False, True):
+            with self.subTest(spill_fails=spill_fails):
+                turn = f'child-n5:middleware:{spill_fails}'
+                response = self._n1_response('final', 'PASS: parser inspected\n' + ('Evidence line.\n' * 400))
+                normalized = self._codex_normalized(self._n1_call(response, 1, turn))
+                entry = self._child_entry(normalized.content, completed=True)
+                self._finalize_parent_summary(entry, spill_fails=spill_fails)
+
+                self.assertEqual((entry['status'], entry['exit_reason']), ('completed', 'completed'))
+                self.assertTrue(entry['summary_truncated'])
+                marker = self._marker_line(entry['summary'])
+                self.assertEqual(marker['carrier'], 'middleware')
+                self.assertEqual(marker['kind'], 'ordinary_replacement')
+                self.assertFalse(marker['satisfies_cross_provider_review'])
+                if spill_fails:
+                    self.assertNotIn('summary_full_path', entry)
+                else:
+                    self.assertIn('summary_full_path', entry)
+
+    def test_f04_n5_final_output_marker_survives_parent_budget_with_or_without_spill(self):
+        from agent.turn_finalizer import apply_llm_output_transform
+
+        self._host_hook_manager()
+        for spill_fails in (False, True):
+            with self.subTest(spill_fails=spill_fails):
+                turn = f'child-n5:final-output:{spill_fails}'
+                self._n1_call(self._n1_response('reasoning', 'still inspecting'), 1, turn)
+                final, changed, _ = apply_llm_output_transform(
+                    SimpleNamespace(session_id='child-n5', model='gpt-terra', platform='subagent'),
+                    'PASS: parser inspected\n' + ('Evidence line.\n' * 400),
+                    turn_id=turn, logger=self.HOOK_LOG,
+                )
+                self.assertTrue(changed)
+                entry = self._child_entry(final, completed=True)
+                self._finalize_parent_summary(entry, spill_fails=spill_fails)
+
+                self.assertEqual((entry['status'], entry['exit_reason']), ('completed', 'completed'))
+                self.assertTrue(entry['summary_truncated'])
+                marker = self._marker_line(entry['summary'])
+                self.assertEqual(marker['carrier'], 'final_output')
+                self.assertEqual(marker['actual'], {'model': 'unknown', 'provider': 'unknown'})
+                self.assertFalse(marker['satisfies_cross_provider_review'])
+                if spill_fails:
+                    self.assertNotIn('summary_full_path', entry)
+                else:
+                    self.assertIn('summary_full_path', entry)
 
     # Audit H01: remove when F07 lands
     @unittest.expectedFailure
@@ -1634,8 +1736,8 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(result.replacement_provenance['executed']['provider'], 'openai-codex')
         self.assertIn('actual replacement executed on gpt-spark', result.route_reason)
         provenance = self._parent_visible_provenance(result)
-        self.assertEqual(provenance['executed']['model'], 'gpt-spark')
-        self.assertEqual(provenance['executed']['provider'], 'openai-codex')
+        self.assertEqual(provenance['actual']['model'], 'gpt-spark')
+        self.assertEqual(provenance['actual']['provider'], 'openai-codex')
         retry.assert_called_once()
 
     def test_failed_review_bridge_keeps_one_route_call_and_records_visible_failure_audit(self):

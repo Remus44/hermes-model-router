@@ -4878,6 +4878,12 @@ def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False
 
 
 _SUBSTITUTION_PROVENANCE_PREFIX = "[ROUTER SUBSTITUTION PROVENANCE v1] "
+# The host's lowest dynamic summary budget retains only a 500-character tail.
+# Keep one complete parent-visible marker below this hard cap so it survives that
+# tail after `_trim_summary_with_footer` even when no spill file can be written.
+_PARENT_VISIBLE_PROVENANCE_MAX_CHARS = 400
+_PARENT_PROVENANCE_VALUE_MAX_CHARS = 24
+_PARENT_PROVENANCE_REFERENCE_CHARS = 16
 
 
 def _provenance_text(value: Any, fallback: str = "unknown") -> str:
@@ -4923,9 +4929,11 @@ def _provenance_mapping(value: Any) -> Dict[str, str]:
 
 
 def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
-                             replacement: Any = None, executed: Any = None) -> Dict[str, Any]:
+                             replacement: Any = None, executed: Any = None,
+                             carrier: str = "middleware") -> Dict[str, Any]:
     marker = {
         "kind": kind,
+        "carrier": carrier,
         "identity": _provenance_identity(identity),
         "substitution": _provenance_mapping(substitution),
         # A replacement or a same-provider step-down is not an independent,
@@ -4939,15 +4947,60 @@ def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
             "failure_kind": _provenance_text(replacement.get("failure_kind")),
             "requested_review": _provenance_mapping(replacement.get("requested_review")),
             "planned": _provenance_mapping(replacement.get("planned")),
+            "reference": _provenance_text(replacement.get("provenance_ref"), ""),
         })
     if isinstance(executed, dict):
         marker["executed"] = _provenance_mapping(executed)
     return marker
 
 
-def _provenance_annotation(marker: Dict[str, Any]) -> str:
+def _parent_provenance_value(value: Any, fallback: str = "unknown") -> str:
+    return _provenance_text(value, fallback)[:_PARENT_PROVENANCE_VALUE_MAX_CHARS]
+
+
+def _parent_provenance_reference(marker: Dict[str, Any]) -> str:
+    supplied = marker.get("reference")
+    if isinstance(supplied, str) and supplied:
+        return supplied[:_PARENT_PROVENANCE_REFERENCE_CHARS]
     encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return _SUBSTITUTION_PROVENANCE_PREFIX + encoded
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:_PARENT_PROVENANCE_REFERENCE_CHARS]
+
+
+def _parent_visible_provenance(marker: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact marker retained in the host's 500-character summary tail.
+
+    Full replacement detail remains in the existing Claude audit event; this line
+    carries only the parent decision fields plus its short audit reference.
+    """
+    identity = marker.get("identity") if isinstance(marker.get("identity"), dict) else {}
+    requested = identity.get("requested") if isinstance(identity.get("requested"), dict) else {}
+    resolved = identity.get("resolved") if isinstance(identity.get("resolved"), dict) else {}
+    replacement = marker.get("requested_review") if isinstance(marker.get("requested_review"), dict) else {}
+    executed = marker.get("executed") if isinstance(marker.get("executed"), dict) else {}
+    return {
+        "v": 1,
+        "kind": _parent_provenance_value(marker.get("kind")),
+        "carrier": _parent_provenance_value(marker.get("carrier")),
+        "ref": _parent_provenance_reference(marker),
+        "requested": _parent_provenance_value(requested.get("value") or replacement.get("tier")),
+        "resolved": _parent_provenance_value(resolved.get("value")),
+        "actual": {
+            "provider": _parent_provenance_value(executed.get("provider")),
+            "model": _parent_provenance_value(executed.get("model")),
+        },
+        "policy": _parent_provenance_value(marker.get("policy")),
+        "reason": _parent_provenance_value(marker.get("failure_kind") or marker.get("reason")),
+        "satisfies_cross_provider_review": False,
+    }
+
+
+def _provenance_annotation(marker: Dict[str, Any]) -> str:
+    encoded = json.dumps(_parent_visible_provenance(marker), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=True)
+    line = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
+    if len(line) > _PARENT_VISIBLE_PROVENANCE_MAX_CHARS:
+        raise ValueError("compact provenance marker exceeded its parent-summary bound")
+    return line
 
 
 class _AnnotatedResponseOverlay:
@@ -5343,9 +5396,10 @@ def on_transform_llm_output(response_text: Any = None, turn_id: Any = None, **_:
         return None  # the middleware already marked the reply that ends the turn
     unobserved = {"model": "unknown", "model_source": "not_observed",
                   "provider": "unknown", "provider_source": "not_observed", "status": "unknown"}
-    marker = _substitution_provenance("ordinary_replacement", identity=replacement.get("identity"),
-                                      substitution={}, replacement=replacement, executed=unobserved)
-    marker["carrier"] = "final_output"
+    marker = _substitution_provenance(
+        "ordinary_replacement", identity=replacement.get("identity"), substitution={}, replacement=replacement,
+        executed=unobserved, carrier="final_output",
+    )
     return response_text.rstrip() + "\n\n" + _provenance_annotation(marker)
 
 
@@ -5390,6 +5444,14 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
             "source": "ordinary_provider.request_configuration",
         }
         identity_data = identity.as_dict() if hasattr(identity, "as_dict") else identity
+        reference_data = {
+            "policy": "legacy_ordinary_provider_route",
+            "requested_review": {"tier": requested_alias, "transport": "claude_cli"},
+            "failure_kind": failure_kind, "planned": planned, "identity": identity_data,
+        }
+        provenance_ref = hashlib.sha256(json.dumps(
+            reference_data, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str,
+        ).encode("utf-8")).hexdigest()[:_PARENT_PROVENANCE_REFERENCE_CHARS]
         return {
             "policy": "legacy_ordinary_provider_route",
             "requested_review": {"tier": requested_alias, "transport": "claude_cli"},
@@ -5397,6 +5459,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
             "planned": planned,
             "reason": "attempted Claude CLI review failed; an ordinary provider replacement is planned, not observed",
             "failure_kind": failure_kind,
+            "provenance_ref": provenance_ref,
             **({"identity": identity_data} if isinstance(identity_data, dict) else {}),
         }
 

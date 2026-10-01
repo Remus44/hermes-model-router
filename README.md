@@ -327,11 +327,20 @@ requested, resolved and observed: a CLI alias is not proof of the served model.
 An `exact` review requires recorded `exact_model` capability evidence and is
 refused before the CLI starts when that evidence is absent. The default
 `profile_preferred` review may use the configured ordinary provider route after
-an attempted CLI failure. For a successful CLI step-down or a response-shaped
-ordinary replacement, the router appends one bounded, deterministic,
-plugin-owned `ROUTER SUBSTITUTION PROVENANCE v1` JSON line after the useful
-verdict. That content survives the supported Codex Responses normalization and
-child-result projection to the parent; arbitrary response attributes do not.
+an attempted CLI failure. For a successful CLI step-down or a response-shaped ordinary replacement, the
+router appends one compact, deterministic, plugin-owned `ROUTER SUBSTITUTION
+PROVENANCE v1` JSON line after the useful verdict. The line is hard-bounded to
+400 characters (including its prefix), so the host's dynamic 2,000-character
+minimum summary budget retains the complete line in its 500-character tail,
+whether or not the full-summary spill succeeds. It carries the marker version,
+kind, carrier, requested and resolved/admitted targets, actual provider/model
+(or `unknown`), policy/failure code, `satisfies_cross_provider_review: false`,
+and a short `ref`; for an ordinary replacement, the existing Claude audit event
+contains the fuller replacement record under that reference. That content survives the supported
+Codex Responses normalization, child-result projection, and parent summary
+budgeting; arbitrary response attributes do not. If an operator configures
+`delegation.max_summary_chars` below 400, the static ceiling wins over the host
+floor and this parent-visible survival guarantee no longer applies.
 When the replacement's first reply is only reasoning, commentary or a tool call
 and the child continues its turn, the router keeps the provenance for that turn
 (bounded, cleared at turn end) and appends the line to the reply that ends it;
