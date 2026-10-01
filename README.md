@@ -1319,10 +1319,22 @@ scheduling and verification remain deferred.
 `execution_adapters.py` wraps the actual legacy transport boundaries. Registered
 `delegate_task` execution retains the existing account guard as its sole admission
 owner; `delegate_claude` retains its existing admission/step-down and scoped effort
-handler, then invokes an explicitly raw host callable. The public CLI bridge wrapper
-likewise invokes an explicitly raw bridge function and passes the authoritative
-identity unchanged, including the exact canonical model argument. No boundary calls
-its own public entrypoint recursively or performs a second account admission.
+handler, then invokes an explicitly raw host callable. Every Claude CLI entrypoint
+(the standalone `claude_opus_bridge.py` script, direct Python calls to
+`claude_opus_bridge.dispatch` and the middleware bridge) crosses one normalised CLI
+boundary exactly once, owned by the public `dispatch`: it validates input, then
+records one receipt around a private raw subprocess operation that never calls a
+public entrypoint back. Invalid input and an exact refusal raise before the boundary
+(nothing launched, no receipt); an attempted run leaves one receipt, one lifecycle
+`started`/`terminal` pair and, only on a validated success, one routed-call record.
+A caller that passes no identity gets legacy facts: requested model from the
+explicit tier, resolved value from the actual `--model` alias argument, observed
+model only from the validated CLI result; account stays `unknown` and nothing else
+is invented. A caller's own identity is passed unchanged, including the exact
+canonical model argument; an exact identity is re-checked against the CLI
+`exact_model` capability before launch, so a direct call cannot bypass it. No
+boundary calls its own public entrypoint recursively or performs a second account
+admission.
 Legacy goals, context, supported tool payloads and host-owned budgets/permissions
 remain authoritative. They are **not** converted into fabricated `ExecutionRequest`
 permissions, criteria or deadlines.

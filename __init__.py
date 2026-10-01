@@ -4846,26 +4846,15 @@ def _verified_delegated_claude_review(text: str, cfg: Dict[str, Any], *, request
 def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False, cfg: Dict[str, Any],
                       model: Optional[str] = None, requested_alias: Optional[str] = None,
                       adjustment: str = "", identity: Any = None, **context: Any) -> Dict[str, Any]:
-    """Legacy CLI boundary; keep admission at the existing policy call site.
+    """Middleware CLI entry; keep admission at the existing policy call site.
 
-    No concurrency cap: the pre-S05 bridge had none. A typed ClaudeBridgeFailure
-    is a terminal outcome and is recorded as such, never held as unknown.
+    Maps router config onto the public ``claude_opus_bridge.dispatch``, which
+    owns the one normalised CLI boundary (shared with the standalone ``main()``
+    and direct Python callers) and calls only its private raw subprocess
+    operation. Not wrapped again here, so each run yields one receipt. No
+    concurrency cap: the pre-S05 bridge had none. A typed ClaudeBridgeFailure is
+    a terminal outcome and is recorded as such, never held as unknown.
     """
-    from .claude_opus_bridge import ClaudeBridgeFailure
-    from .execution_adapters import dispatch_legacy
-    return dispatch_legacy(
-        lambda: _run_opus5_bridge_raw(repo=repo, task=task, write=write, review=review, cfg=cfg,
-            model=model, requested_alias=requested_alias, adjustment=adjustment, identity=identity, **context),
-        transport="claude_cli", scope="claude_cli:local_credentials",
-        evidence={"claude_tier": model or "opus", "tier_adjusted": adjustment},
-        terminal_exceptions=(ClaudeBridgeFailure,),
-    )
-
-
-def _run_opus5_bridge_raw(*, repo: str, task: str, write: bool, review: bool = False, cfg: Dict[str, Any],
-                      model: Optional[str] = None, requested_alias: Optional[str] = None,
-                      adjustment: str = "", identity: Any = None, **context: Any) -> Dict[str, Any]:
-    """Lazy raw bridge import; never calls the public adapter boundary recursively."""
     from .claude_opus_bridge import dispatch
 
     coding_cfg = cfg.get("coding_agent") or {}

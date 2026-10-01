@@ -3,6 +3,7 @@ import inspect
 import json
 import threading
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,16 @@ def identity(transport, *, alias="terra", provider="openai-codex", model="gpt-5.
     return contracts.TargetIdentity(provider, provider, transport, alias, selection_mode,
         contracts.ModelFact(model, "operator_request"), contracts.ModelFact(model, "configured_target"),
         contracts.ModelFact(), contracts.EffortFact(effort, "unknown", "not_observed"))
+
+
+@contextmanager
+def raw_cli(side_effect):
+    """Mock only the CLI's PRIVATE raw subprocess operation (F03): the public
+    boundary in ``claude_opus_bridge.dispatch`` stays real. Input validation is
+    stubbed so fixture paths/tasks need not exist; yields the raw mock."""
+    with patch.object(cli, "_prepare", return_value=SimpleNamespace(alias="opus", adjustment="")), \
+            patch.object(cli, "_run_cli", side_effect=side_effect) as raw:
+        yield raw
 
 
 def request(target, *, attempt="attempt-001"):
@@ -577,7 +588,9 @@ class LegacyBoundaryTests(unittest.TestCase):
         completed = SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"type": "result", "subtype": "success", "result": "reviewed", "modelUsage": {"claude-sonnet-5-5": {}}, "num_turns": 1}))
         with patch.object(cli.subprocess, "run", return_value=completed) as run, \
              patch.object(cli, "_load_config", return_value={}), \
-             patch.object(cli, "classify_review_dispatch", return_value=(True, "")):
+             patch.object(cli, "classify_review_dispatch", return_value=(True, "")), \
+             patch("model_router.target_identity._cli_exact_capability",
+                   return_value=("supported", "fixture capability evidence")):
             result = router._run_opus5_bridge(repo=str(Path(__file__).parent), task="[sonnet-review] inspect file", write=False,
                 review=True, model="sonnet", requested_alias="sonnet", identity=target, cfg={})
         command = run.call_args.args[0]
@@ -590,14 +603,14 @@ class LegacyBoundaryTests(unittest.TestCase):
         self.assertEqual(self.book.records()[0].observed_model, "claude-sonnet-5-5")
 
     def test_cli_failure_records_terminal_receipt_and_propagates_typed_exception(self):
-        with patch.object(cli, "dispatch", side_effect=cli.ClaudeBridgeFailure("model mismatch", "model-mismatch")):
+        with raw_cli(cli.ClaudeBridgeFailure("model mismatch", "model-mismatch")):
             with self.assertRaises(cli.ClaudeBridgeFailure):
                 router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
         self.assertEqual(len(self.book.records()), 1)
         self.assertEqual(self.book.records()[0].status, "failed")
 
     def test_untyped_cli_exception_stays_unknown(self):
-        with patch.object(cli, "dispatch", side_effect=OSError("CLI missing")):
+        with raw_cli(OSError("CLI missing")):
             with self.assertRaises(OSError):
                 router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
         self.assertEqual(self.book.records()[0].status, "unknown")
@@ -696,7 +709,7 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
             with self.subTest(kind=failure.failure_kind):
                 self.book = adapters.ReservationBook()
                 with patch.object(adapters, "RESERVATIONS", self.book), \
-                     patch.object(cli, "dispatch", side_effect=[failure, ok]) as dispatch:
+                     raw_cli([failure, ok]) as dispatch:
                     with self.assertRaises(cli.ClaudeBridgeFailure) as raised:
                         router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={})
                     self.assertIs(raised.exception, failure)
@@ -718,7 +731,7 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
                 results.append(router._run_opus5_bridge(repo="/work", task="review", write=False, cfg={}))
             except Exception as exc:  # pragma: no cover - failure path of the regression
                 errors.append(exc)
-        with patch.object(cli, "dispatch", side_effect=dispatch):
+        with raw_cli(dispatch):
             first = threading.Thread(target=call)
             first.start()
             self.assertTrue(entered.wait(5))
