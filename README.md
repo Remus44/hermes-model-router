@@ -1315,23 +1315,30 @@ proof. CLI observed model evidence comes only from its validated bridge result.
 Malformed/partial responses, background acceptance and ambiguous exceptions remain
 `unknown` in the receipt; a top-level `{"error": ...}` payload and a typed
 `ClaudeBridgeFailure` are recorded as `failed` (`timed_out` for a CLI timeout).
-None of them keeps capacity after the call returns: the host exposes no completion
-signal correlated to an accepted background handle, so the legacy boundary never
-refuses a dispatch the unchanged host would accept.
+None of them keeps the record in flight after the call returns: the host exposes no
+completion signal correlated to an accepted background handle, so the legacy
+boundary never refuses a dispatch the unchanged host would accept.
 
-One locked reservation owner is shared by the native transports per active parent,
-with batch child counts charged against the host capacity seam only while a call is
-in flight (a batch wider than the host limit reaches the host's own refusal).
-Missing capacity support refuses before launch. Full attempt keys prevent reuse
+The legacy boundary adds no capacity check of its own: for `delegate_task`,
+`delegate_claude` and the CLI bridge the unchanged host (its batch-width check and
+async-pool fallback) is the sole admission authority, so distinct concurrent calls on
+one parent are never refused by the plugin. One locked journal is shared by the
+native transports per active parent. Missing host delegation support refuses before
+launch. Full attempt keys prevent reuse
 across workflows; where the host supplies session/turn/tool-call IDs, the public
 boundary deduplicates that invocation and rejects changed payloads under the same
 IDs. A legacy call with no stable invocation IDs receives observation-only IDs: a
 later new call is not invented to be the same attempt. In-flight duplicates do not
-dispatch again, and retained terminal duplicates replay instead of re-running. CLI
-runs keep their pre-S05 concurrency (no plugin cap).
+dispatch again, and retained terminal duplicates replay instead of re-running. Each
+completion and public seal is bound to the exact claim that started it, so a late
+invocation can never overwrite, replay into or unprotect a newer claim under the same
+IDs; a public invocation's record is pinned against eviction until its final response
+is sealed or the invocation unwinds. CLI runs keep their pre-S05 concurrency (no
+plugin cap).
 
 S06 owns persistence, background completion correlation and unknown-work
-reconciliation. The receipt journal keeps in-flight records unconditionally and
+reconciliation. The receipt journal keeps in-flight and seal-pending public records
+unconditionally and
 finished records (terminal, unknown, observation-only) for one hour, bounded to 4096
 by least-recently-used eviction; a full journal evicts, it never refuses. While a
 sealed session/turn/tool-call record is retained, an identical repeat replays its

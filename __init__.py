@@ -4834,7 +4834,7 @@ def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False
     return dispatch_legacy(
         lambda: _run_opus5_bridge_raw(repo=repo, task=task, write=write, review=review, cfg=cfg,
             model=model, requested_alias=requested_alias, adjustment=adjustment, identity=identity, **context),
-        transport="claude_cli", scope="claude_cli:local_credentials", limit=None,
+        transport="claude_cli", scope="claude_cli:local_credentials",
         evidence={"claude_tier": model or "opus", "tier_adjusted": adjustment},
         terminal_exceptions=(ClaudeBridgeFailure,),
     )

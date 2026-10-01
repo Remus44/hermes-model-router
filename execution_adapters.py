@@ -21,9 +21,10 @@ from . import execution_contracts as contracts
 from . import worker_admission
 
 AttemptKey = Tuple[str, int, str, str]
-# Journal bound for records that no longer hold capacity (terminal, returned
-# unknown, observation-only). In-flight records are never evicted; real host
-# concurrency bounds them. Reaching the bound evicts, it never refuses.
+# Journal bound for finished records (terminal, returned unknown,
+# observation-only). In-flight records and public invocations awaiting their
+# seal are never evicted; real host concurrency bounds them. Reaching the bound
+# evicts, it never refuses.
 _MAX_RECORDS = 4096
 # Replay/deduplication window for a finished record, measured from its finish.
 _RECORD_TTL_SECONDS = 3600.0
@@ -61,18 +62,27 @@ class _Claim:
     sealed: bool = False
     in_flight: bool = True
     finished_at: float = 0.0
+    # A public invocation's record stays pinned until its final public response
+    # is sealed or the invocation unwinds, even after the raw call has returned.
+    protected: bool = False
+
+    @property
+    def evictable(self) -> bool:
+        return not self.in_flight and not self.protected
 
 
 class ReservationBook:
-    """One locked process-local owner for slot claims and attempt deduplication.
+    """One locked process-local owner for attempt deduplication (and structured claims).
 
-    Capacity is held only for the synchronous in-flight window of a raw dispatch:
-    the host exposes no completion signal correlated to an accepted background
-    handle, so holding it longer would refuse work the unchanged host accepts.
+    Legacy dispatches carry no capacity accounting: the unchanged host is their
+    sole admission authority. Only the structured ``claim()`` API counts weight
+    against a limit. Every completion/seal write names the exact ``_Claim`` it
+    belongs to and is dropped when the key now maps to another claim, so an old
+    invocation never overwrites, replays into or unprotects a newer one.
     Finished records (terminal, returned-unknown, observation-only) stay traceable
     and replayable until TTL or LRU eviction; a full journal evicts, never refuses.
-    In-flight records are never evicted. S06 owns persistence/reconciliation; this
-    class never automatically replays an attempt.
+    In-flight and seal-pending public records are never evicted. S06 owns
+    persistence/reconciliation; this class never automatically replays an attempt.
     """
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -81,16 +91,19 @@ class ReservationBook:
     def _purge_locked(self, room: int = 0) -> None:
         """Drop expired finished records, then LRU finished records to fit ``room``."""
         deadline = _now() - _RECORD_TTL_SECONDS
-        for key in [k for k, c in self._claims.items() if not c.in_flight and c.finished_at <= deadline]:
+        for key in [k for k, c in self._claims.items() if c.evictable and c.finished_at <= deadline]:
             del self._claims[key]
         excess = len(self._claims) + room - _MAX_RECORDS
         if excess > 0:
-            for key in [k for k, c in self._claims.items() if not c.in_flight][:excess]:
+            for key in [k for k, c in self._claims.items() if c.evictable][:excess]:
                 del self._claims[key]
 
     def _begin(self, scope: str, key: AttemptKey, limit: Optional[int], weight: int,
-               transport: str, fingerprint: str = "") -> Tuple[bool, Optional[_Claim]]:
-        """``limit=None`` records the attempt without capacity accounting."""
+               transport: str, fingerprint: str = "", *,
+               protect: bool = False) -> Tuple[bool, Optional[_Claim]]:
+        """``limit=None`` records the attempt without capacity accounting (every
+        legacy dispatch). ``protect`` pins a public invocation until it is sealed
+        or released."""
         with self._lock:
             if not isinstance(key, tuple) or len(key) != 4:
                 return False, None  # an attempt ID alone is not a full ownership key
@@ -116,7 +129,8 @@ class ReservationBook:
                     return False, None
             self._purge_locked(room=1)
             entry = _Claim(scope, weight if limit is not None else 0,
-                LegacyReceipt(key, transport, scope, "local-" + uuid.uuid4().hex), fingerprint=fingerprint)
+                LegacyReceipt(key, transport, scope, "local-" + uuid.uuid4().hex), fingerprint=fingerprint,
+                protected=protect)
             self._claims[key] = entry
             return True, entry
 
@@ -144,44 +158,63 @@ class ReservationBook:
                 return True, entry.response
             return True, json.dumps({"error": "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})
 
-    def _seal_tool_response(self, key: AttemptKey, raw: Any) -> None:
-        # Native raw completion precedes Claude's effort/step-down annotation.
-        # Seal only the complete public response so replay neither re-admits nor
-        # enters a fresh reasoning scope that could falsely report 'not applied'.
-        if self._finish(key, raw):
-            with self._lock:
-                entry = self._claims.get(key)
-                if entry is not None:
-                    entry.sealed = True
+    def _owned_locked(self, key: AttemptKey, claim: Optional[_Claim]) -> bool:
+        # Identity, not equality: a replacement claim under the same key is never ours.
+        return claim is not None and self._claims.get(key) is claim
 
-    def _finish(self, key: AttemptKey, raw: Any, *, exceptional: bool = False,
+    def _seal_tool_response(self, key: AttemptKey, claim: Optional[_Claim], raw: Any) -> bool:
+        """Seal ``claim``'s complete public response in one lock acquisition.
+
+        Native raw completion precedes Claude's effort/step-down annotation.
+        Seal only the complete public response so replay neither re-admits nor
+        enters a fresh reasoning scope that could falsely report 'not applied'.
+        Returns False, writing nothing, when ``key`` now maps to another claim."""
+        with self._lock:
+            if claim is None or not self._owned_locked(key, claim):
+                return False
+            self._finish_locked(key, claim, raw)
+            claim.sealed, claim.protected = True, False
+            return True
+
+    def _release(self, key: AttemptKey, claim: Optional[_Claim]) -> None:
+        """The public invocation unwound: its record becomes ordinarily evictable."""
+        with self._lock:
+            if claim is not None and self._owned_locked(key, claim):
+                claim.protected = False
+
+    def _finish(self, key: AttemptKey, claim: Optional[_Claim], raw: Any, *, exceptional: bool = False,
                 failure: Optional[BaseException] = None,
                 evidence: Optional[Mapping[str, Any]] = None) -> bool:
-        """Close the synchronous window: capacity is always released here.
+        """Close ``claim``'s raw synchronous window (weight and in-flight released).
 
-        Returns False when the record is absent (refused before raw dispatch, or
-        already evicted after finishing)."""
+        Returns False, writing nothing, when the key no longer maps to this exact
+        claim (evicted after finishing, or replaced by a newer claim)."""
         with self._lock:
-            entry = self._claims.get(key)
-            if entry is None:
+            if claim is None or not self._owned_locked(key, claim):
                 return False
-            entry.response, entry.cached = None, False
-            entry.receipt = _normalize(entry.receipt, raw, exceptional=exceptional,
-                                       failure=failure, evidence=evidence)
-            # No host completion signal correlates to an accepted background handle
-            # or an ambiguous exception, so neither may keep the slot beyond this call;
-            # the receipt keeps its status (unknown stays unknown) for traceability.
-            entry.weight, entry.in_flight, entry.finished_at = 0, False, _now()
-            self._claims.move_to_end(key)
-            # Cache only bounded legacy responses. Oversized duplicates refuse,
-            # never re-dispatch; the original caller still receives the full raw result.
-            try:
-                size = len(raw) if isinstance(raw, str) else len(json.dumps(raw))
-            except (TypeError, ValueError):
-                size = _MAX_CACHED_RESPONSE + 1
-            if not exceptional and size <= _MAX_CACHED_RESPONSE:
-                entry.response, entry.cached = raw, True
+            self._finish_locked(key, claim, raw, exceptional=exceptional, failure=failure, evidence=evidence)
             return True
+
+    def _finish_locked(self, key: AttemptKey, entry: _Claim, raw: Any, *, exceptional: bool = False,
+                       failure: Optional[BaseException] = None,
+                       evidence: Optional[Mapping[str, Any]] = None) -> None:
+        entry.response, entry.cached = None, False
+        entry.receipt = _normalize(entry.receipt, raw, exceptional=exceptional,
+                                   failure=failure, evidence=evidence)
+        # No host completion signal correlates to an accepted background handle
+        # or an ambiguous exception, so neither may stay in flight beyond this call;
+        # the receipt keeps its status (unknown stays unknown) for traceability.
+        # Replay protection of a public invocation (``protected``) is separate.
+        entry.weight, entry.in_flight, entry.finished_at = 0, False, _now()
+        self._claims.move_to_end(key)
+        # Cache only bounded legacy responses. Oversized duplicates refuse,
+        # never re-dispatch; the original caller still receives the full raw result.
+        try:
+            size = len(raw) if isinstance(raw, str) else len(json.dumps(raw))
+        except (TypeError, ValueError):
+            size = _MAX_CACHED_RESPONSE + 1
+        if not exceptional and size <= _MAX_CACHED_RESPONSE:
+            entry.response, entry.cached = raw, True
 
 
 RESERVATIONS = ReservationBook()
@@ -245,64 +278,65 @@ def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
 
 
 def dispatch_legacy(raw_dispatch: Callable[[], Any], *, transport: str, scope: str,
-                    limit: Optional[int], weight: int = 1, attempt_key: Optional[AttemptKey] = None,
+                    attempt_key: Optional[AttemptKey] = None,
                     reservations: Optional[ReservationBook] = None,
                     evidence: Optional[Mapping[str, Any]] = None, fingerprint: str = "",
-                    terminal_exceptions: Tuple[type, ...] = ()) -> Any:
+                    terminal_exceptions: Tuple[type, ...] = (),
+                    claim_cell: Optional[list] = None) -> Any:
     """Call an explicitly raw seam exactly once and return its public payload unchanged.
 
-    Admission remains with the named legacy owner upstream of this call. An
+    Admission remains with the named legacy owner upstream of this call; this
+    boundary adds no capacity check (the unchanged host is the sole admission
+    authority). It only deduplicates the same attempt and keeps a receipt. An
     observation-only invocation ID is created when the host has no attempt IDs;
     repeated *new* legacy tool calls are not invented to be the same attempt.
-    Capacity (``limit``; ``None`` = none, as the legacy CLI never had a cap) is
-    held only while ``raw_dispatch`` runs. ``terminal_exceptions`` are typed
-    terminal outcomes recorded as failed/timed_out; other exceptions stay unknown.
+    ``terminal_exceptions`` are typed terminal outcomes recorded as
+    failed/timed_out; other exceptions stay unknown. With ``claim_cell`` (a
+    one-item list) the record is a public invocation: it is pinned against
+    eviction and the fresh ``_Claim`` is stored there for sealing/release.
     """
     owner = reservations if reservations is not None else RESERVATIONS
     key = attempt_key if attempt_key is not None else ("legacy", 0, transport, uuid.uuid4().hex)
-    fresh, entry = owner._begin(scope, key, limit, weight, transport, fingerprint)
+    fresh, entry = owner._begin(scope, key, None, 1, transport, fingerprint, protect=claim_cell is not None)
     if not fresh:
         if entry is not None and entry.cached:
             return entry.response
-        message = "No fresh execution reservation: attempt already started/unknown, payload changed, or capacity in use by an in-flight call. Nothing was spawned by this call."
+        message = "No fresh execution reservation: attempt already started/unknown or payload changed. Nothing was spawned by this call."
         if transport == "claude_cli":
             from .claude_opus_bridge import ClaudeBridgeFailure
             raise ClaudeBridgeFailure(message, "concurrency")
         return json.dumps({"error": message})
+    if claim_cell is not None:
+        claim_cell[0] = entry
     try:
         raw = raw_dispatch()
     except BaseException as exc:
         typed = exc if terminal_exceptions and isinstance(exc, terminal_exceptions) else None
-        owner._finish(key, None, exceptional=True, failure=typed, evidence=evidence)
+        owner._finish(key, entry, None, exceptional=True, failure=typed, evidence=evidence)
         raise
-    owner._finish(key, raw, evidence=evidence)
+    owner._finish(key, entry, raw, evidence=evidence)
     return raw
 
 
-def native_legacy_dispatch(raw_dispatch: Callable[[], Any], *, parent: Any, tasks: Any = None,
+def native_legacy_dispatch(raw_dispatch: Callable[[], Any], *, parent: Any,
                            transport: str, evidence: Optional[Mapping[str, Any]] = None) -> Any:
-    """No tools/workspaces/routes are invented: the host remains their authority."""
+    """No tools/workspaces/routes are invented: the host remains their authority.
+
+    No plugin capacity check either: the host's own batch-width check and async
+    pool fallback are the only admission for these legacy calls."""
     try:
-        from tools.delegate_tool import _get_max_concurrent_children
-        limit = _get_max_concurrent_children()
+        from tools.delegate_tool import _get_max_concurrent_children  # noqa: F401
     except Exception:
-        limit = 0  # missing host capacity seam cannot authorize a launch
-    # The host validates batch width itself ("Too many tasks"); clamp so a wide
-    # batch reaches that host refusal instead of a new one from this boundary.
-    weight = len(tasks) if isinstance(tasks, list) and tasks else 1
-    if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 1:
-        weight = min(weight, limit)
-    # Both native transports share this parent's child capacity. No parent field
+        # Host compatibility, not capacity: a host without its delegation
+        # capacity seam is not the unchanged host this boundary wraps.
+        return json.dumps({"error": "Hermes delegation capacity seam is unavailable. Nothing was spawned by this call."})
+    # Both native transports share this parent's journal scope. No parent field
     # or config mutation is used to simulate a route, a workspace, or isolation.
     scope = f"hermes_children:{getattr(parent, 'session_id', '')}:{id(parent)}"
     invocation = _NATIVE_INVOCATION.get()
-    key, fingerprint, started = invocation if invocation is not None else (None, "", None)
-    def launch() -> Any:
-        if started is not None:
-            started[0] = True
-        return raw_dispatch()
-    return dispatch_legacy(launch, transport=transport, scope=scope, limit=limit,
-                           weight=weight, evidence=evidence, attempt_key=key, fingerprint=fingerprint)
+    key, fingerprint, cell = invocation if invocation is not None else (None, "", None)
+    return dispatch_legacy(raw_dispatch, transport=transport, scope=scope, evidence=evidence,
+                           attempt_key=key, fingerprint=fingerprint, claim_cell=cell)
 
 
 def guard_legacy_tool_execution(**kwargs: Any) -> Any:
@@ -314,6 +348,7 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
     raw_next = kwargs["next_call"]
     identifiers = tuple(kwargs.get(k) for k in ("session_id", "turn_id", "tool_call_id"))
     invocation = None
+    owner = RESERVATIONS
     if all(isinstance(value, str) and value for value in identifiers):
         session, turn, tool_call = identifiers
         key = (session, 0, turn, tool_call)
@@ -321,9 +356,11 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
             fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, allow_nan=False).encode()).hexdigest()
         except (TypeError, ValueError):
             return json.dumps({"error": "Legacy invocation is not a JSON-compatible tool payload. Nothing was spawned."})
-        invocation = (key, fingerprint, [False])
+        # The cell receives the exact _Claim this invocation created, if any; only
+        # that claim is ever sealed or released by this invocation.
+        invocation = (key, fingerprint, [None])
         transport = "hermes_claude" if name == "delegate_claude" else "hermes_codex"
-        exists, response = RESERVATIONS._tool_response(key, fingerprint, transport)
+        exists, response = owner._tool_response(key, fingerprint, transport)
         if exists:
             return response
     token = _NATIVE_INVOCATION.set(invocation)
@@ -336,13 +373,15 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
             def admitted(sent: Dict[str, Any]) -> Any:
                 from agent.subagent_lifecycle import get_active_subagent_parent
                 return native_legacy_dispatch(lambda: raw_next(sent), parent=get_active_subagent_parent(),
-                    tasks=sent.get("tasks"), transport="hermes_codex")
+                    transport="hermes_codex")
             response = worker_admission.guard_tool_execution(**{**kwargs, "next_call": admitted})
-        if invocation is not None and invocation[2][0]:
-            RESERVATIONS._seal_tool_response(invocation[0], response)
+        if invocation is not None and invocation[2][0] is not None:
+            owner._seal_tool_response(invocation[0], invocation[2][0], response)
         return response
     finally:
         _NATIVE_INVOCATION.reset(token)
+        if invocation is not None and invocation[2][0] is not None:
+            owner._release(invocation[0], invocation[2][0])  # no-op once sealed
 
 
 def _cap(snapshot: Any, transport: str, name: str) -> Any:

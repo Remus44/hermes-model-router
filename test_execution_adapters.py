@@ -196,9 +196,9 @@ class LegacyBoundaryTests(unittest.TestCase):
         self.shared_patch.start()
         self.addCleanup(self.shared_patch.stop)
 
-    def dispatch(self, raw, *, key=("workflow", 1, "task", "attempt"), limit=1, transport="hermes_codex", weight=1):
+    def dispatch(self, raw, *, key=("workflow", 1, "task", "attempt"), transport="hermes_codex"):
         return adapters.dispatch_legacy(raw, transport=transport, scope="parent:shared", attempt_key=key,
-            limit=limit, weight=weight, reservations=self.book)
+            reservations=self.book)
 
     def test_oversized_handle_is_not_silently_repaired_into_another_identifier(self):
         payload = json.dumps({"delegation_id": "d" * 300})
@@ -248,13 +248,13 @@ class LegacyBoundaryTests(unittest.TestCase):
             self.assertTrue(finish.wait(5))
             return payload
         with patch.object(adapters, "_MAX_RECORDS", 1):
-            thread = threading.Thread(target=lambda: self.dispatch(slow, limit=5))
+            thread = threading.Thread(target=lambda: self.dispatch(slow))
             thread.start()
             self.assertTrue(started.wait(5))
             try:
-                self.assertIs(self.dispatch(lambda: payload, key=("other", 1, "t", "a"), limit=5), payload)
+                self.assertIs(self.dispatch(lambda: payload, key=("other", 1, "t", "a")), payload)
                 self.assertIsNotNone(self.book.record(("workflow", 1, "task", "attempt")))
-                duplicate = json.loads(self.dispatch(lambda: "SHOULD NOT START", limit=5))
+                duplicate = json.loads(self.dispatch(lambda: "SHOULD NOT START"))
                 self.assertIn("error", duplicate)  # in-flight duplicate still blocked
             finally:
                 finish.set()
@@ -336,33 +336,34 @@ class LegacyBoundaryTests(unittest.TestCase):
             thread.join(5)
         self.assertEqual(len(calls), 1)
 
-    def test_shared_owner_last_slot_race_and_batch_weight(self):
-        # Capacity is contended only inside the synchronous in-flight window.
-        barrier = threading.Barrier(3)
-        release = threading.Event()
+    def test_shared_owner_admits_distinct_concurrent_calls_and_dedups_same_attempt(self):
+        # Superseded (fix round 3, R1): legacy dispatches get no plugin capacity
+        # check; the host is the sole admission authority. Only the same attempt
+        # is deduplicated while it is in flight.
+        started, release = threading.Event(), threading.Event()
         calls, responses = [], []
-        def submit(transport, key):
-            barrier.wait()
-            def raw():
-                calls.append(transport)
-                self.assertTrue(release.wait(5))
-                return json.dumps({"delegation_id": transport})
-            responses.append(self.dispatch(raw, transport=transport, key=key))
-        threads = [threading.Thread(target=submit, args=(t, (t, 1, "task", "attempt")))
-            for t in ("hermes_codex", "hermes_claude")]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for _ in range(500):
-            if responses:
-                break
-            threading.Event().wait(0.01)
-        release.set()
-        for thread in threads:
+        def slow():
+            calls.append("hermes_codex")
+            started.set()
+            self.assertTrue(release.wait(5))
+            return json.dumps({"delegation_id": "hermes_codex"})
+        codex_key = ("hermes_codex", 1, "task", "attempt")
+        thread = threading.Thread(target=lambda: responses.append(self.dispatch(slow, key=codex_key)))
+        thread.start()
+        self.assertTrue(started.wait(5))
+        try:
+            claude_raw = json.dumps({"delegation_id": "hermes_claude"})
+            self.assertIs(self.dispatch(lambda: calls.append("hermes_claude") or claude_raw,
+                transport="hermes_claude", key=("hermes_claude", 1, "task", "attempt")), claude_raw)
+            self.assertEqual(self.dispatch(lambda: calls.append("wide") or "{}",
+                key=("wide", 1, "t", "a")), "{}")
+            duplicate = json.loads(self.dispatch(lambda: calls.append("duplicate") or "{}", key=codex_key))
+            self.assertIn("error", duplicate)  # same in-flight attempt: never a second dispatch
+        finally:
+            release.set()
             thread.join(5)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(sum("error" in json.loads(r) for r in responses), 1)
-        self.assertIn("error", json.loads(self.dispatch(lambda: "no", weight=2, key=("wide", 1, "t", "a"))))
+        self.assertEqual(responses, [json.dumps({"delegation_id": "hermes_codex"})])
+        self.assertEqual(calls, ["hermes_codex", "hermes_claude", "wide"])
 
     def test_empty_and_ambiguous_partial_sync_results_stay_unknown_without_holding_capacity(self):
         for results in ([], [{"status": "unknown", "result": "lost"}], [{"status": "completed"}, {"status": "running"}]):
@@ -606,7 +607,7 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
             for index in range(7):
                 transport = "hermes_claude" if index % 2 else "hermes_codex"
                 raw = adapters.native_legacy_dispatch(lambda i=index: starts.append(i) or self.background(i),
-                    parent=self.parent, tasks=[{"goal": "g"}], transport=transport)
+                    parent=self.parent, transport=transport)
                 self.assertNotIn("error", json.loads(raw))
         self.assertEqual(starts, list(range(7)))
         self.assertTrue(all(r.status == "unknown" for r in self.book.records()))  # accepted, not completed
@@ -639,7 +640,7 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
                     nonlocal starts
                     starts += 1
                     return payloads[i % len(payloads)]
-                response = adapters.dispatch_legacy(raw, transport="hermes_codex", scope="parent:x", limit=1)
+                response = adapters.dispatch_legacy(raw, transport="hermes_codex", scope="parent:x")
                 self.assertIs(response, payloads[index % len(payloads)])
                 self.assertLessEqual(len(self.book.records()), 8)
         self.assertEqual(starts, 40)
@@ -649,7 +650,7 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
         starts = []
         for index in range(adapters._MAX_RECORDS + 1):
             self.assertIs(adapters.dispatch_legacy(lambda: starts.append(1) or payload, transport="hermes_codex",
-                scope="parent:x", limit=1), payload)
+                scope="parent:x"), payload)
         self.assertEqual(len(starts), adapters._MAX_RECORDS + 1)
         self.assertLessEqual(len(self.book.records()), adapters._MAX_RECORDS)
 
@@ -660,14 +661,14 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
         key = ("session", 0, "turn", "call")
         with patch.object(adapters, "_now", lambda: clock[0], create=True):
             first = adapters.dispatch_legacy(lambda: calls.append(1) or payload, transport="hermes_codex",
-                scope="p", limit=1, attempt_key=key, fingerprint="f")
+                scope="p", attempt_key=key, fingerprint="f")
             clock[0] += 60
             self.assertIs(adapters.dispatch_legacy(lambda: calls.append(2) or payload, transport="hermes_codex",
-                scope="p", limit=1, attempt_key=key, fingerprint="f"), first)
+                scope="p", attempt_key=key, fingerprint="f"), first)
             self.assertEqual(calls, [1])
             clock[0] += getattr(adapters, "_RECORD_TTL_SECONDS", 3600) + 1
             adapters.dispatch_legacy(lambda: calls.append(3) or payload, transport="hermes_codex",
-                scope="p", limit=1, attempt_key=key, fingerprint="f")
+                scope="p", attempt_key=key, fingerprint="f")
         self.assertEqual(calls, [1, 3])
 
     def test_cli_call_after_typed_bridge_failure_is_not_refused(self):
@@ -717,11 +718,11 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
         calls = []
         error = json.dumps({"error": "Too many tasks"})
         self.assertIs(adapters.dispatch_legacy(lambda: calls.append(1) or error, transport="hermes_codex",
-            scope="parent:y", limit=1, attempt_key=("w", 1, "t", "a")), error)
+            scope="parent:y", attempt_key=("w", 1, "t", "a")), error)
         self.assertEqual(self.book.record(("w", 1, "t", "a")).status, "failed")
         ok = json.dumps({"results": [{"status": "completed"}], "total_duration_seconds": 1})
         self.assertIs(adapters.dispatch_legacy(lambda: calls.append(2) or ok, transport="hermes_codex",
-            scope="parent:y", limit=1, attempt_key=("w2", 1, "t", "a")), ok)
+            scope="parent:y", attempt_key=("w2", 1, "t", "a")), ok)
         self.assertEqual(calls, [1, 2])
 
     def test_batch_wider_than_limit_reaches_host_for_its_own_refusal(self):
@@ -729,8 +730,265 @@ class UnchangedHostAdmissionTests(unittest.TestCase):
         host_error = json.dumps({"error": "Too many tasks: 3 provided, but max_concurrent_children is 2."})
         with patch("tools.delegate_tool._get_max_concurrent_children", return_value=2):
             raw = adapters.native_legacy_dispatch(lambda: calls.append(1) or host_error, parent=self.parent,
-                tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}], transport="hermes_codex")
+                transport="hermes_codex")
         self.assertIs(raw, host_error)
+        self.assertEqual(calls, [1])
+
+
+class PublicClaimIdentityTests(unittest.TestCase):
+    """Fix round 3: claim identity (N3) and host-only legacy admission (R1).
+
+    Every interleaving goes through the registered public middleware
+    ``guard_legacy_tool_execution``. Ordering uses events only, never sleeps.
+    """
+    def setUp(self):
+        self.book = adapters.ReservationBook()
+        self.parent = SimpleNamespace(_delegate_depth=0, session_id="parent")
+        self.clock = [1000.0]
+        self.gates = {}  # goal -> (reached, resume): pause after raw return, before public sealing
+        self.events = []
+        real_guard = worker_admission.guard_tool_execution
+        def pausing_guard(**kw):
+            result = real_guard(**kw)
+            gate = self.gates.get((kw.get("args") or {}).get("goal"))
+            if gate is not None:
+                gate[0].set()
+                if not gate[1].wait(5):
+                    raise AssertionError("paused invocation was never resumed")
+                if len(gate) > 2:
+                    raise gate[2]
+            return result
+        for patcher in (patch.object(adapters, "RESERVATIONS", self.book),
+                        patch.object(adapters, "_now", lambda: self.clock[0]),
+                        patch.object(router, "_load_config", return_value={"enabled": True}),
+                        patch.object(router, "_delegation_targets_detail", return_value={}),
+                        patch.object(router, "_delegated_claude_review_status", return_value=(None, "")),
+                        patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")),
+                        patch.object(worker_admission, "refusal", return_value=""),
+                        patch.object(worker_admission, "guard_tool_execution", pausing_guard),
+                        patch("tools.delegate_tool._get_max_concurrent_children", return_value=1),
+                        patch("agent.subagent_lifecycle.get_active_subagent_parent", return_value=self.parent)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def event(self):
+        event = threading.Event()
+        self.events.append(event)
+        return event
+
+    def spawn(self, fn):
+        box = {}
+        def run():
+            try:
+                box["result"] = fn()
+            except BaseException as exc:  # surfaced by the test's own assertions
+                box["error"] = exc
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(lambda: [event.set() for event in self.events])  # runs before the join
+        return thread, box
+
+    def call(self, call_id, goal, raw):
+        return adapters.guard_legacy_tool_execution(tool_name="delegate_task", args={"goal": goal},
+            next_call=raw, session_id="s", turn_id="t", tool_call_id=call_id)
+
+    @staticmethod
+    def result(name):
+        return json.dumps({"results": [{"status": "completed", "result": name}], "total_duration_seconds": 1})
+
+    def pause(self, goal):
+        reached, resume = self.event(), self.event()
+        self.gates[goal] = (reached, resume)
+        return reached, resume
+
+    def test_old_public_completion_never_overwrites_or_unprotects_replacement_claim(self):
+        # N3 interleaving from re-review 2, driven through the public middleware.
+        key, calls = ("s", 0, "t", "K"), []
+        a_reached, a_resume = self.pause("goal A")
+        a_thread, a_box = self.spawn(lambda: self.call("K", "goal A", lambda sent: calls.append("A") or self.result("A")))
+        self.assertTrue(a_reached.wait(5))  # A: raw returned, public seal not yet written
+        # Force real TTL expiry plus LRU pressure (this evicts A on 1aad967) ...
+        self.clock[0] += adapters._RECORD_TTL_SECONDS + 1
+        with patch.object(adapters, "_MAX_RECORDS", 1):
+            self.assertEqual(self.call("F0", "filler 0", lambda sent: calls.append("F0") or self.result("F0")), self.result("F0"))
+        # ... then remove A's record directly, so the claim-identity check (not just
+        # A's protection) is what keeps A's late seal away from the replacement claim.
+        with self.book._lock:
+            self.book._claims.pop(key, None)
+        b_started, b_release = self.event(), self.event()
+        def raw_b(sent):
+            calls.append("B")
+            b_started.set()
+            if not b_release.wait(5):
+                raise AssertionError("B never released")
+            return self.result("B")
+        b_thread, b_box = self.spawn(lambda: self.call("K", "goal B", raw_b))
+        self.assertTrue(b_started.wait(5))
+        b_record = self.book.record(key)
+        self.assertIsNotNone(b_record)
+        a_resume.set()
+        a_thread.join(5)
+        self.assertEqual(a_box.get("result"), self.result("A"))
+        # B's record is untouched by A's completion and seal.
+        self.assertEqual(self.book.record(key), b_record)
+        # An identical repeat of B never receives A's response and never re-dispatches B.
+        repeat = self.call("K", "goal B", lambda sent: calls.append("B again") or "SHOULD NOT START")
+        self.assertNotEqual(repeat, self.result("A"))
+        self.assertIn("error", json.loads(repeat))
+        # B stays protected from LRU and TTL eviction while it runs.
+        self.clock[0] += adapters._RECORD_TTL_SECONDS + 1
+        with patch.object(adapters, "_MAX_RECORDS", 1):
+            self.assertEqual(self.call("F", "filler", lambda sent: calls.append("F") or self.result("F")), self.result("F"))
+        self.assertEqual(self.book.record(key), b_record)
+        self.assertIn("error", json.loads(self.call("K", "goal B", lambda sent: calls.append("B again") or "SHOULD NOT START")))
+        b_release.set()
+        b_thread.join(5)
+        self.assertEqual(b_box.get("result"), self.result("B"))
+        self.assertEqual(self.call("K", "goal B", lambda sent: calls.append("B again") or "SHOULD NOT START"), self.result("B"))
+        self.assertEqual(calls.count("B"), 1)
+        self.assertNotIn("B again", calls)
+
+    def test_own_record_is_not_lru_evicted_between_raw_return_and_seal(self):
+        key, calls = ("s", 0, "t", "K"), []
+        a_reached, a_resume = self.pause("goal A")
+        a_thread, a_box = self.spawn(lambda: self.call("K", "goal A", lambda sent: calls.append("A") or self.result("A")))
+        self.assertTrue(a_reached.wait(5))
+        with patch.object(adapters, "_MAX_RECORDS", 1):
+            self.assertEqual(self.call("F", "filler", lambda sent: calls.append("F") or self.result("F")), self.result("F"))
+            self.assertIsNotNone(self.book.record(key))
+            changed = self.call("K", "goal B", lambda sent: calls.append("B") or self.result("B"))
+            self.assertIn("error", json.loads(changed))
+            a_resume.set()
+            a_thread.join(5)
+        self.assertEqual(a_box.get("result"), self.result("A"))
+        self.assertEqual(self.call("K", "goal A", lambda sent: calls.append("A again") or "NO"), self.result("A"))
+        self.assertEqual(calls, ["A", "F"])
+
+    def test_own_record_does_not_expire_between_raw_return_and_seal(self):
+        key, calls = ("s", 0, "t", "K"), []
+        a_reached, a_resume = self.pause("goal A")
+        a_thread, a_box = self.spawn(lambda: self.call("K", "goal A", lambda sent: calls.append("A") or self.result("A")))
+        self.assertTrue(a_reached.wait(5))
+        self.clock[0] += adapters._RECORD_TTL_SECONDS + 1
+        changed = self.call("K", "goal B", lambda sent: calls.append("B") or self.result("B"))
+        self.assertIn("error", json.loads(changed))
+        self.assertIsNotNone(self.book.record(key))
+        a_resume.set()
+        a_thread.join(5)
+        self.assertEqual(a_box.get("result"), self.result("A"))
+        self.assertEqual(self.call("K", "goal A", lambda sent: calls.append("A again") or "NO"), self.result("A"))
+        self.assertEqual(calls, ["A"])
+
+    def test_claude_handler_post_processing_keeps_record_protected(self):
+        # The public delegate_claude handler annotates after raw return (claude._annotate).
+        calls, key = [], ("s", 0, "t", "C")
+        reached, resume = self.event(), self.event()
+        real_annotate = claude._annotate
+        def paused_annotate(*args, **kwargs):
+            if not reached.is_set():  # pause only invocation "a"
+                reached.set()
+                if not resume.wait(5):
+                    raise AssertionError("annotation never resumed")
+            return real_annotate(*args, **kwargs)
+        raw = lambda **kw: calls.append(kw["goal"]) or self.result(kw["goal"])
+        def call(goal):
+            return adapters.guard_legacy_tool_execution(tool_name="delegate_claude", args={"goal": goal, "tier": "haiku"},
+                next_call=claude.handle_delegate_claude, session_id="s", turn_id="t", tool_call_id="C")
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)), \
+             patch.object(claude, "_annotate", paused_annotate):
+            thread, box = self.spawn(lambda: call("a"))
+            self.assertTrue(reached.wait(5))
+            self.clock[0] += adapters._RECORD_TTL_SECONDS + 1
+            self.assertIn("error", json.loads(call("b")))
+            self.assertIsNotNone(self.book.record(key))
+            resume.set()
+            thread.join(5)
+            first = box.get("result")
+            self.assertEqual(json.loads(first)["claude_tier"], "haiku")
+            self.assertEqual(call("a"), first)
+        self.assertEqual(calls, ["a"])
+
+    def test_unwound_public_invocation_releases_its_protection(self):
+        # Protection lasts until the seal or the invocation unwinds (exception path).
+        calls = []
+        reached, resume = self.event(), self.event()
+        self.gates["boom"] = (reached, resume, RuntimeError("post-processing failed"))
+        resume.set()
+        with self.assertRaises(RuntimeError):
+            self.call("E1", "boom", lambda sent: calls.append("E1") or self.result("E1"))
+        def raising(sent):
+            calls.append("E2")
+            raise RuntimeError("raw dispatch lost its response")
+        with self.assertRaises(RuntimeError):
+            self.call("E2", "raw raises", raising)
+        self.assertEqual(self.book.record(("s", 0, "t", "E2")).status, "unknown")
+        with patch.object(adapters, "_MAX_RECORDS", 1):
+            self.assertEqual(self.call("F", "filler", lambda sent: calls.append("F") or self.result("F")), self.result("F"))
+        self.assertIsNone(self.book.record(("s", 0, "t", "E1")))
+        self.assertIsNone(self.book.record(("s", 0, "t", "E2")))
+        self.assertEqual(calls, ["E1", "E2", "F"])
+
+    def test_public_changed_payload_after_ttl_expiry_is_a_new_call(self):
+        calls = []
+        first = self.call("K", "P1", lambda sent: calls.append("P1") or self.result("P1"))
+        self.assertIn("error", json.loads(self.call("K", "P2", lambda sent: calls.append("early") or "NO")))
+        self.assertEqual(self.call("K", "P1", lambda sent: calls.append("again") or "NO"), first)
+        self.clock[0] += adapters._RECORD_TTL_SECONDS + 1
+        second = self.call("K", "P2", lambda sent: calls.append("P2") or self.result("P2"))
+        self.assertEqual(second, self.result("P2"))
+        self.assertEqual(self.call("K", "P2", lambda sent: calls.append("again") or "NO"), second)
+        self.assertIn("error", json.loads(self.call("K", "P1", lambda sent: calls.append("again") or "NO")))
+        self.assertEqual(calls, ["P1", "P2"])
+
+    def test_distinct_concurrent_public_calls_on_one_parent_are_admitted_at_limit_one(self):
+        # R1: the host is the sole admission authority for legacy dispatches.
+        calls = []
+        started, release = self.event(), self.event()
+        def slow(sent):
+            calls.append("first")
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("first call never released")
+            return self.result("first")
+        thread, box = self.spawn(lambda: self.call("c1", "first", slow))
+        self.assertTrue(started.wait(5))
+        second = self.call("c2", "second", lambda sent: calls.append("second") or self.result("second"))
+        self.assertEqual(second, self.result("second"))
+        release.set()
+        thread.join(5)
+        self.assertEqual(box.get("result"), self.result("first"))
+        self.assertEqual(calls, ["first", "second"])
+
+    def test_distinct_concurrent_native_calls_mixed_transports_are_admitted_at_limit_one(self):
+        calls = []
+        started, release = self.event(), self.event()
+        def slow():
+            calls.append("codex")
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("codex call never released")
+            return self.result("codex")
+        thread, box = self.spawn(lambda: adapters.native_legacy_dispatch(slow, parent=self.parent,
+            transport="hermes_codex"))
+        self.assertTrue(started.wait(5))
+        claude_raw = adapters.native_legacy_dispatch(lambda: calls.append("claude") or self.result("claude"),
+            parent=self.parent, transport="hermes_claude")
+        self.assertEqual(claude_raw, self.result("claude"))
+        release.set()
+        thread.join(5)
+        self.assertEqual(box.get("result"), self.result("codex"))
+        self.assertEqual(calls, ["codex", "claude"])
+
+    def test_wide_batch_through_public_middleware_reaches_host_refusal(self):
+        calls = []
+        host_error = json.dumps({"error": "Too many tasks: 3 provided, but max_concurrent_children is 1."})
+        response = adapters.guard_legacy_tool_execution(tool_name="delegate_task",
+            args={"tasks": [{"goal": "a"}, {"goal": "b"}, {"goal": "c"}]},
+            next_call=lambda sent: calls.append(1) or host_error, session_id="s", turn_id="t", tool_call_id="wide")
+        self.assertIs(response, host_error)
         self.assertEqual(calls, [1])
 
 

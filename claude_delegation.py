@@ -821,7 +821,7 @@ def _dispatch(args: Dict[str, Any]) -> str:
         if tier == "haiku":
             evidence["reasoning_effort"] = "not_applicable"
         return native_legacy_dispatch(lambda: raw_delegate_task(**kwargs), parent=parent,
-            tasks=kwargs.get("tasks"), transport="hermes_claude", evidence=evidence)
+            transport="hermes_claude", evidence=evidence)
 
     # Haiku has no extended-thinking support (see agent.anthropic_adapter.build_anthropic_kwargs),
     # so the reasoning-effort bridge is simply irrelevant to it: a Haiku call never sets a scope
