@@ -1670,7 +1670,8 @@ class AccountOfExecutionTests(unittest.TestCase):
                        '[sonnet-review] Review parser'}]}
             manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
                                       _report_hook_failure=Mock())
-            downstream = Mock(side_effect=RuntimeError('temporary provider failure'))
+            original = RuntimeError('temporary provider failure')
+            downstream = Mock(side_effect=original)
             with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
                  patch.object(router, '_load_config', return_value=cfg), \
                  patch.object(router, '_maybe_run_opus5', return_value=None), \
@@ -1678,9 +1679,11 @@ class AccountOfExecutionTests(unittest.TestCase):
                  patch.object(router, '_is_transient_provider_failure', return_value=True), \
                  patch.object(router, '_record_tier_failure'), \
                  patch.object(router, '_transient_fallback_model', return_value='gpt-spark'):
-                with self.assertRaisesRegex(RuntimeError, '^temporary provider failure$'):
+                with self.assertRaises(RuntimeError) as cm:
                     run_llm_execution_middleware(request, downstream, provider='openai-codex',
                         api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            self.assertIs(cm.exception, original)
+            self.assertEqual(str(cm.exception), 'temporary provider failure')
             self.assertFalse(routes.exists(), 'an unsubmitted fallback must not create a routed-call record')
         downstream.assert_called_once()
 

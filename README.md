@@ -734,10 +734,11 @@ may not route work somewhere policy forbids.
 
 ### Retrying a failed downstream request
 
-The plugin can re-issue one failed provider call through Hermes's `llm_execution`
-middleware (`retry_call`), which is what lets a route that fails on arrival be
-answered by a different model without failing the turn. It needs a Hermes new
-enough to pass `retry_call` to execution middleware.
+The plugin retries a failed provider call only when the host explicitly supplies a
+compatible `retry_call` to `llm_execution` middleware. The installed host supplies
+no such callback, so a failure on arrival propagates unchanged to the host or parent
+owner; the plugin neither calls single-use `next_call` again nor writes a routed-call
+record for an unsubmitted fallback.
 
 ### Live Dashboard
 
