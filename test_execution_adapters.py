@@ -960,8 +960,8 @@ class PublicClaimIdentityTests(unittest.TestCase):
             thread, box = self.spawn(call)
             self.assertTrue(paused.wait(5))
             pending = call()
-            self.assertEqual(json.loads(pending)["error"],
-                "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.")
+            self.assertEqual(pending, json.dumps({"error":
+                "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."}))
             release.set()
             thread.join(5)
             first = box.get("result")
@@ -1037,7 +1037,7 @@ class PublicClaimIdentityTests(unittest.TestCase):
              patch.object(claude.usage_guard, "apply", wraps=claude.usage_guard.apply) as apply, \
              patch.object(claude, "_log", side_effect=lambda _cfg, entry: audits.append(entry)):
             first = call()
-            cfg["claude_delegation"]["disabled"] = ["opus5", "sonnet5"]
+            cfg["callable"]["opus5"] = cfg["callable"]["sonnet5"] = False
             read.return_value = _reading(95.0)
             duplicate = call()
         self.assertEqual(duplicate, first)
@@ -1088,21 +1088,24 @@ class PublicClaimIdentityTests(unittest.TestCase):
                 args={"goal": "large", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
                 session_id="oversized", turn_id="turn", tool_call_id="claude")
         self.assertEqual((codex, claude_response), (oversized, oversized))
-        self.assertIn("error", json.loads(codex_duplicate))
-        self.assertIn("error", json.loads(claude_duplicate))
+        pending = json.dumps({"error":
+            "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})
+        self.assertEqual(codex_duplicate, pending)
+        self.assertEqual(claude_duplicate, pending)
         self.assertEqual((len(codex_calls), len(claude_calls)), (1, 1))
 
     def test_changed_transport_under_public_ids_is_rejected_before_claude_usage_read(self):
-        codex_calls = []
-        first = adapters.guard_legacy_tool_execution(tool_name="delegate_task", args={"goal": "same"},
+        args, codex_calls = {"goal": "same", "tier": "haiku"}, []
+        first = adapters.guard_legacy_tool_execution(tool_name="delegate_task", args=args,
             next_call=lambda sent: codex_calls.append(sent) or self.result("codex"),
             session_id="transport", turn_id="turn", tool_call_id="same")
         with patch.object(claude.usage_guard, "read", side_effect=AssertionError("duplicate read usage")) as read:
-            changed = adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
-                args={"goal": "same", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
+            changed = adapters.guard_legacy_tool_execution(tool_name="delegate_claude", args=args,
+                next_call=claude.handle_delegate_claude,
                 session_id="transport", turn_id="turn", tool_call_id="same")
         self.assertEqual(first, self.result("codex"))
-        self.assertIn("error", json.loads(changed))
+        self.assertEqual(changed, json.dumps({"error":
+            "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."}))
         self.assertEqual((len(codex_calls), read.call_count), (1, 0))
 
     def test_old_public_completion_never_overwrites_or_unprotects_replacement_claim(self):

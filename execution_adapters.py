@@ -384,8 +384,10 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
         return response
     except BaseException:
         if invocation is not None and invocation[2][0] is not None:
-            # A raw exception already closed its receipt; a handler-side unwind
-            # has not. The identity-checked close is idempotent in either case.
+            # A raw exception already closed its receipt as unknown/failed; an
+            # unwind after raw return finds the raw outcome and drops only the
+            # unsealed cache; an unwind before dispatch closes it here. Identity-
+            # checked and idempotent.
             owner._finish(invocation[0], invocation[2][0], None, exceptional=True)
         raise
     finally:
