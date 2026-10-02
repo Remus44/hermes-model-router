@@ -4884,6 +4884,8 @@ _SUBSTITUTION_PROVENANCE_PREFIX = "[ROUTER SUBSTITUTION PROVENANCE v1] "
 _PARENT_VISIBLE_PROVENANCE_MAX_CHARS = 400
 _PARENT_PROVENANCE_VALUE_MAX_CHARS = 24
 _PARENT_PROVENANCE_REFERENCE_CHARS = 16
+_PARENT_PROVENANCE_SAFE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/@+-")
+_PARENT_PROVENANCE_POLICY_CODES = {"legacy_ordinary_provider_route": "legacy_ordinary_route"}
 
 
 def _provenance_text(value: Any, fallback: str = "unknown") -> str:
@@ -4929,7 +4931,7 @@ def _provenance_mapping(value: Any) -> Dict[str, str]:
 
 
 def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
-                             replacement: Any = None, executed: Any = None,
+                             replacement: Any = None, executed: Any = None, reference: Any = None,
                              carrier: str = "middleware") -> Dict[str, Any]:
     marker = {
         "kind": kind,
@@ -4940,6 +4942,8 @@ def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
         # cross-provider review merely because its output contains this evidence.
         "satisfies_cross_provider_review": False,
     }
+    if reference:
+        marker["reference"] = str(reference)
     if isinstance(replacement, dict):
         marker.update({
             "policy": _provenance_text(replacement.get("policy")),
@@ -4954,42 +4958,52 @@ def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
     return marker
 
 
-def _parent_provenance_value(value: Any, fallback: str = "unknown") -> str:
-    return _provenance_text(value, fallback)[:_PARENT_PROVENANCE_VALUE_MAX_CHARS]
+def _parent_provenance_value(value: Any, fallback: str = "unknown", *, limit: int = _PARENT_PROVENANCE_VALUE_MAX_CHARS) -> str:
+    original = value if isinstance(value, str) and value else fallback
+    safe = "".join(char if char in _PARENT_PROVENANCE_SAFE_CHARS else "_" for char in original)
+    altered = safe != original or len(safe) > limit
+    if altered:
+        suffix = "~" + hashlib.sha256(original.encode("utf-8")).hexdigest()[:6]
+        safe = safe[:max(0, limit - len(suffix))] + suffix
+    return safe[:limit] or fallback
 
 
 def _parent_provenance_reference(marker: Dict[str, Any]) -> str:
     supplied = marker.get("reference")
     if isinstance(supplied, str) and supplied:
-        return supplied[:_PARENT_PROVENANCE_REFERENCE_CHARS]
+        return _parent_provenance_value(supplied, limit=_PARENT_PROVENANCE_REFERENCE_CHARS)
     encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:_PARENT_PROVENANCE_REFERENCE_CHARS]
 
 
 def _parent_visible_provenance(marker: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact marker retained in the host's 500-character summary tail.
-
-    Full replacement detail remains in the existing Claude audit event; this line
-    carries only the parent decision fields plus its short audit reference.
-    """
+    """Compact, ASCII-safe marker retained in the host's 500-character tail."""
     identity = marker.get("identity") if isinstance(marker.get("identity"), dict) else {}
     requested = identity.get("requested") if isinstance(identity.get("requested"), dict) else {}
     resolved = identity.get("resolved") if isinstance(identity.get("resolved"), dict) else {}
+    observed = identity.get("observed") if isinstance(identity.get("observed"), dict) else {}
     replacement = marker.get("requested_review") if isinstance(marker.get("requested_review"), dict) else {}
     executed = marker.get("executed") if isinstance(marker.get("executed"), dict) else {}
+    step_down = marker.get("kind") == "claude_cli_step_down"
+    observed_is_real = bool(observed.get("canonical")) and observed.get("source") == "claude_cli.result.modelUsage"
+    requested_value = requested.get("value")
+    requested_parent = requested_value if requested_value not in (None, "", "unknown") else (
+        "alias:" + str(replacement.get("tier") or "unknown"))
+    policy = marker.get("policy") or (marker.get("substitution") or {}).get("policy")
+    reason = marker.get("failure_kind") or marker.get("reason") or (marker.get("substitution") or {}).get("reason")
     return {
         "v": 1,
         "kind": _parent_provenance_value(marker.get("kind")),
         "carrier": _parent_provenance_value(marker.get("carrier")),
         "ref": _parent_provenance_reference(marker),
-        "requested": _parent_provenance_value(requested.get("value") or replacement.get("tier")),
-        "resolved": _parent_provenance_value(resolved.get("value")),
+        "requested": _parent_provenance_value(requested_parent, limit=20),
+        "resolved": _parent_provenance_value(resolved.get("value"), limit=20),
         "actual": {
-            "provider": _parent_provenance_value(executed.get("provider")),
-            "model": _parent_provenance_value(executed.get("model")),
+            "provider": _parent_provenance_value(identity.get("provider") if step_down else executed.get("provider"), limit=20),
+            "model": _parent_provenance_value(observed.get("value") if step_down and observed_is_real else executed.get("model"), limit=20),
         },
-        "policy": _parent_provenance_value(marker.get("policy")),
-        "reason": _parent_provenance_value(marker.get("failure_kind") or marker.get("reason")),
+        "policy": _parent_provenance_value(_PARENT_PROVENANCE_POLICY_CODES.get(str(policy), policy)),
+        "reason": _parent_provenance_value(reason, limit=20),
         "satisfies_cross_provider_review": False,
     }
 
@@ -4998,9 +5012,11 @@ def _provenance_annotation(marker: Dict[str, Any]) -> str:
     encoded = json.dumps(_parent_visible_provenance(marker), sort_keys=True,
                          separators=(",", ":"), ensure_ascii=True)
     line = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
-    if len(line) > _PARENT_VISIBLE_PROVENANCE_MAX_CHARS:
-        raise ValueError("compact provenance marker exceeded its parent-summary bound")
-    return line
+    if len(line) <= _PARENT_VISIBLE_PROVENANCE_MAX_CHARS:
+        return line
+    fallback = {"v": 1, "kind": "unknown", "carrier": "unknown", "ref": "0" * 16,
+                "detail": "overflow", "satisfies_cross_provider_review": False}
+    return _SUBSTITUTION_PROVENANCE_PREFIX + json.dumps(fallback, sort_keys=True, separators=(",", ":"))
 
 
 class _AnnotatedResponseOverlay:
@@ -5222,6 +5238,7 @@ def _opus5_response(result: Dict[str, Any]) -> Any:
     if isinstance(substitution, dict):
         return _annotated_response(response, _substitution_provenance(
             "claude_cli_step_down", identity=result.get("identity"), substitution=substitution,
+            reference=result.get("bridge_run_id"),
         ))
     return response
 
@@ -5352,6 +5369,7 @@ def _deliver_replacement_result(result: Any, replacement: Dict[str, Any],
     TTL/size bounds.
     """
     shape = _provenance_shape(result)
+    _pending_replacement_put(key, replacement)
     if shape is None:
         return _record_ordinary_replacement_result(result, replacement) if first_call else result
     if first_call or shape["terminal"]:

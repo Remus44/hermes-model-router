@@ -823,8 +823,9 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(provenance['carrier'], 'middleware')
         self.assertEqual(provenance['requested'], 'claude-opus-5-5')
         self.assertEqual(provenance['resolved'], 'sonnet')
-        self.assertEqual(provenance['actual'], {'model': 'unknown', 'provider': 'unknown'})
-        self.assertTrue(provenance['ref'])
+        self.assertEqual(provenance['actual']['model'], 'claude-sonnet-5-5')
+        self.assertEqual(provenance['actual']['provider'], 'anthropic')
+        self.assertEqual(provenance['policy'], 'profile_preferred')
         self.assertFalse(provenance['satisfies_cross_provider_review'])
 
     # Audit A02: remove when F04 lands
@@ -1073,7 +1074,10 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertEqual(provenance['kind'], 'claude_cli_step_down')
         self.assertEqual(provenance['requested'], 'claude-opus-5-5')
         self.assertEqual(provenance['resolved'], 'sonnet')
-        self.assertEqual(provenance['actual'], {'model': 'unknown', 'provider': 'unknown'})
+        self.assertEqual(provenance['actual'], {'model': 'claude-sonnet-5-5', 'provider': 'anthropic'})
+        self.assertEqual(provenance['policy'], 'profile_preferred')
+        self.assertNotEqual(provenance['reason'], 'unknown')
+        self.assertTrue(provenance['ref'])
 
     def _middleware_step_down_failure(self, run_effect):
         """Real resolver -> real admission branch (Sonnet step-down) -> real public
@@ -1494,6 +1498,54 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertIs(unchanged, text)
         self.assertFalse(transformed)
 
+    # --- F04 fix round 5 (re-review R4-1..R4-5): parent fields are ASCII-safe,
+    # visibly lossy when shortened, and step-down facts remain parent-visible.
+    def test_f04_r4_parent_marker_bound_is_constructive_for_encoded_input(self):
+        samples = ('"' * 24, '\\' * 24, '\x01' * 24, '模' * 24, '😀' * 24,
+                   '模😀\\"' * 1024)
+        for value in samples:
+            with self.subTest(value=value[:1]):
+                marker = router._substitution_provenance(
+                    'ordinary_replacement',
+                    identity={'requested': {'value': 'claude-opus-5-5'}, 'resolved': {'value': 'opus'}},
+                    substitution={},
+                    replacement={'policy': 'legacy_ordinary_provider_route', 'failure_kind': 'timeout',
+                                 'requested_review': {'tier': 'opus'}, 'provenance_ref': 'a' * 16},
+                    executed={'model': value, 'provider': 'openai-codex'},
+                )
+                try:
+                    line = router._provenance_annotation(marker)
+                except Exception:
+                    line = None
+                self.assertIsNotNone(line, 'annotation must not raise')
+                assert isinstance(line, str)
+                parsed = json.loads(line[len(self.PREFIX):])
+                self.assertLessEqual(len(line), 400)
+                self.assertRegex(parsed['actual']['model'], r'~[0-9a-f]{6}$', parsed)
+        huge = 'x' * 4096
+        marker = router._substitution_provenance(
+            huge, identity={'requested': {'value': huge}, 'resolved': {'value': huge}}, substitution={},
+            replacement={'policy': huge, 'failure_kind': huge, 'requested_review': {'tier': huge},
+                         'provenance_ref': huge}, executed={'model': huge, 'provider': huge})
+        self.assertLessEqual(len(router._provenance_annotation(marker)), 400)
+
+    def test_f04_r4_requested_tier_fallback_is_explicit_alias(self):
+        marker = router._substitution_provenance(
+            'ordinary_replacement', identity=None, substitution={},
+            replacement={'policy': 'legacy_ordinary_provider_route', 'failure_kind': 'timeout',
+                         'requested_review': {'tier': 'opus'}}, executed={'model': 'gpt-terra'})
+        visible = json.loads(router._provenance_annotation(marker)[len(self.PREFIX):])
+        self.assertEqual(visible['requested'], 'alias:opus')
+
+    def test_f04_r4_parent_policy_is_a_code_not_a_prefix(self):
+        marker = router._substitution_provenance(
+            'ordinary_replacement', identity={'requested': {'value': 'claude-opus-5-5'}}, substitution={},
+            replacement={'policy': 'legacy_ordinary_provider_route', 'failure_kind': 'timeout',
+                         'requested_review': {'tier': 'opus'}}, executed={'model': 'claude-sonnet-4-5-20250929'})
+        visible = json.loads(router._provenance_annotation(marker)[len(self.PREFIX):])
+        self.assertEqual(visible['policy'], 'legacy_ordinary_route')
+        self.assertNotEqual(visible['actual']['model'], 'claude-sonnet-4-5-202509')
+
     # --- F04 fix round 4 (re-review N5): the child summary returned to the
     # parent is budgeted after child projection. At the host's 2,000-character
     # floor, both a middleware carrier and the final-output backstop carrier
@@ -1548,9 +1600,9 @@ class AccountOfExecutionTests(unittest.TestCase):
         self.assertLessEqual(len(line), bound)
         parsed = json.loads(line[len(self.PREFIX):])
         self.assertEqual(parsed['v'], 1)
-        self.assertEqual(parsed['requested'], 'x' * value_bound)
-        self.assertEqual(parsed['resolved'], 'x' * value_bound)
-        self.assertEqual(parsed['actual']['model'], 'x' * value_bound)
+        self.assertRegex(parsed['requested'], r'^x{13}~[0-9a-f]{6}$')
+        self.assertRegex(parsed['resolved'], r'^x{13}~[0-9a-f]{6}$')
+        self.assertRegex(parsed['actual']['model'], r'^x{13}~[0-9a-f]{6}$')
         self.assertFalse(parsed['satisfies_cross_provider_review'])
 
     def test_f04_n5_middleware_marker_survives_parent_budget_with_or_without_spill(self):
