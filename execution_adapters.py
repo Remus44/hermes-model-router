@@ -147,17 +147,6 @@ class ReservationBook:
         with self._lock:
             return tuple(entry.receipt for entry in self._claims.values())
 
-    def _tool_response(self, key: AttemptKey, fingerprint: str, transport: str) -> Tuple[bool, Any]:
-        with self._lock:
-            self._purge_locked()  # an expired record is never replayed
-            entry = self._claims.get(key)
-            if entry is None:
-                return False, None
-            if (entry.fingerprint == fingerprint and entry.receipt.transport == transport
-                    and entry.sealed and entry.cached):
-                return True, entry.response
-            return True, json.dumps({"error": "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})
-
     def _owned_locked(self, key: AttemptKey, claim: Optional[_Claim]) -> bool:
         # Identity, not equality: a replacement claim under the same key is never ours.
         return claim is not None and self._claims.get(key) is claim
@@ -395,6 +384,8 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
         return response
     except BaseException:
         if invocation is not None and invocation[2][0] is not None:
+            # A raw exception already closed its receipt; a handler-side unwind
+            # has not. The identity-checked close is idempotent in either case.
             owner._finish(invocation[0], invocation[2][0], None, exceptional=True)
         raise
     finally:
