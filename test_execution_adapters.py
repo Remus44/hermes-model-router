@@ -211,21 +211,84 @@ class LegacyBoundaryTests(unittest.TestCase):
         return adapters.dispatch_legacy(raw, transport=transport, scope="parent:shared", attempt_key=key,
             reservations=self.book)
 
-    # Audit A04: remove when F06 lands
-    @unittest.expectedFailure
-    def test_a04_native_iteration_exhaustion_is_not_normalized_as_success(self):
+    def _host_entry(self, result, *, schema=None):
         from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
 
-        entry = _build_result_entry(SimpleNamespace(model='gpt-terra'),
-            {'final_response': 'partial implementation', 'completed': False, 'api_calls': 3},
-            0, 1.0, _SchemaOutcome(None, None, [], 0))
+        return _build_result_entry(SimpleNamespace(model='gpt-terra'), result, 0, 1.0,
+            schema if schema is not None else _SchemaOutcome(None, None, [], 0))
+
+    def _receipt_for(self, results=None, **payload):
+        if results is not None:
+            payload['results'] = results
+        book = adapters.ReservationBook()
+        adapters.dispatch_legacy(lambda: json.dumps(payload), transport='hermes_codex',
+            scope='parent', reservations=book)
+        return book.records()[0]
+
+    def test_a04_native_iteration_exhaustion_is_not_normalized_as_success(self):
+        entry = self._host_entry({'final_response': 'partial implementation', 'completed': False, 'api_calls': 3})
         self.assertEqual(entry['exit_reason'], 'max_iterations')
         self.assertTrue(entry['truncated'])
-        book = adapters.ReservationBook()
-        adapters.dispatch_legacy(lambda: json.dumps({'results': [entry]}), transport='hermes_codex',
-            scope='parent', reservations=book)
-        self.assertNotEqual(book.records()[0].status, 'succeeded',
-            'real host partial/budget exhaustion became succeeded')
+
+        receipt = self._receipt_for([entry])
+
+        self.assertEqual(receipt.status, 'failed', 'real host partial/budget exhaustion became succeeded')
+        self.assertEqual(getattr(receipt, 'exit_reason', None), 'max_iterations')
+        self.assertTrue(getattr(receipt, 'truncated', False))
+        self.assertEqual(getattr(receipt, 'task_outcomes', ()), ('completed:max_iterations',))
+        self.assertEqual(receipt.observed_model, 'unknown')
+
+    def test_native_child_results_keep_terminal_partial_and_verification_evidence(self):
+        from tools.delegate_tool_child_run import _SchemaOutcome
+
+        ordinary = self._host_entry({'final_response': 'done', 'completed': True, 'api_calls': 1})
+        partial = self._host_entry({'final_response': 'unfinished', 'completed': False, 'api_calls': 3})
+        interrupted = self._host_entry({'final_response': 'Operation interrupted.', 'interrupted': True,
+            'messages': [{'role': 'assistant', 'content': 'usable partial notes'}]})
+        failure = self._host_entry({'final_response': 'provider rejected', 'failed': True,
+            'error': 'provider rejected'})
+        schema_invalid = self._host_entry({'final_response': '{bad json', 'completed': True},
+            schema=_SchemaOutcome({'type': 'object'}, False, ['invalid JSON'], 1))
+        timeout = {'status': 'timeout', 'exit_reason': 'timeout', 'truncated': False,
+            'error': 'child timed out'}
+        cases = (
+            ('ordinary', [ordinary], 'succeeded', 'completed', False, 'unknown', ('completed:completed',)),
+            ('partial', [partial], 'failed', 'max_iterations', True, 'unknown', ('completed:max_iterations',)),
+            ('interrupted', [interrupted], 'cancelled', 'interrupted', False, 'unknown', ('interrupted:interrupted',)),
+            ('failure', [failure], 'failed', 'error', False, 'unknown', ('failed:error',)),
+            ('timeout', [timeout], 'timed_out', 'timeout', False, 'unknown', ('timeout:timeout',)),
+            ('mixed', [ordinary, partial], 'failed', 'mixed', True, 'unknown',
+                ('completed:completed', 'completed:max_iterations')),
+            ('schema-invalid', [schema_invalid], 'succeeded', 'completed', False, 'failed', ('completed:completed',)),
+        )
+        for name, entries, status, exit_reason, truncated, verification, outcomes in cases:
+            with self.subTest(name=name):
+                receipt = self._receipt_for(entries)
+                self.assertEqual(receipt.status, status)
+                self.assertEqual(getattr(receipt, 'exit_reason', None), exit_reason)
+                self.assertEqual(getattr(receipt, 'truncated', None), truncated)
+                self.assertEqual(getattr(receipt, 'verification', None), verification)
+                self.assertEqual(getattr(receipt, 'task_outcomes', ()), outcomes)
+                self.assertEqual(receipt.observed_model, 'unknown')
+
+    def test_background_malformed_and_contradictory_native_results_remain_unknown(self):
+        contradictory = self._host_entry({'final_response': 'inconsistent', 'completed': False})
+        contradictory['truncated'] = False
+        cases = (
+            ('background', None, {'status': 'dispatched', 'delegation_id': 'delegation-1'}, 'delegation-1'),
+            ('malformed', None, {'results': [{'status': 'completed', 'exit_reason': 'completed',
+                'truncated': 'not-a-bool'}]}, None),
+            ('contradictory', [contradictory], {}, None),
+        )
+        for name, results, payload, handle in cases:
+            with self.subTest(name=name):
+                receipt = self._receipt_for(**payload) if results is None else self._receipt_for(results, **payload)
+                self.assertEqual(receipt.status, 'unknown')
+                self.assertEqual(getattr(receipt, 'exit_reason', None), 'unknown')
+                self.assertEqual(getattr(receipt, 'verification', None), 'unknown')
+                self.assertEqual(getattr(receipt, 'task_outcomes', ()), ())
+                if handle:
+                    self.assertEqual(receipt.handle, handle)
 
     def test_oversized_handle_is_not_silently_repaired_into_another_identifier(self):
         payload = json.dumps({"delegation_id": "d" * 300})

@@ -49,6 +49,13 @@ class LegacyReceipt:
     adjustment: str = ""
     effort: str = "unknown"
     observed_model: str = "unknown"
+    # Native child terminal and schema facts are distinct from receipt status:
+    # a usable partial result is not successful execution, and schema failure is
+    # not evidence that execution failed or that a parent accepted the output.
+    exit_reason: str = "unknown"
+    truncated: bool = False
+    verification: str = "unknown"
+    task_outcomes: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -248,14 +255,64 @@ def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
             observed_model=_identifier(payload.get("effective_model")) or "unknown")
     results = payload.get("results")
     if isinstance(results, list) and results:
-        statuses = [r.get("status") if isinstance(r, Mapping) else None for r in results]
-        terminal = {"completed", "failed", "error", "cancelled", "timeout"}
-        ids = tuple(dict.fromkeys(_identifier(r.get(k)) for r in results if isinstance(r, Mapping)
-            for k in ("subagent_id", "session_id") if _identifier(r.get(k))))[:128]
-        receipt = replace(receipt, child_ids=ids)
-        if all(isinstance(s, str) and s in terminal for s in statuses) and not payload.get("delegation_id"):
-            state = "succeeded" if all(s == "completed" for s in statuses) else "failed"
-            return replace(receipt, status=state)
+        # Pre-F06 synthetic legacy payloads exposed only per-task ``status``.
+        # Keep their established receipt shape byte-compatible; a result that
+        # supplies any of the newer terminal fields must satisfy their joint
+        # host contract below, otherwise it remains unknown.
+        if all(isinstance(result, Mapping) and "exit_reason" not in result and "truncated" not in result
+               for result in results):
+            statuses = [result.get("status") for result in results]
+            legacy_terminal = {"completed", "failed", "error", "cancelled", "timeout"}
+            ids = tuple(dict.fromkeys(_identifier(result.get(key)) for result in results
+                for key in ("subagent_id", "session_id") if _identifier(result.get(key))))[:128]
+            if all(isinstance(status, str) and status in legacy_terminal for status in statuses) and not payload.get("delegation_id"):
+                state = "succeeded" if all(status == "completed" for status in statuses) else "failed"
+                return replace(receipt, status=state, child_ids=ids)
+        terminal = {"completed", "failed", "error", "cancelled", "interrupted", "timeout"}
+        classified = []
+        child_ids = []
+        verification_values = []
+        for result in results:
+            if not isinstance(result, Mapping):
+                classified = []
+                break
+            status = _bounded(result.get("status"), 32).lower()
+            exit_reason = _bounded(result.get("exit_reason"), 32).lower()
+            truncated = result.get("truncated")
+            if status not in terminal or exit_reason == "" or not isinstance(truncated, bool):
+                classified = []
+                break
+            if status == "completed" and exit_reason == "completed" and not truncated:
+                state = "succeeded"
+            elif status == "completed" and exit_reason == "max_iterations" and truncated:
+                state = "failed"
+            elif status in {"failed", "error"} and exit_reason == "error" and not truncated:
+                state = "failed"
+            elif status == "timeout" and exit_reason == "timeout" and not truncated:
+                state = "timed_out"
+            elif status in {"cancelled", "interrupted"} and exit_reason in {"cancelled", "interrupted"} and not truncated:
+                state = "cancelled"
+            else:
+                classified = []
+                break
+            classified.append((state, status, exit_reason, truncated))
+            child_ids.extend(_identifier(result.get(key)) for key in ("subagent_id", "session_id"))
+            schema_valid = result.get("schema_valid")
+            if isinstance(schema_valid, bool):
+                verification_values.append(schema_valid)
+        if classified and len(classified) == len(results) and not payload.get("delegation_id"):
+            outcomes = tuple(f"{status}:{reason}" for _, status, reason, _ in classified)[:128]
+            ids = tuple(dict.fromkeys(child_id for child_id in child_ids if child_id))[:128]
+            states = {state for state, _, _, _ in classified}
+            reasons = {reason for _, _, reason, _ in classified}
+            status = next(iter(states)) if len(states) == 1 else (
+                "failed" if "failed" in states else "timed_out" if "timed_out" in states else "cancelled")
+            exit_reason = next(iter(reasons)) if len(reasons) == 1 else "mixed"
+            verification = "failed" if False in verification_values else (
+                "passed" if verification_values else "unknown")
+            return replace(receipt, status=status, child_ids=ids, exit_reason=exit_reason,
+                truncated=any(item[3] for item in classified), verification=verification,
+                task_outcomes=outcomes)
     # A handle proves dispatch acceptance, not completion; malformed and partial
     # responses may follow a start. Both stay unknown (traceable), but hold no slot.
     handle = next((_identifier(payload.get(k)) for k in ("delegation_id", "subagent_id", "id")
