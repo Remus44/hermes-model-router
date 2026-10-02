@@ -1653,36 +1653,59 @@ class AccountOfExecutionTests(unittest.TestCase):
                 else:
                     self.assertIn('summary_full_path', entry)
 
-    # Audit H01: remove when F07 lands
-    @unittest.expectedFailure
-    def test_h01_installed_host_runner_supports_retry_callback(self):
+    def test_h01_installed_host_runner_preserves_failure_without_retry_seam(self):
         """H01 is inherited (existed at 70125ce)."""
         from hermes_cli.middleware import run_llm_execution_middleware
 
+        with tempfile.TemporaryDirectory() as directory:
+            routes = Path(directory) / 'routes.jsonl'
+            cfg = {
+                'enabled': True, 'provider': 'openai-codex',
+                'models': {'terra': 'gpt-terra', 'spark': 'gpt-spark'},
+                'callable': {'sonnet5': True, 'opus5': True},
+                'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
+                'logging': {'enabled': True, 'path': str(routes)},
+            }
+            request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                       '[sonnet-review] Review parser'}]}
+            manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
+                                      _report_hook_failure=Mock())
+            downstream = Mock(side_effect=RuntimeError('temporary provider failure'))
+            with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
+                 patch.object(router, '_load_config', return_value=cfg), \
+                 patch.object(router, '_maybe_run_opus5', return_value=None), \
+                 patch.object(router.worker_admission, 'refusal', return_value=''), \
+                 patch.object(router, '_is_transient_provider_failure', return_value=True), \
+                 patch.object(router, '_record_tier_failure'), \
+                 patch.object(router, '_transient_fallback_model', return_value='gpt-spark'):
+                with self.assertRaisesRegex(RuntimeError, '^temporary provider failure$'):
+                    run_llm_execution_middleware(request, downstream, provider='openai-codex',
+                        api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            self.assertFalse(routes.exists(), 'an unsubmitted fallback must not create a routed-call record')
+        downstream.assert_called_once()
+
+    def test_h01_supplied_retry_callback_runs_once_when_retry_fails(self):
         cfg = {
-            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'enabled': True, 'provider': 'openai-codex',
+            'models': {'terra': 'gpt-terra', 'spark': 'gpt-spark'},
             'callable': {'sonnet5': True, 'opus5': True},
             'coding_agent': {'enabled': False, 'delegated_review': {'enabled': True}},
         }
-        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
-                   '[sonnet-review] Review parser'}]}
-        manager = SimpleNamespace(_middleware={'llm_execution': [router.run_llm_with_transient_failover]},
-                                  _report_hook_failure=Mock())
-        downstream = Mock(side_effect=[RuntimeError('temporary provider failure'), SimpleNamespace(model='gpt-spark')])
-        with patch('hermes_cli.plugins._delivery_manager', return_value=manager), \
-             patch.object(router, '_load_config', return_value=cfg), \
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content': 'Review parser'}]}
+        downstream = Mock(side_effect=RuntimeError('first transient failure'))
+        retry = Mock(side_effect=RuntimeError('retry transient failure'))
+        with patch.object(router, '_load_config', return_value=cfg), \
              patch.object(router, '_maybe_run_opus5', return_value=None), \
              patch.object(router.worker_admission, 'refusal', return_value=''), \
              patch.object(router, '_is_transient_provider_failure', return_value=True), \
              patch.object(router, '_record_tier_failure'), \
-             patch.object(router, '_log_decision'), \
              patch.object(router, '_transient_fallback_model', return_value='gpt-spark'):
-            try:
-                run_llm_execution_middleware(request, downstream, provider='openai-codex',
-                    api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
-            except Exception:
-                pass
-        self.assertEqual(downstream.call_count, 2, 'installed host runner did not supply a reusable retry callback')
+            with self.assertRaisesRegex(RuntimeError, '^retry transient failure$'):
+                router.run_llm_with_transient_failover(
+                    request=request, next_call=downstream, retry_call=retry,
+                    provider='openai-codex', api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+        downstream.assert_called_once()
+        retry.assert_called_once()
 
     def test_exact_cli_route_without_capability_evidence_refuses_without_ordinary_provider_fallback(self):
         from hermes_cli.middleware import run_llm_execution_middleware

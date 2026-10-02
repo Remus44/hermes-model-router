@@ -327,7 +327,11 @@ requested, resolved and observed: a CLI alias is not proof of the served model.
 An `exact` review requires recorded `exact_model` capability evidence and is
 refused before the CLI starts when that evidence is absent. The default
 `profile_preferred` review may use the configured ordinary provider route after
-an attempted CLI failure. For a successful CLI step-down or a response-shaped ordinary replacement, the
+an attempted CLI failure. A transient ordinary-provider failure is retried on a
+plugin-selected fallback only when the host passes a compatible `retry_call`;
+without that seam the router preserves the original downstream failure, makes no
+second `next_call` invocation, and writes no fallback routed-call record. For a
+successful CLI step-down or a response-shaped ordinary replacement, the
 router appends one compact, deterministic, plugin-owned `ROUTER SUBSTITUTION
 PROVENANCE v1` JSON line after the useful verdict. The line is hard-bounded to
 400 characters (including its prefix), so the host's dynamic 2,000-character

@@ -5721,10 +5721,9 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     """
     request = kwargs.get("request")
     next_call = kwargs.get("next_call")
-    # Current Hermes exposes an LLM-only retry callback so providers can be
-    # retried without violating the single-use downstream ``next_call`` contract.
-    # Keep the direct callable fallback for unit-level and older-host compatibility.
-    retry_call = kwargs.get("retry_call") or next_call
+    # A plugin-owned alternate request is permitted only through the host's
+    # explicit retry seam. ``next_call`` is single-use in the installed host.
+    retry_call = kwargs.get("retry_call")
     cfg = _load_config()
     provider = str(kwargs.get("provider", "")).casefold()
     configured_provider = str(cfg.get("provider", "openai-codex")).casefold()
@@ -5865,6 +5864,10 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
         if not fallback_model or not (
             quota_exhausted or unavailable or _is_transient_provider_failure(error)
         ):
+            raise
+        # Without a compatible host retry callback, the plugin must leave the
+        # original downstream failure untouched: ``next_call`` is not reusable.
+        if not callable(retry_call):
             raise
         if quota_exhausted:
             _remember_spark_quota_exhaustion(str(kwargs.get("turn_id") or ""))

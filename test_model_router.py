@@ -1434,14 +1434,17 @@ class ModelRouterTests(unittest.TestCase):
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 429: weekly quota exhausted for gpt-5.3-codex-spark")
+            raise RuntimeError("HTTP 429: weekly quota exhausted for gpt-5.3-codex-spark")
+
+        def retry_call(request):
+            calls.append(request["model"])
             self.assertEqual(request["reasoning"]["effort"], "medium")
             return "recovered by Luna"
 
         result = run_llm_with_transient_failover(
             request={**chat_request("[spark] Bounded read-only source inspection."), "model": MODELS["spark"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
 
@@ -1496,14 +1499,17 @@ class ModelRouterTests(unittest.TestCase):
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 429: weekly limit reached for this account")
+            raise RuntimeError("HTTP 429: weekly limit reached for this account")
+
+        def retry_call(request):
+            calls.append(request["model"])
             self.assertEqual(request["reasoning"]["effort"], "medium")
             return "luna-recovered"
 
         result = run_llm_with_transient_failover(
             request={**chat_request("[spark] Bounded read-only source inspection."), "model": MODELS["spark"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
 
@@ -1530,13 +1536,16 @@ class ModelRouterTests(unittest.TestCase):
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 503: upstream connect error")
+            raise RuntimeError("HTTP 503: upstream connect error")
+
+        def retry_call(request):
+            calls.append(request["model"])
             return "recovered"
 
         result = run_llm_with_transient_failover(
             request={**chat_request_with_image("Inspect this screenshot."), "model": MODELS["sol"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
         self.assertEqual(result, "recovered")
@@ -1562,13 +1571,16 @@ class ModelRouterTests(unittest.TestCase):
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 503: upstream connect error or disconnect/reset before headers")
+            raise RuntimeError("HTTP 503: upstream connect error or disconnect/reset before headers")
+
+        def retry_call(request):
+            calls.append(request["model"])
             return "recovered"
 
         result = run_llm_with_transient_failover(
             request={**chat_request("[sol] Folytasd a fejlesztést."), "model": MODELS["sol"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
 
