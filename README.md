@@ -1412,7 +1412,12 @@ native transports per active parent. Missing host delegation support refuses bef
 launch. Full attempt keys prevent reuse
 across workflows; where the host supplies session/turn/tool-call IDs, the public
 boundary deduplicates that invocation and rejects changed payloads under the same
-IDs. A legacy call with no stable invocation IDs receives observation-only IDs: a
+IDs. Ownership is acquired atomically at that public boundary before account
+admission, Claude usage/effort scoping or lifecycle annotation: only the owner
+calls the raw host seam and seals the final public response. A duplicate before
+seal reports pending/unknown; a retained duplicate after seal replays the exact
+bounded final response without a second admission, scope, audit or raw dispatch.
+A legacy call with no stable invocation IDs receives observation-only IDs: a
 later new call is not invented to be the same attempt. In-flight duplicates do not
 dispatch again, and retained terminal duplicates replay instead of re-running. Each
 completion and public seal is bound to the exact claim that started it, so a late

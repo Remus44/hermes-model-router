@@ -297,24 +297,33 @@ def dispatch_legacy(raw_dispatch: Callable[[], Any], *, transport: str, scope: s
     """
     owner = reservations if reservations is not None else RESERVATIONS
     key = attempt_key if attempt_key is not None else ("legacy", 0, transport, uuid.uuid4().hex)
-    fresh, entry = owner._begin(scope, key, None, 1, transport, fingerprint, protect=claim_cell is not None)
-    if not fresh:
-        if entry is not None and entry.cached:
-            return entry.response
-        message = "No fresh execution reservation: attempt already started/unknown or payload changed. Nothing was spawned by this call."
-        if transport == "claude_cli":
-            from .claude_opus_bridge import ClaudeBridgeFailure
-            raise ClaudeBridgeFailure(message, "concurrency")
-        return json.dumps({"error": message})
-    if claim_cell is not None:
-        claim_cell[0] = entry
+    # The registered public boundary may already own this exact claim.  In that
+    # case its final seal, rather than this raw transport seam, records the only
+    # replayable public response.  Do not begin the claim again after Claude's
+    # admission/effort scope has run.
+    entry = claim_cell[0] if claim_cell is not None else None
+    public_owner = entry is not None
+    if not public_owner:
+        fresh, entry = owner._begin(scope, key, None, 1, transport, fingerprint,
+                                    protect=claim_cell is not None)
+        if not fresh:
+            if entry is not None and entry.cached:
+                return entry.response
+            message = "No fresh execution reservation: attempt already started/unknown or payload changed. Nothing was spawned by this call."
+            if transport == "claude_cli":
+                from .claude_opus_bridge import ClaudeBridgeFailure
+                raise ClaudeBridgeFailure(message, "concurrency")
+            return json.dumps({"error": message})
+        if claim_cell is not None:
+            claim_cell[0] = entry
     try:
         raw = raw_dispatch()
     except BaseException as exc:
         typed = exc if terminal_exceptions and isinstance(exc, terminal_exceptions) else None
         owner._finish(key, entry, None, exceptional=True, failure=typed, evidence=evidence)
         raise
-    owner._finish(key, entry, raw, evidence=evidence)
+    if not public_owner:
+        owner._finish(key, entry, raw, evidence=evidence)
     return raw
 
 
@@ -350,19 +359,26 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
     invocation = None
     owner = RESERVATIONS
     if all(isinstance(value, str) and value for value in identifiers):
-        session, turn, tool_call = identifiers
+        session, turn, tool_call = (str(identifiers[0]), str(identifiers[1]), str(identifiers[2]))
         key = (session, 0, turn, tool_call)
         try:
             fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, allow_nan=False).encode()).hexdigest()
         except (TypeError, ValueError):
             return json.dumps({"error": "Legacy invocation is not a JSON-compatible tool payload. Nothing was spawned."})
-        # The cell receives the exact _Claim this invocation created, if any; only
-        # that claim is ever sealed or released by this invocation.
-        invocation = (key, fingerprint, [None])
         transport = "hermes_claude" if name == "delegate_claude" else "hermes_codex"
-        exists, response = owner._tool_response(key, fingerprint, transport)
-        if exists:
-            return response
+        # Own the public invocation before its legacy admission can read usage,
+        # enter a Claude reasoning scope or write an audit.  A duplicate can only
+        # replay a sealed final response; while its owner is still running it
+        # reports pending/unknown without touching the raw seam.
+        fresh, claim = owner._begin(f"public:{session}", key, None, 1, transport,
+                                    fingerprint, protect=True)
+        if not fresh:
+            if claim is not None and claim.sealed and claim.cached:
+                return claim.response
+            return json.dumps({"error": "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})
+        # The cell carries the exact outer owner through the raw native dispatch
+        # to final sealing/unwind; the inner boundary must never re-claim it.
+        invocation = (key, fingerprint, [claim])
     token = _NATIVE_INVOCATION.set(invocation)
     try:
         if name == "delegate_claude":
@@ -378,6 +394,10 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
         if invocation is not None and invocation[2][0] is not None:
             owner._seal_tool_response(invocation[0], invocation[2][0], response)
         return response
+    except BaseException:
+        if invocation is not None and invocation[2][0] is not None:
+            owner._finish(invocation[0], invocation[2][0], None, exceptional=True)
+        raise
     finally:
         _NATIVE_INVOCATION.reset(token)
         if invocation is not None and invocation[2][0] is not None:

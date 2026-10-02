@@ -831,25 +831,22 @@ class PublicClaimIdentityTests(unittest.TestCase):
         self.gates[goal] = (reached, resume)
         return reached, resume
 
-    # Audit A03: remove when F05 lands
-    @unittest.expectedFailure
     def test_a03_concurrent_claude_lookup_miss_replays_final_public_response(self):
         book = adapters.ReservationBook()
         parent = SimpleNamespace(_delegate_depth=0, session_id='parent')
-        lookup = book._tool_response
-        second_missed = threading.Event()
-        first_done = threading.Event()
-        results, errors, calls = {}, [], []
+        begin = book._begin
+        both_missed, release_claim = threading.Event(), threading.Event()
+        arrivals, arrival_lock = [0], threading.Lock()
+        results, errors, calls, audits = {}, [], [], []
 
-        def gated_lookup(*args):
-            answer = lookup(*args)
-            if threading.current_thread().name == 'second':
-                second_missed.set()
-                if not first_done.wait(5):
-                    raise RuntimeError('first caller stalled')
-            elif not second_missed.wait(5):
-                raise RuntimeError('second caller stalled')
-            return answer
+        def gated_begin(*args, **kwargs):
+            with arrival_lock:
+                arrivals[0] += 1
+                if arrivals[0] == 2:
+                    both_missed.set()
+            if not release_claim.wait(5):
+                raise AssertionError('both public callers did not reach atomic claim')
+            return begin(*args, **kwargs)
 
         def raw(**kwargs):
             calls.append(kwargs)
@@ -863,26 +860,36 @@ class PublicClaimIdentityTests(unittest.TestCase):
                     session_id='wf', turn_id='turn', tool_call_id='same-call')
             except BaseException as exc:
                 errors.append(exc)
-            finally:
-                if label == 'first':
-                    first_done.set()
 
         with patch.object(adapters, 'RESERVATIONS', book), \
-             patch.object(book, '_tool_response', side_effect=gated_lookup), \
+             patch.object(book, '_begin', side_effect=gated_begin), \
              patch.object(router, '_load_config', return_value=_cfg()), \
              patch.object(claude, '_host', return_value=(raw, lambda: parent)), \
              patch.object(claude, 'install_reasoning_bridge', return_value=(True, '')), \
              patch.object(claude.usage_guard, 'read', return_value=_reading(10)), \
-             patch.object(claude, '_log'):
+             patch.object(claude.usage_guard, 'apply', wraps=claude.usage_guard.apply) as apply, \
+             patch.object(claude, '_log', side_effect=lambda _cfg, entry: audits.append(entry)):
+            first = threading.Thread(target=invoke, args=('first',), name='first')
             second = threading.Thread(target=invoke, args=('second',), name='second')
+            first.start()
             second.start()
-            invoke('first')
+            self.assertTrue(both_missed.wait(5))
+            release_claim.set()
+            first.join(6)
             second.join(6)
+            replay = adapters.guard_legacy_tool_execution(tool_name='delegate_claude',
+                args={'tier': 'sonnet', 'goal': 'review'}, next_call=claude.handle_delegate_claude,
+                session_id='wf', turn_id='turn', tool_call_id='same-call')
+        self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertFalse(errors, repr(errors))
         self.assertEqual(len(calls), 1)
-        self.assertEqual(results['second'], results['first'],
-            f'concurrent replay was re-annotated: {results}')
+        self.assertEqual(apply.call_count, 1)
+        self.assertEqual(len(audits), 1)
+        self.assertIn(results['first'], (replay, json.dumps({'error': 'Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.'})))
+        self.assertIn(results['second'], (replay, json.dumps({'error': 'Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.'})))
+        self.assertEqual(replay, next(result for result in results.values() if result == replay),
+            f'completed replay was not byte-equivalent: {results}')
 
     def test_old_public_completion_never_overwrites_or_unprotects_replacement_claim(self):
         # N3 interleaving from re-review 2, driven through the public middleware.
