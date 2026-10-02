@@ -886,10 +886,9 @@ class PublicClaimIdentityTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(apply.call_count, 1)
         self.assertEqual(len(audits), 1)
-        self.assertIn(results['first'], (replay, json.dumps({'error': 'Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.'})))
-        self.assertIn(results['second'], (replay, json.dumps({'error': 'Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.'})))
-        self.assertEqual(replay, next(result for result in results.values() if result == replay),
-            f'completed replay was not byte-equivalent: {results}')
+        pending = json.dumps({'error': 'Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.'})
+        self.assertTrue(all(result in (replay, pending) for result in results.values()))
+        self.assertIn(replay, results.values())
 
     def test_public_haiku_receipt_keeps_not_applicable_effort(self):
         raw_calls = []
@@ -928,6 +927,183 @@ class PublicClaimIdentityTests(unittest.TestCase):
         self.assertEqual(receipt.resolved_tier, "sonnet")
         self.assertIn("opus", receipt.adjustment)
         self.assertEqual(len(raw_calls), 1)
+
+    def test_identical_claude_duplicate_before_seal_is_pending_then_replays_once(self):
+        raw_calls, scopes, audits = [], [], []
+        paused, release = self.event(), self.event()
+        real_annotate, real_scope = claude._annotate, claude.reasoning_scope
+        @contextmanager
+        def counted_scope(*args, **kwargs):
+            scopes.append(1)
+            with real_scope(*args, **kwargs) as scope:
+                yield scope
+        def raw(**kwargs):
+            raw_calls.append(kwargs)
+            claude._REASONING_SCOPE.get().applied[0] += 1
+            return self.result("one")
+        def paused_annotate(*args, **kwargs):
+            paused.set()
+            self.assertTrue(release.wait(5))
+            return real_annotate(*args, **kwargs)
+        def call():
+            return adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "one", "tier": "sonnet"}, next_call=claude.handle_delegate_claude,
+                session_id="duplicate", turn_id="turn", tool_call_id="before-seal")
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude, "reasoning_scope", counted_scope), \
+             patch.object(claude, "_annotate", paused_annotate), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)) as read, \
+             patch.object(claude.usage_guard, "apply", wraps=claude.usage_guard.apply) as apply, \
+             patch.object(claude, "_log", side_effect=lambda _cfg, entry: audits.append(entry)):
+            thread, box = self.spawn(call)
+            self.assertTrue(paused.wait(5))
+            pending = call()
+            self.assertEqual(json.loads(pending)["error"],
+                "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call.")
+            release.set()
+            thread.join(5)
+            first = box.get("result")
+            self.assertEqual(call(), first)
+        self.assertEqual((len(raw_calls), read.call_count, apply.call_count, len(scopes), len(audits)), (1, 1, 1, 1, 1))
+
+    def test_loser_gated_in_begin_after_seal_replays_without_reannotation(self):
+        raw_calls, scopes, audits = [], [], []
+        annotation_paused, release_annotation = self.event(), self.event()
+        loser_entered, release_loser = self.event(), self.event()
+        real_begin, real_annotate, real_scope = self.book._begin, claude._annotate, claude.reasoning_scope
+        public_calls, begin_lock = [0], threading.Lock()
+        @contextmanager
+        def counted_scope(*args, **kwargs):
+            scopes.append(1)
+            with real_scope(*args, **kwargs) as scope:
+                yield scope
+        def gated_begin(*args, **kwargs):
+            if args[0].startswith("public:"):
+                with begin_lock:
+                    public_calls[0] += 1
+                    loser = public_calls[0] == 2
+                if loser:
+                    loser_entered.set()
+                    self.assertTrue(release_loser.wait(5))
+            return real_begin(*args, **kwargs)
+        def raw(**kwargs):
+            raw_calls.append(kwargs)
+            claude._REASONING_SCOPE.get().applied[0] += 1
+            return self.result("sealed")
+        def paused_annotate(*args, **kwargs):
+            annotation_paused.set()
+            self.assertTrue(release_annotation.wait(5))
+            return real_annotate(*args, **kwargs)
+        def call():
+            return adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "sealed", "tier": "sonnet"}, next_call=claude.handle_delegate_claude,
+                session_id="duplicate", turn_id="turn", tool_call_id="after-seal")
+        with patch.object(self.book, "_begin", side_effect=gated_begin), \
+             patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude, "reasoning_scope", counted_scope), \
+             patch.object(claude, "_annotate", paused_annotate), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)) as read, \
+             patch.object(claude.usage_guard, "apply", wraps=claude.usage_guard.apply) as apply, \
+             patch.object(claude, "_log", side_effect=lambda _cfg, entry: audits.append(entry)):
+            owner, owner_box = self.spawn(call)
+            self.assertTrue(annotation_paused.wait(5))
+            loser, loser_box = self.spawn(call)
+            self.assertTrue(loser_entered.wait(5))
+            release_annotation.set()
+            owner.join(5)
+            release_loser.set()
+            loser.join(5)
+        self.assertEqual(loser_box.get("result"), owner_box.get("result"))
+        self.assertEqual((len(raw_calls), read.call_count, apply.call_count, len(scopes), len(audits)), (1, 1, 1, 1, 1))
+
+    def test_sealed_claude_duplicate_ignores_later_usage_and_settings_changes(self):
+        cfg, raw_calls, audits = _cfg(), [], []
+        def raw(**kwargs):
+            raw_calls.append(kwargs)
+            claude._REASONING_SCOPE.get().applied[0] += 1
+            return self.result("original")
+        def call():
+            return adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "original", "tier": "opus"}, next_call=claude.handle_delegate_claude,
+                session_id="duplicate", turn_id="turn", tool_call_id="settings")
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)) as read, \
+             patch.object(claude.usage_guard, "apply", wraps=claude.usage_guard.apply) as apply, \
+             patch.object(claude, "_log", side_effect=lambda _cfg, entry: audits.append(entry)):
+            first = call()
+            cfg["claude_delegation"]["disabled"] = ["opus5", "sonnet5"]
+            read.return_value = _reading(95.0)
+            duplicate = call()
+        self.assertEqual(duplicate, first)
+        self.assertEqual((len(raw_calls), read.call_count, apply.call_count, len(audits)), (1, 1, 1, 1))
+
+    def test_public_claude_base_exception_unwinds_to_unknown_and_blocks_duplicate(self):
+        raw_calls = []
+        class Fatal(BaseException):
+            pass
+        def raw(**kwargs):
+            raw_calls.append(kwargs)
+            raise Fatal("raw lost")
+        def call():
+            return adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "fatal", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
+                session_id="duplicate", turn_id="turn", tool_call_id="fatal")
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+            with self.assertRaises(Fatal):
+                call()
+            duplicate = call()
+        receipt = self.book.record(("duplicate", 0, "turn", "fatal"))
+        self.assertEqual(receipt.status, "unknown")
+        with self.book._lock:
+            claim = self.book._claims[("duplicate", 0, "turn", "fatal")]
+            self.assertFalse(claim.protected)
+            self.assertFalse(claim.in_flight)
+        self.assertIn("error", json.loads(duplicate))
+        self.assertEqual(len(raw_calls), 1)
+
+    def test_oversized_public_responses_return_to_owner_and_block_duplicates(self):
+        oversized = "x" * (adapters._MAX_CACHED_RESPONSE + 1)
+        codex_calls, claude_calls = [], []
+        codex = adapters.guard_legacy_tool_execution(tool_name="delegate_task", args={"goal": "large"},
+            next_call=lambda sent: codex_calls.append(sent) or oversized,
+            session_id="oversized", turn_id="turn", tool_call_id="codex")
+        codex_duplicate = adapters.guard_legacy_tool_execution(tool_name="delegate_task", args={"goal": "large"},
+            next_call=lambda sent: codex_calls.append(sent) or "SHOULD NOT START",
+            session_id="oversized", turn_id="turn", tool_call_id="codex")
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(lambda **kwargs: claude_calls.append(kwargs) or oversized, lambda: self.parent)), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+            claude_response = adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "large", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
+                session_id="oversized", turn_id="turn", tool_call_id="claude")
+            claude_duplicate = adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "large", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
+                session_id="oversized", turn_id="turn", tool_call_id="claude")
+        self.assertEqual((codex, claude_response), (oversized, oversized))
+        self.assertIn("error", json.loads(codex_duplicate))
+        self.assertIn("error", json.loads(claude_duplicate))
+        self.assertEqual((len(codex_calls), len(claude_calls)), (1, 1))
+
+    def test_changed_transport_under_public_ids_is_rejected_before_claude_usage_read(self):
+        codex_calls = []
+        first = adapters.guard_legacy_tool_execution(tool_name="delegate_task", args={"goal": "same"},
+            next_call=lambda sent: codex_calls.append(sent) or self.result("codex"),
+            session_id="transport", turn_id="turn", tool_call_id="same")
+        with patch.object(claude.usage_guard, "read", side_effect=AssertionError("duplicate read usage")) as read:
+            changed = adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "same", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
+                session_id="transport", turn_id="turn", tool_call_id="same")
+        self.assertEqual(first, self.result("codex"))
+        self.assertIn("error", json.loads(changed))
+        self.assertEqual((len(codex_calls), read.call_count), (1, 0))
 
     def test_old_public_completion_never_overwrites_or_unprotects_replacement_claim(self):
         # N3 interleaving from re-review 2, driven through the public middleware.
