@@ -335,12 +335,17 @@ minimum summary budget retains the complete line in its 500-character tail,
 whether or not the full-summary spill succeeds. It carries the marker version,
 kind, carrier, requested and resolved/admitted targets, actual provider/model
 (or `unknown`), policy/failure code, `satisfies_cross_provider_review: false`,
-and a short `ref`; for an ordinary replacement, the existing Claude audit event
+and a short `ref`; successful CLI step-downs carry canonical `modelUsage` and
+Anthropic transport-owner facts, with `ref` resolving to the bridge lifecycle
+record. Parent-visible values are ASCII-safe and visibly suffixed when altered
+or shortened. For an ordinary replacement, the existing Claude audit event
 contains the fuller replacement record under that reference. That content survives the supported
 Codex Responses normalization, child-result projection, and parent summary
-budgeting; arbitrary response attributes do not. If an operator configures
-`delegation.max_summary_chars` below 400, the static ceiling wins over the host
-floor and this parent-visible survival guarantee no longer applies.
+budgeting; arbitrary response attributes do not. Survival under a configured
+static `delegation.max_summary_chars` requires roughly four times the marker
+length (about 1,600 for the 400-character maximum), because the host retains
+only a newline-snapped 25% tail; below that threshold the parent-visible
+survival guarantee is void. The dynamic 2,000-character floor is safe.
 When the replacement's first reply is only reasoning, commentary or a tool call
 and the child continues its turn, the router keeps the provenance for that turn
 (bounded, cleared at turn end) and appends the line to the reply that ends it;
