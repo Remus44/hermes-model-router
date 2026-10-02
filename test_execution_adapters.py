@@ -217,6 +217,77 @@ class LegacyBoundaryTests(unittest.TestCase):
         return _build_result_entry(SimpleNamespace(model='gpt-terra'), result, 0, 1.0,
             schema if schema is not None else _SchemaOutcome(None, None, [], 0))
 
+    def _host_timeout_entry(self, status):
+        # Exact key set of the await_child timeout/exception entry in
+        # tools/delegate_tool_child_run.py (no ``truncated`` key).
+        is_timeout = status == 'timeout'
+        return {'task_index': 0, 'status': status, 'summary': None, 'error': 'child failed',
+            'exit_reason': status, 'api_calls': 2, 'duration_seconds': 3.0,
+            'timeout_seconds': 30 if is_timeout else None,
+            'timed_out_after_seconds': 3.0 if is_timeout else None,
+            'timeout_phase': 'after_llm_calls' if is_timeout else None,
+            'last_event_age': 1.0 if is_timeout else None, '_child_role': None, 'diagnostic_path': None}
+
+    def _fabricated(self, status):
+        from tools.delegate_tool_child_run import _fabricated_entry
+
+        return _fabricated_entry(1, status, 'child never finished', SimpleNamespace())
+
+    def test_host_timeout_and_exception_entries_without_truncated_are_classified(self):
+        for status, state in (('timeout', 'timed_out'), ('error', 'failed')):
+            with self.subTest(status=status):
+                receipt = self._receipt_for([self._host_timeout_entry(status)])
+                self.assertEqual(receipt.status, state)
+                self.assertEqual(receipt.exit_reason, status)
+                self.assertIs(receipt.truncated, False)
+                self.assertEqual(receipt.task_outcomes, (f'{status}:{status}',))
+
+    def test_host_failed_entries_with_budget_or_empty_response_are_failed(self):
+        cases = (
+            ({'final_response': '', 'completed': False}, 'max_iterations', True, 'failed:max_iterations'),
+            ({'final_response': '(empty)', 'completed': True}, 'completed', False, 'failed:completed'),
+        )
+        for result, reason, truncated, outcome in cases:
+            with self.subTest(reason=reason):
+                entry = self._host_entry(result)
+                self.assertEqual((entry['status'], entry['exit_reason'], entry['truncated']),
+                    ('failed', reason, truncated))
+                receipt = self._receipt_for([entry])
+                self.assertEqual(receipt.status, 'failed')
+                self.assertEqual(receipt.exit_reason, reason)
+                self.assertIs(receipt.truncated, truncated)
+                self.assertEqual(receipt.task_outcomes, (outcome,))
+
+    def test_fabricated_entries_keep_per_task_outcomes_in_mixed_batches(self):
+        ok = self._host_entry({'final_response': 'done', 'completed': True, 'api_calls': 1})
+        interrupted = self._receipt_for([ok, self._fabricated('interrupted')])
+        self.assertEqual(interrupted.status, 'cancelled')
+        self.assertEqual(interrupted.exit_reason, 'mixed')
+        self.assertEqual(interrupted.task_outcomes, ('completed:completed', 'interrupted:unknown'))
+        failed = self._receipt_for([ok, self._fabricated('error')])
+        self.assertEqual(failed.status, 'failed')
+        self.assertEqual(failed.task_outcomes, ('completed:completed', 'error:unknown'))
+        timed_out = self._receipt_for([ok, self._host_timeout_entry('timeout'), self._fabricated('interrupted')])
+        self.assertEqual(timed_out.status, 'timed_out', 'precedence is failed > timed_out > cancelled')
+
+    def test_lone_fabricated_entries_are_classified_explicitly(self):
+        self.assertEqual(self._receipt_for([self._fabricated('error')]).status, 'failed')
+        self.assertEqual(self._receipt_for([self._fabricated('interrupted')]).status, 'cancelled')
+
+    def test_contradictory_host_pairs_stay_unknown(self):
+        base = self._host_entry({'final_response': 'done', 'completed': True, 'api_calls': 1})
+        cases = (('completed', 'max_iterations', False), ('completed', 'completed', True),
+            ('bogus', 'completed', False), ('completed', 'completed', 'no'))
+        for status, reason, truncated in cases:
+            with self.subTest(pair=(status, reason, truncated)):
+                entry = dict(base, status=status, exit_reason=reason, truncated=truncated)
+                receipt = self._receipt_for([entry])
+                self.assertEqual(receipt.status, 'unknown')
+                self.assertEqual(receipt.task_outcomes, ())
+        entry = {k: v for k, v in base.items() if k != 'truncated'}
+        entry.update(status='completed', exit_reason='max_iterations')
+        self.assertEqual(self._receipt_for([entry]).status, 'unknown')
+
     def _receipt_for(self, results=None, **payload):
         if results is not None:
             payload['results'] = results
@@ -249,8 +320,7 @@ class LegacyBoundaryTests(unittest.TestCase):
             'error': 'provider rejected'})
         schema_invalid = self._host_entry({'final_response': '{bad json', 'completed': True},
             schema=_SchemaOutcome({'type': 'object'}, False, ['invalid JSON'], 1))
-        timeout = {'status': 'timeout', 'exit_reason': 'timeout', 'truncated': False,
-            'error': 'child timed out'}
+        timeout = self._host_timeout_entry('timeout')
         cases = (
             ('ordinary', [ordinary], 'succeeded', 'completed', False, 'unknown', ('completed:completed',)),
             ('partial', [partial], 'failed', 'max_iterations', True, 'unknown', ('completed:max_iterations',)),

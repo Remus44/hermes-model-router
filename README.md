@@ -1400,16 +1400,25 @@ proof. CLI observed model evidence comes only from its validated bridge result.
 Malformed/partial responses, background acceptance and ambiguous exceptions remain
 `unknown` in the receipt; a top-level `{"error": ...}` payload and a typed
 `ClaudeBridgeFailure` are recorded as `failed` (`timed_out` for a CLI timeout).
-For native child entries carrying the host's complete `status`/`exit_reason`/
-`truncated` vocabulary, receipts also retain bounded `exit_reason`, `truncated`,
+For native child entries, receipts also retain bounded `exit_reason`, `truncated`,
 ordered per-task outcomes and separate schema `verification` evidence. A normal
 completed child is `succeeded`; genuine `max_iterations` output is `failed` with
 its usable partial summary still in the unchanged host payload; interruption is
-`cancelled`; timeout is `timed_out`; and explicit execution error is `failed`.
-Mixed batches retain their per-task outcomes and use `exit_reason="mixed"` rather
-than claiming uniform completion. `schema_valid: false` records
-`verification="failed"` without changing an otherwise completed execution into
-verified/accepted work. Contradictory entries with those fields stay `unknown`.
+`cancelled`; and a host `failed` entry (including `max_iterations` with no usable
+summary or a `completed` child with an empty response) is `failed`. The host's
+timeout/exception entries carry `exit_reason` but no `truncated` key: a missing
+`truncated` counts as `false` there, so `timeout` is `timed_out` and `error` is
+`failed`. A host-fabricated entry (child raised or never finished: no
+`exit_reason`/`truncated`) is classified per task from its status, with
+`exit_reason` recorded as `unknown`. Mixed batches retain their per-task outcomes
+and use `exit_reason="mixed"`; the batch status follows the precedence
+`failed` > `timed_out` > `cancelled` (`succeeded` only when all tasks succeeded).
+Batch `verification` looks only at entries reporting `schema_valid`: any `false`
+gives `failed`, otherwise any `true` gives `passed`, otherwise `unknown`; tasks
+without a schema are ignored. `schema_valid: false` never turns an otherwise
+completed execution into verified/accepted work. Contradictory pairs, an unknown
+status, a non-boolean `truncated`, or a `max_iterations` entry lacking
+`truncated` stay `unknown`.
 The older status-only synthetic result shape remains compatible with its prior
 receipt classification. Native `child.model` remains unobserved identity.
 None of them keeps the record in flight after the call returns: the host exposes no

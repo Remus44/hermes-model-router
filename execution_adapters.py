@@ -279,20 +279,48 @@ def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
             status = _bounded(result.get("status"), 32).lower()
             exit_reason = _bounded(result.get("exit_reason"), 32).lower()
             truncated = result.get("truncated")
-            if status not in terminal or exit_reason == "" or not isinstance(truncated, bool):
+            if status not in terminal or ("truncated" in result and not isinstance(truncated, bool)):
                 classified = []
                 break
-            if status == "completed" and exit_reason == "completed" and not truncated:
-                state = "succeeded"
-            elif status == "completed" and exit_reason == "max_iterations" and truncated:
-                state = "failed"
-            elif status in {"failed", "error"} and exit_reason == "error" and not truncated:
-                state = "failed"
-            elif status == "timeout" and exit_reason == "timeout" and not truncated:
-                state = "timed_out"
-            elif status in {"cancelled", "interrupted"} and exit_reason in {"cancelled", "interrupted"} and not truncated:
-                state = "cancelled"
+            if exit_reason == "" and "truncated" not in result:
+                # Host-fabricated entry (raised/abandoned child): no exit_reason or
+                # truncated key. Classified per task from its status alone.
+                exit_reason, truncated = "unknown", False
+                if status in {"failed", "error"}:
+                    state = "failed"
+                elif status == "timeout":
+                    state = "timed_out"
+                elif status in {"cancelled", "interrupted"}:
+                    state = "cancelled"
+                else:
+                    state = ""
+            elif exit_reason == "":
+                state = ""
             else:
+                if "truncated" not in result:
+                    # The host's timeout/exception entry omits ``truncated``: that is
+                    # not truncation evidence, except for a budget stop, which
+                    # must state it.
+                    truncated = False if exit_reason != "max_iterations" else None
+                if truncated is None:
+                    state = ""
+                elif status == "completed" and exit_reason == "completed" and not truncated:
+                    state = "succeeded"
+                elif status == "completed" and exit_reason == "max_iterations" and truncated:
+                    state = "failed"
+                elif status == "failed" and exit_reason == "max_iterations" and truncated:
+                    state = "failed"  # host: budget stop with no usable summary
+                elif status == "failed" and exit_reason == "completed" and not truncated:
+                    state = "failed"  # host: completed child with an empty final response
+                elif status in {"failed", "error"} and exit_reason == "error" and not truncated:
+                    state = "failed"
+                elif status == "timeout" and exit_reason == "timeout" and not truncated:
+                    state = "timed_out"
+                elif status in {"cancelled", "interrupted"} and exit_reason in {"cancelled", "interrupted"} and not truncated:
+                    state = "cancelled"
+                else:
+                    state = ""
+            if not state:
                 classified = []
                 break
             classified.append((state, status, exit_reason, truncated))
@@ -305,9 +333,14 @@ def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
             ids = tuple(dict.fromkeys(child_id for child_id in child_ids if child_id))[:128]
             states = {state for state, _, _, _ in classified}
             reasons = {reason for _, _, reason, _ in classified}
+            # Batch precedence: failed > timed_out > cancelled (> succeeded only when
+            # every task succeeded). Per-task outcomes stay in ``task_outcomes``.
             status = next(iter(states)) if len(states) == 1 else (
                 "failed" if "failed" in states else "timed_out" if "timed_out" in states else "cancelled")
             exit_reason = next(iter(reasons)) if len(reasons) == 1 else "mixed"
+            # Batch verification aggregates only entries that reported schema_valid:
+            # any False -> failed; else any True -> passed (tasks without a schema
+            # are ignored); none reported -> unknown.
             verification = "failed" if False in verification_values else (
                 "passed" if verification_values else "unknown")
             return replace(receipt, status=status, child_ids=ids, exit_reason=exit_reason,
