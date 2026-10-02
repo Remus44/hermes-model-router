@@ -1369,10 +1369,13 @@ class AccountOfExecutionTests(unittest.TestCase):
              patch.object(router, '_load_config', return_value=self.N1_CFG), \
              patch.object(router, 'run_llm_with_transient_failover') as middleware, \
              patch.dict(os.environ, env, clear=True):
-            final, reason, _ = _resolve_budget_fallback(
+            fallback = _resolve_budget_fallback(
                 agent, final_response=None, api_call_count=3, interrupted=False, failed=False,
                 messages=messages, _turn_exit_reason='budget_exhausted', _pending_verification_response=None,
                 _pending_verification_response_previewed=False, logger=log)
+            final, reason = fallback[0], fallback[1]
+            if len(fallback) == 4:
+                self.assertFalse(fallback[3])
             final, transformed, pre_transform = _apply_output_hooks(
                 agent, final, log, platform='subagent', effective_task_id='sa-0', turn_id=turn,
                 original_user_message='[opus-review] Review parser', messages=messages)
