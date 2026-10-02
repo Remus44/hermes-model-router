@@ -891,6 +891,44 @@ class PublicClaimIdentityTests(unittest.TestCase):
         self.assertEqual(replay, next(result for result in results.values() if result == replay),
             f'completed replay was not byte-equivalent: {results}')
 
+    def test_public_haiku_receipt_keeps_not_applicable_effort(self):
+        raw_calls = []
+        def raw(**kwargs):
+            raw_calls.append(kwargs)
+            return self.result("haiku")
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(10.0)):
+            response = adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "receipt", "tier": "haiku"}, next_call=claude.handle_delegate_claude,
+                session_id="receipt", turn_id="turn", tool_call_id="haiku")
+        self.assertNotIn("error", json.loads(response))
+        receipt = self.book.record(("receipt", 0, "turn", "haiku"))
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.effort, "not_applicable")
+        self.assertEqual(receipt.resolved_tier, "haiku")
+        self.assertEqual(len(raw_calls), 1)
+
+    def test_public_claude_non_json_result_keeps_resolved_tier_and_adjustment(self):
+        raw_calls = []
+        def raw(**kwargs):
+            raw_calls.append(kwargs)
+            claude._REASONING_SCOPE.get().applied[0] += 1
+            return "not json"
+        with patch.object(router, "_load_config", return_value=_cfg()), \
+             patch.object(claude, "_host", return_value=(raw, lambda: self.parent)), \
+             patch.object(claude, "install_reasoning_bridge", return_value=(True, "")), \
+             patch.object(claude.usage_guard, "read", return_value=_reading(75.0)):
+            response = adapters.guard_legacy_tool_execution(tool_name="delegate_claude",
+                args={"goal": "receipt", "tier": "opus"}, next_call=claude.handle_delegate_claude,
+                session_id="receipt", turn_id="turn", tool_call_id="non-json")
+        self.assertEqual(response, "not json")
+        receipt = self.book.record(("receipt", 0, "turn", "non-json"))
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.resolved_tier, "sonnet")
+        self.assertIn("opus", receipt.adjustment)
+        self.assertEqual(len(raw_calls), 1)
+
     def test_old_public_completion_never_overwrites_or_unprotects_replacement_claim(self):
         # N3 interleaving from re-review 2, driven through the public middleware.
         key, calls = ("s", 0, "t", "K"), []

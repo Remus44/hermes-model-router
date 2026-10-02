@@ -245,7 +245,7 @@ def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
     payload = _payload(raw)
     facts = evidence or payload
     receipt = replace(receipt, resolved_tier=_bounded(facts.get("claude_tier")) or receipt.resolved_tier,
-        adjustment=_bounded(facts.get("tier_adjusted"), 512),
+        adjustment=_bounded(facts.get("tier_adjusted"), 512) or receipt.adjustment,
         effort=_bounded(facts.get("reasoning_effort")) or receipt.effort)
     if failure is not None:
         # A typed terminal outcome (ClaudeBridgeFailure) is not ambiguous.
@@ -322,8 +322,7 @@ def dispatch_legacy(raw_dispatch: Callable[[], Any], *, transport: str, scope: s
         typed = exc if terminal_exceptions and isinstance(exc, terminal_exceptions) else None
         owner._finish(key, entry, None, exceptional=True, failure=typed, evidence=evidence)
         raise
-    if not public_owner:
-        owner._finish(key, entry, raw, evidence=evidence)
+    owner._finish(key, entry, raw, evidence=evidence)
     return raw
 
 
