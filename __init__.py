@@ -31,6 +31,7 @@ from . import runtime_capabilities
 from . import target_identity
 from . import usage_guard
 from . import worker_admission
+from . import triage
 from .hermes_paths import hermes_path
 
 _logger = logging.getLogger("model_router")
@@ -152,6 +153,15 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         # was missed (for example, a process that loaded an older plugin).
         "rescue_min_calls": 6,
         "path": "~/.hermes/logs/terra-spark-orchestration.jsonl",
+    },
+    # The parent triages each actionable user turn itself (triage.py): solo or
+    # workers. While it is on it supersedes the forced conductor and the
+    # low-risk task_budget below, and owns the worker budget of the turn.
+    "triage": {
+        "enabled": False,
+        "max_workers_per_turn": 4,
+        "max_children_per_worker": 1,
+        "path": "~/.hermes/logs/model-router-triage.jsonl",
     },
     # A short, clear request must not pay for a planner plus a recursive tree of
     # workers.  This guard applies only to bounded low-risk dispatches; complex
@@ -3925,6 +3935,33 @@ def _routing_note(request: Dict[str, Any], kwargs: Dict[str, Any], cfg: Dict[str
     return "\n\n" + "\n".join(lines) + "\n"
 
 
+def _triage_request(
+    kwargs: Dict[str, Any], cfg: Dict[str, Any], decision: RouteDecision
+) -> Optional[Dict[str, Any]]:
+    """The forced triage call for this request, or None when it gets none."""
+    if not triage.enabled(cfg):
+        return None
+    request = kwargs.get("request")
+    try:
+        kind = classify_request(request, api_call_count=1, config=cfg).kind if isinstance(request, dict) else ""
+    except Exception:
+        kind = ""
+    reason = triage.skip_reason(kwargs, cfg, kind)
+    if reason is None and not _supports_forced_tool_choice(kwargs, decision):
+        reason = "no_forced_tool_choice"
+    forced = triage.force(request, cfg, anthropic=_is_anthropic_shaped(request)) if reason is None else None
+    if reason is None and forced is None:
+        reason = "no_triage_tool"
+    # Mid-loop and worker calls are every call but one: logging them buries the signal.
+    if reason not in {"mid_loop_call", "subagent_turn"}:
+        triage._log(cfg, {
+            "event": "triage_forced" if forced is not None else "triage_skipped",
+            "reason": reason, "kind": kind, "turn_id": str(kwargs.get("turn_id") or ""),
+            "parent_model": decision.tier, "prompt_preview": _prompt_preview(request or {})[:160],
+        })
+    return forced
+
+
 def route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Hermes llm_request middleware entrypoint.
 
@@ -3992,7 +4029,8 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
         decision = RouteDecision(
             external_parent, active_model, "external delegation target", "external",
         )
-        forced = _force_terra_supervisor_preflight(kwargs, cfg, decision)
+        forced = (_triage_request(kwargs, cfg, decision) if triage.enabled(cfg)
+                  else _force_terra_supervisor_preflight(kwargs, cfg, decision))
         # A conductor on Claude reaches this branch and returns early, so the
         # stopped-worker notice would never have been attached for exactly the
         # setup that needs it most: the `code` chain puts the conductor on an
@@ -4006,9 +4044,10 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
             else ""
         )
         # The forced preflight already carries the full contract; the note is for
-        # the turns it leaves alone.
+        # the turns it leaves alone. A triage call needs it: it is what the
+        # parent decides its routes from.
         note = ""
-        if forced is None:
+        if forced is None or triage.enabled(cfg):
             try:
                 note = (_worker_order_note(request, cfg) if subagent_marker
                         else _routing_note(request, kwargs, cfg))
@@ -4156,11 +4195,16 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     # Rules above may intentionally rewrite the tier (root labels, subagents,
     # quota). Re-validate the final destination immediately before dispatch.
     decision = _require_callable(decision, cfg)
-    # Any parent tier may orchestrate; _orchestration_skip_reason owns the gates.
-    forced_preflight_request = _force_terra_supervisor_preflight(kwargs, cfg, decision)
+    # Triage, when on, replaces the forced conductor: the parent decides itself.
+    # Otherwise any parent tier may orchestrate; _orchestration_skip_reason owns the gates.
+    triage_request = _triage_request(kwargs, cfg, decision)
+    forced_preflight_request = (
+        None if triage.enabled(cfg) else _force_terra_supervisor_preflight(kwargs, cfg, decision)
+    )
     forced_shadow_request = (
         _force_shadow_delegation_if_eligible(kwargs, cfg)
-        if decision.tier == str(cfg.get("default_model", "terra")) and forced_preflight_request is None
+        if decision.tier == str(cfg.get("default_model", "terra"))
+        and forced_preflight_request is None and triage_request is None
         else None
     )
     # The orchestration gates above must see the tier this request actually
@@ -4216,7 +4260,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
                 reason=f"Claude review not taken ({reason}); ran as an ordinary {decision.tier} worker",
             )
 
-    routed = forced_preflight_request or forced_shadow_request or dict(request)
+    routed = forced_preflight_request or triage_request or forced_shadow_request or dict(request)
     # A worker that died on an account limit is the one failure the conductor
     # cannot act on from the envelope alone. Attached here, after the forced
     # requests, so it survives whichever of them produced ``routed``; deep-copied
@@ -6191,9 +6235,14 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         return None
     try:
         cfg = _load_config()
-        bounded = _bounded_dispatch_block(args, cfg, str(_.get("turn_id") or ""))
-        if bounded:
-            return {"action": "block", "message": bounded}
+        if triage.enabled(cfg):
+            over_budget = triage.spawn_block(tool_name, args, cfg, _)
+            if over_budget:
+                return {"action": "block", "message": over_budget}
+        else:
+            bounded = _bounded_dispatch_block(args, cfg, str(_.get("turn_id") or ""))
+            if bounded:
+                return {"action": "block", "message": bounded}
         declined = _declined_conductor_goal(args, cfg, str(_.get("turn_id") or ""))
         if declined:
             return {"action": "block", "message": declined}
@@ -6251,3 +6300,4 @@ def register(ctx: Any) -> None:
     ctx.register_hook("subagent_stop", on_subagent_stop)
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
     claude_delegation.register(ctx)
+    triage.register(ctx, _load_config())

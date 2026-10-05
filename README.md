@@ -153,6 +153,49 @@ The router advertises a `model` parameter only when the host exposes it; otherwi
 Codex labels choose models within the configured provider and Claude workers use
 `delegate_claude`.
 
+#### Triage: the parent decides
+
+The model that receives the prompt decides who does the work. On the first call
+of an actionable user turn the router narrows the toolset to `triage_task` (reached
+through the `tool_call` bridge, because Hermes defers plugin tools) and the parent
+records `decision: solo` or `decision: delegate`, with a kind, a scope, a one-line
+rationale and, for `delegate`, the planned subtasks and their routes. The routing
+note (preferred routes per kind of work, account usage) travels with that call.
+The next call has the full toolset again, and the tool result tells the parent what
+follows from its own decision.
+
+Questions and short remarks with no imperative in them ("mi a következő
+kritikus?", "ment a levél") skip triage, as do workers, later calls of a turn,
+memory reviews, delegation completions and background-process notices. A short
+go-ahead after a discussion ("rendben, csináld meg!") is triaged: it stands for the
+whole discussed plan. A Claude parent with thinking on is asked rather than forced,
+because Anthropic refuses a forced tool choice while thinking.
+
+While triage is on it replaces the forced conductor and the small-task budget, and
+the router enforces the worker budget on every `delegate_task` and `delegate_claude`
+spawn:
+
+- at most `max_workers_per_turn` (4) workers per user turn, sub-workers included;
+- each worker may start `max_children_per_worker` (1) sub-worker;
+- a sub-worker never delegates.
+
+```yaml
+triage:
+  enabled: true
+  max_workers_per_turn: 4
+  max_children_per_worker: 1
+  path: ~/.hermes/logs/model-router-triage.jsonl
+```
+
+Hermes's `delegation.max_spawn_depth` must be at least 2 for a worker to reach its
+sub-worker. A refused spawn returns `Nothing was spawned.` and costs no budget. The
+triage log records each `triage_forced`/`triage_skipped` (with its reason), every
+`triage_decision`, and each `spawn_admitted`/`spawn_blocked`:
+
+```bash
+tail -20 ~/.hermes/logs/model-router-triage.jsonl | jq '{event, reason, decision, rationale}'
+```
+
 #### Small-task budget
 
 A short, clear task must not pay for a planner plus a tree of workers. The
@@ -1643,6 +1686,12 @@ reliable control plane*.
 
 ## Diagnosing a parent that will not delegate
 
+With triage on, read `~/.hermes/logs/model-router-triage.jsonl` first: a
+`triage_decision` with `decision: solo` and its `rationale` is the parent's own
+answer, and a `triage_skipped` names the gate (`conversational`, `chat`,
+`lifecycle_event`, `no_triage_tool`, ...). The rest of this section is about the
+forced conductor, which runs only while triage is off.
+
 `~/.hermes/logs/terra-spark-orchestration.jsonl` records why a preflight did not
 run. Read its tail first — the answer is usually one field:
 
@@ -1740,6 +1789,18 @@ to import at all. Keep new tests in a `TestCase`; a bare `def test_*` is silentl
 skipped here.
 
 ## Version
+
+**1.25.1** — An imperative overrides the classifier's chat label in the triage
+prefilter. "rendben indítsd el ennek a javítását, majd rakjad ki developmentre" was
+read as brief conversation and the fix ran untriaged on Terra alone.
+
+**1.25.0** — Triage replaces the forced conductor. The parent's first call of an
+actionable user turn is `triage_task`, where it decides itself whether it works
+alone or splits the work; questions and short remarks skip it. The router enforces
+four workers per user turn (sub-workers included), one sub-worker per worker and
+none below that, and logs every decision and spawn to `model-router-triage.jsonl`.
+Prompted by a 39-call solo turn on 2026-10-05, after the conductor had been
+switched off for fanning a small fix out.
 
 **1.24.0** — Small-task budget and exact lifecycle accounting, after a pricing-copy
 fix fanned out into a conductor plus two workers (about 100 routing decisions).

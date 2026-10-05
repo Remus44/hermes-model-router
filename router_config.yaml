@@ -140,7 +140,18 @@ session_policy:
   pin_root_parent: true
 delegation:
   preserve_spark_subagents: true
+# The parent triages every actionable user turn itself: its first call must be
+# triage_task (solo or workers). Questions and short remarks skip it. While on,
+# it replaces the forced conductor below and owns the turn's worker budget:
+# max_workers_per_turn counts sub-workers too, each worker may start
+# max_children_per_worker sub-workers, and a sub-worker never delegates.
+triage:
+  enabled: true
+  max_workers_per_turn: 4
+  max_children_per_worker: 1
+  path: ~/.hermes/logs/model-router-triage.jsonl
 orchestration:
+  # Superseded by triage while that is on.
   enabled: true
   # The forced conductor runs on the parent's own tier (Grok plans on Grok,
   # Terra on Terra). Off: it uses default_model and its fallback chain, as
