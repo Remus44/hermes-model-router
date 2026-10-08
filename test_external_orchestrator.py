@@ -73,7 +73,8 @@ class ExternalParentOrchestrationTests(unittest.TestCase):
         {"name": "delegate_task"} on a Claude parent whose tool was mcp__delegate_task.
         Anthropic answered 400 "Tool 'delegate_task' not found in provided tools" and the
         turn fell back off Opus. The forced name must be the one actually offered."""
-        request = _delegating_request("claude-opus-5-5", "mcp__delegate_task")
+        # claude-haiku-4-5: Claude 5 bodies are never forced (test_claude_preflight).
+        request = _delegating_request("claude-haiku-4-5", "mcp__delegate_task")
         request["tools"] = [{"name": "mcp__delegate_task",
                              "input_schema": request["tools"][0]["parameters"]}]
         with tempfile.TemporaryDirectory() as d, host_delegation(depth=2), \

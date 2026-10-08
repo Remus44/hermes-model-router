@@ -200,9 +200,23 @@ class TriageIsSkippedTests(_Patched):
         self.assertEqual(routed["tools"][1]["input_schema"]["properties"]["name"]["enum"], ["triage_task"])
         self.assertIn("[ROUTER TRIAGE]", routed["messages"][-1]["content"][-1]["text"])
 
+    def test_a_claude_five_parent_without_thinking_is_asked_not_forced(self):
+        """claude-opus-5-5 / claude-sonnet-5-5 400 a forced tool_choice even without
+        thinking ("not supported for this model"); Hermes then fell back to Terra."""
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            with self.subTest(model=model):
+                tools = [{"name": "mcp__delegate_task", "input_schema": {"type": "object", "properties": {}}},
+                         {"name": "mcp__tool_call", "input_schema": {"type": "object", "properties": {}}}]
+                request = {"model": model, "tools": tools,
+                           "messages": [{"role": "user", "content": [{"type": "text", "text": TASK}]}]}
+                routed = triage.force(request, self.cfg, anthropic=True)
+                self.assertNotIn("tool_choice", routed)
+                self.assertEqual(len(routed["tools"]), 2)
+                self.assertIn("[ROUTER TRIAGE]", routed["messages"][-1]["content"][-1]["text"])
+
     def test_an_anthropic_parent_without_thinking_is_forced_by_name(self):
         tools = [{"name": "mcp__tool_call", "input_schema": {"type": "object", "properties": {}}}]
-        request = {"model": "claude-opus-5-5", "tools": tools,
+        request = {"model": "claude-haiku-4-5", "tools": tools,
                    "messages": [{"role": "user", "content": [{"type": "text", "text": TASK}]}]}
         routed = triage.force(request, self.cfg, anthropic=True)
         self.assertEqual(routed["tool_choice"], {"type": "tool", "name": "mcp__tool_call"})

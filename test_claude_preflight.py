@@ -41,9 +41,11 @@ def _cfg(temp_dir, claude=True):
     return cfg
 
 
-def _anthropic_request(text, tools):
+def _anthropic_request(text, tools, model="claude-haiku-4-5"):
+    # The forced-call mechanics need a body model that accepts a forced tool_choice;
+    # Claude 5 bodies take the unforced path (ClaudeFiveIsAskedNotForcedTests).
     request = chat_request(text)
-    request["model"] = "claude-opus-5-5"
+    request["model"] = model
     request["tools"] = [{"name": name, "input_schema": dict(SCHEMA)} for name in tools]
     return request
 
@@ -126,6 +128,24 @@ class ForcedPreflightTests(unittest.TestCase):
     def test_a_session_with_no_route_to_claude_keeps_the_delegate_task_only_call(self):
         request = self._route(_anthropic_request(REVIEW, ["mcp__delegate_task", "mcp__read_file"]))
         self.assertEqual(_names(request), ["mcp__delegate_task"])
+
+
+class ClaudeFiveIsAskedNotForcedTests(unittest.TestCase):
+    """Measured live 2026-09-28..10-07: claude-opus-5-5 and claude-sonnet-5-5 answer a
+    forced tool_choice with 400 "not supported for this model", and Hermes dropped the
+    turn onto Terra. Their preflight keeps the whole toolset and forces nothing."""
+
+    _route = ForcedPreflightTests._route
+
+    def test_a_claude_five_body_is_not_forced(self):
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            with self.subTest(model=model):
+                tools = ["mcp__delegate_task", "mcp__tool_describe", "mcp__tool_call", "mcp__read_file"]
+                request = self._route(_anthropic_request(REVIEW, tools, model=model))
+                self.assertNotIn("tool_choice", request)
+                self.assertEqual(_names(request), tools)
+                self.assertEqual(request["tools"][0]["input_schema"]["properties"]["role"]["enum"],
+                                 ["orchestrator"])
 
 
 class OfferedTests(unittest.TestCase):

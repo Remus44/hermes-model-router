@@ -2328,6 +2328,23 @@ def _is_anthropic_shaped(request: Dict[str, Any]) -> bool:
     )
 
 
+# Claude 5-family models answer a forced tool_choice ({"type": "any"} or "tool")
+# with HTTP 400 "not supported for this model" -- measured live on claude-opus-5-5
+# and claude-sonnet-5-5, thinking or not. Hermes reads that 400 as a provider
+# failure and drops the whole turn onto the fallback account.
+_NO_FORCED_CHOICE_MODEL = re.compile(r"claude-(?:opus|sonnet)-5")
+
+
+def _rejects_forced_tool_choice(request: Dict[str, Any]) -> bool:
+    """True when Anthropic would 400 a forced tool_choice on this request."""
+    if not isinstance(request, dict) or not _is_anthropic_shaped(request):
+        return False
+    thinking = request.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") not in (None, "disabled"):
+        return True
+    return bool(_NO_FORCED_CHOICE_MODEL.search(str(request.get("model") or "").casefold()))
+
+
 def _supports_forced_tool_choice(kwargs: Dict[str, Any], decision: RouteDecision) -> bool:
     """Whether this route can be made to call a tool by protocol.
 
@@ -3657,7 +3674,8 @@ def _force_terra_supervisor_preflight(
         plan_id,
         min(3, max(1, int((cfg.get("orchestration") or {}).get("max_tasks", 3)))),
         cfg=cfg,
-        force_tools=_supports_forced_tool_choice(kwargs, decision),
+        force_tools=(_supports_forced_tool_choice(kwargs, decision)
+                     and not _rejects_forced_tool_choice(kwargs["request"])),
         claude_choice=claude_choice,
         parent_tier=decision.tier,
     )

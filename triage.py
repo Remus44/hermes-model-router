@@ -233,7 +233,7 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
     if vehicle is None:
         return None
     tool, via_bridge = vehicle
-    from . import _append_user_instruction, _tool_schema_slot
+    from . import _append_user_instruction, _rejects_forced_tool_choice, _tool_schema_slot
 
     pinned = deepcopy(tool)
     owner, key = _tool_schema_slot(pinned)
@@ -246,11 +246,10 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
             properties["arguments"] = deepcopy(SCHEMA_PARAMETERS)
             schema["required"] = ["name", "arguments"]
     routed = deepcopy(request)
-    thinking = routed.get("thinking")
-    if anthropic and isinstance(thinking, dict) and thinking.get("type") not in (None, "disabled"):
-        # Anthropic refuses a forced tool_choice while thinking is on. One optional
-        # tool would let the reply end the turn, so the toolset stays whole and
-        # the triage is asked for, not forced.
+    if anthropic and _rejects_forced_tool_choice(routed):
+        # Anthropic refuses a forced tool_choice while thinking is on, and on Claude 5
+        # models at all. One optional tool would let the reply end the turn, so the
+        # toolset stays whole and the triage is asked for, not forced.
         routed["tools"] = [pinned if isinstance(item, dict) and _tool_name(item) == _tool_name(tool) else item
                            for item in routed.get("tools") or []]
         _append_user_instruction(routed, instruction(cfg, via_bridge=via_bridge))

@@ -1790,6 +1790,13 @@ skipped here.
 
 ## Version
 
+**1.25.2** — Claude 5 parents are never forced into a tool call. claude-opus-5-5 and
+claude-sonnet-5-5 answer `tool_choice` `any`/`tool` with HTTP 400 "not supported for
+this model", thinking or not, and Hermes read that as a provider failure: every
+triaged turn's first call fell back to Terra ("Model fallback: claude-opus-5-5 via
+anthropic unavailable"). Triage and the conductor preflight now ask instead of force
+on those models, keeping the whole toolset, as they already did with thinking on.
+
 **1.25.1** — An imperative overrides the classifier's chat label in the triage
 prefilter. "rendben indítsd el ennek a javítását, majd rakjad ki developmentre" was
 read as brief conversation and the fix ran untriaged on Terra alone.
