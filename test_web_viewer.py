@@ -1455,7 +1455,7 @@ class AccountsApiTests(unittest.TestCase):
             anthropic_fetcher.assert_not_called()
             codex_fetcher.assert_not_called()
 
-    def test_save_usage_limits_updates_and_validates(self):
+    def test_save_usage_limits_updates_and_rejects_invalid_values_without_changing_config(self):
         with tempfile.TemporaryDirectory() as directory:
             config, _, _ = self._build_config(directory)
 
@@ -1466,14 +1466,74 @@ class AccountsApiTests(unittest.TestCase):
             self.assertEqual(config["usage_guard"]["accounts"]["anthropic"]["soft_percent"], 60)
             self.assertEqual(config["usage_guard"]["accounts"]["anthropic"]["hard_percent"], 85)
 
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"anthropic": {"soft_percent": 90, "hard_percent": 85}}, config))
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"anthropic": {"soft_percent": 10, "hard_percent": 150}}, config))
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"anthropic": {"soft_percent": 0, "hard_percent": 90}}, config))
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"nope": {"soft_percent": 10, "hard_percent": 90}}, config))
+            before = json.loads(json.dumps(config))
+            invalid_payloads = (
+                {"anthropic": {"soft_percent": 90, "hard_percent": 85}},
+                {"anthropic": {"soft_percent": 10, "hard_percent": 150}},
+                {"anthropic": {"soft_percent": 0, "hard_percent": 90}},
+                {"anthropic": {"soft_percent": "nope", "hard_percent": 90}},
+                {"nope": {"soft_percent": 10, "hard_percent": 90}},
+            )
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    error = web_viewer._save_usage_limits(payload, config)
+                    self.assertIsNotNone(error)
+                    self.assertEqual(config, before)
+
+    def test_save_usage_limits_accepts_equal_thresholds_as_integers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, _ = self._build_config(directory)
+            error = web_viewer._save_usage_limits({
+                "anthropic": {"soft_percent": 98, "hard_percent": 98},
+                "openai-codex": {"soft_percent": 100, "hard_percent": 100},
+            }, config)
+
+        self.assertIsNone(error)
+        accounts = config["usage_guard"]["accounts"]
+        self.assertEqual((accounts["anthropic"]["soft_percent"], accounts["anthropic"]["hard_percent"]), (98, 98))
+        self.assertEqual((accounts["openai-codex"]["soft_percent"], accounts["openai-codex"]["hard_percent"]), (100, 100))
+        self.assertIsInstance(accounts["anthropic"]["soft_percent"], int)
+        self.assertIsInstance(accounts["openai-codex"]["hard_percent"], int)
+
+    def test_save_usage_limits_rejects_mixed_payload_without_writing_any_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, _ = self._build_config(directory)
+            before = json.loads(json.dumps(config))
+            error = web_viewer._save_usage_limits({
+                "anthropic": {"soft_percent": 98, "hard_percent": 98},
+                "openai-codex": {"soft_percent": 100, "hard_percent": 99},
+            }, config)
+
+        self.assertEqual(error, "Limits for 'openai-codex' must satisfy 0 < soft <= hard <= 100")
+        self.assertEqual(config, before)
+
+    def test_full_page_usage_limits_payload_accepts_equal_limits_and_preserves_step_down(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, _, _ = self._build_config(directory)
+            config_path = root / "router_config.yaml"
+            hermes_path = root / "config.yaml"
+            config_path.write_text(web_viewer.yaml.safe_dump(config), encoding="utf-8")
+            hermes_path.write_text("{}\n", encoding="utf-8")
+            payload = {
+                "callable": {**config["callable"], "terra": False},
+                "usage_limits": {
+                    "anthropic": {"soft_percent": 98, "hard_percent": 98},
+                    "openai-codex": {"soft_percent": 100, "hard_percent": 100},
+                },
+            }
+            with patch.object(web_viewer, "CONFIG_PATH", config_path), \
+                 patch.object(web_viewer, "HERMES_CONFIG_PATH", hermes_path):
+                payload["revision"] = web_viewer._config_revision()
+                status, body = web_viewer._save_config_payload(payload)
+            local = web_viewer._load_yaml_mapping(config_path.with_name("router_config.local.yaml"))
+            effective = web_viewer._effective_router_config(web_viewer._load_yaml_mapping(config_path), local)
+
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["success"])
+        self.assertFalse(local["callable"]["terra"])
+        self.assertEqual(effective["usage_guard"]["accounts"]["anthropic"]["step_down"], {"opus5": "sonnet5"})
+        self.assertEqual(effective["usage_guard"]["accounts"]["openai-codex"]["step_down"], {"sol": "terra"})
 
     def test_whole_percentages_are_saved_as_integers(self):
         config = {"usage_guard": {"accounts": {"anthropic": {"soft_percent": 70, "hard_percent": 90}}}}
@@ -1953,6 +2013,11 @@ class AccountCardTests(DashboardProbeMixin, unittest.TestCase):
         codex_card = self._card("openai-codex", self.CODEX_INFO)
         self.assertIn("account.delegation.always", codex_card)
         self.assertNotIn("data-account-toggle", codex_card)
+
+    def test_limit_inputs_allow_equal_soft_and_hard_values(self):
+        card = self._card("anthropic", self.CLAUDE_INFO)
+        self.assertIn('min="1" max="100" data-limit="soft"', card)
+        self.assertIn('min="1" max="100" data-limit="hard"', card)
 
     def test_an_account_without_a_usage_source_shows_the_none_message_and_disabled_limits(self):
         card = self._card("qwen-token", self.NO_USAGE_SOURCE_INFO)

@@ -806,19 +806,25 @@ def _save_usage_limits(raw, config: dict):
         # Nothing to save: leave an absent usage_guard block absent rather than
         # setdefault()-ing an empty one into existence on every settings save.
         return None
-    accounts = ((config.setdefault("usage_guard", {})).setdefault("accounts", {}))
+    guard = config.get("usage_guard")
+    accounts = guard.get("accounts") if isinstance(guard, dict) else {}
+    if not isinstance(accounts, dict):
+        accounts = {}
+    updates = {}
     for account, values in raw.items():
-        if account not in accounts:
+        if account not in accounts or not isinstance(accounts[account], dict):
             return f"No usage guard is configured for account '{account}'"
         try:
             soft, hard = float(values["soft_percent"]), float(values["hard_percent"])
         except Exception:
             return f"Limits for '{account}' need numeric soft_percent and hard_percent"
-        if not (0 < soft < hard <= 100):
-            return f"Limits for '{account}' must satisfy 0 < soft < hard <= 100"
+        if not (0 < soft <= hard <= 100):
+            return f"Limits for '{account}' must satisfy 0 < soft <= hard <= 100"
         # 80, not 80.0: a whole percentage is written the way the file spells it.
-        accounts[account]["soft_percent"], accounts[account]["hard_percent"] = (
-            int(v) if v.is_integer() else v for v in (soft, hard))
+        updates[account] = tuple(int(v) if v.is_integer() else v for v in (soft, hard))
+    for account, (soft, hard) in updates.items():
+        accounts[account]["soft_percent"] = soft
+        accounts[account]["hard_percent"] = hard
     return None
 
 
@@ -1878,7 +1884,7 @@ function accountCard(account,info){const callable=currentConfig.callable||{},coo
   const modelControls=`<div class="account-row models"><span>${t('account.models')}</span><div class="model-list${hasEffort?'':' no-effort'}">${models}</div></div>`;
   const u=info.usage,usage=info.has_usage_source?(u?usageRow('account.usage.week',u.weekly,u.weekly_resets_at,info.soft_percent,info.hard_percent)+usageRow('account.usage.session',u.session,u.session_resets_at,info.soft_percent,info.hard_percent)+`<div class="usage-age">${ageText(info.usage_age_seconds)} <button type="button" data-refresh-usage="${account}">${t('account.usage.refresh')}</button>${usageError(account)}${loadText}</div>`:`<div class="usage-age">${t('account.state.unknown')} <button type="button" data-refresh-usage="${account}">${t('account.usage.refresh')}</button>${usageError(account)}${loadText}</div>`):`<div class="usage-none">${t('account.usage.none')}</div><div class="usage-age">${loadText}</div>`;
   const off=info.guard?'':'disabled',step=Object.entries(info.step_down||{}).map(([a,b])=>`${a} → ${b}`).join(', ');
-  const limits=`<label>${t('account.limits.soft')} <input type="number" min="1" max="99" data-limit="soft" data-account="${account}" value="${info.soft_percent??''}" ${off}>%</label> <label>${t('account.limits.hard')} <input type="number" min="2" max="100" data-limit="hard" data-account="${account}" value="${info.hard_percent??''}" ${off}>%</label>${step?`<div class="stepdown">${t('account.limits.stepdown')}: ${step}</div>`:''}`;
+  const limits=`<label>${t('account.limits.soft')} <input type="number" min="1" max="100" data-limit="soft" data-account="${account}" value="${info.soft_percent??''}" ${off}>%</label> <label>${t('account.limits.hard')} <input type="number" min="1" max="100" data-limit="hard" data-account="${account}" value="${info.hard_percent??''}" ${off}>%</label>${step?`<div class="stepdown">${t('account.limits.stepdown')}: ${step}</div>`:''}`;
   // delegate_claude is on while a Claude model is switched on; the row only reports it.
   // The default tier is chosen under Workers, next to the other worker defaults.
   const delegation=d.tool==='delegate_claude'?`${d.enabled?t('account.delegation.via').replace('{tool}','delegate_claude'):t('account.delegation.off')}`:`${t('account.delegation.via').replace('{tool}',d.tool||'delegate_task')} · ${t('account.delegation.always')}`;
