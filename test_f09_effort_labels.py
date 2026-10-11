@@ -1,7 +1,9 @@
+import contextlib
 import copy
 import importlib
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import types
@@ -35,7 +37,13 @@ class _ReasoningEffortUnavailableFinder:
         return None
 
 
-def load_plugin_without_reasoning_effort():
+@contextlib.contextmanager
+def plugin_without_reasoning_effort():
+    """Yield a freshly loaded plugin (or None) while the effort module stays blocked.
+
+    The import blocker is removed only when the ``with`` block ends, so every
+    assertion made inside it runs against the missing-host-module state.
+    """
     package_name = "f09_no_reasoning_effort"
     module_name = f"{package_name}.model_router"
     package = types.ModuleType(package_name)
@@ -46,18 +54,19 @@ def load_plugin_without_reasoning_effort():
         sys.modules[package_name] = package
         sys.meta_path.insert(0, finder)
         try:
+            plugin = None
             spec = importlib.util.spec_from_file_location(
                 module_name, ROOT / "__init__.py", submodule_search_locations=[str(ROOT)],
             )
-            if spec is None or spec.loader is None:
-                return None
-            plugin = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = plugin
-            try:
-                spec.loader.exec_module(plugin)
-            except ModuleNotFoundError:
-                return None
-            return plugin
+            if spec is not None and spec.loader is not None:
+                candidate = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = candidate
+                try:
+                    spec.loader.exec_module(candidate)
+                    plugin = candidate
+                except ModuleNotFoundError:
+                    plugin = None
+            yield plugin
         finally:
             sys.meta_path.remove(finder)
 
@@ -102,6 +111,15 @@ def request(text, cfg):
 
 
 class ExactEffortLabelTests(unittest.TestCase):
+    def setUp(self):
+        self._reset_effort_label_cache()
+        self.addCleanup(self._reset_effort_label_cache)
+
+    @staticmethod
+    def _reset_effort_label_cache():
+        router._CODEX_TIER_EFFORTS_CACHE.clear()
+        router._CODEX_TIER_EFFORTS_WARNING_EMITTED = False
+
     def route(self, text, cfg):
         with patch.object(router, "_load_config", return_value=cfg), patch.object(router, "_log_decision"):
             return router.route_llm_request(
@@ -113,13 +131,27 @@ class ExactEffortLabelTests(unittest.TestCase):
             )
 
     def test_plugin_import_and_label_validation_fall_back_when_host_effort_module_is_missing(self):
-        plugin = load_plugin_without_reasoning_effort()
-        self.assertIsNotNone(plugin, "the plugin must load without agent.reasoning_effort")
-        assert plugin is not None
-        self.assertEqual(plugin._label_match("[sol:high] Inspect and report.").group("tier").casefold(), "sol")
-        self.assertEqual(plugin._unsupported_label("[sol:bogus] Inspect and report.")[0], "sol")
-        self.assertIsNotNone(plugin._label_match("[sol:max] Inspect and report."))
-        self.assertEqual(plugin._unsupported_label("[spark:max] Inspect and report.")[0], "spark")
+        cfg = shipped_config()
+        with plugin_without_reasoning_effort() as plugin:
+            self.assertIsNotNone(plugin, "the plugin must load without agent.reasoning_effort")
+            assert plugin is not None
+            # The blocker is still installed here: the host module really is unreachable.
+            with self.assertRaises(ModuleNotFoundError):
+                importlib.import_module("agent.reasoning_effort")
+            plugin._CODEX_TIER_EFFORTS_CACHE.clear()
+            plugin._CODEX_TIER_EFFORTS_WARNING_EMITTED = False
+            with self.assertLogs("model_router", level="WARNING") as logged:
+                self.assertIsNotNone(plugin._label_match("[sol:max] Inspect and report.", cfg))
+                self.assertIsNone(plugin._unsupported_label("[sol:max] Inspect and report.", cfg))
+                refused = plugin._unsupported_label("[spark:max] Inspect and report.", cfg)
+                self.assertIsNotNone(refused)
+                self.assertEqual(refused[:2], ("spark", "max"))
+                self.assertEqual(refused[2], FALLBACK_TIER_LEVELS["spark"])
+                self.assertEqual(plugin._unsupported_label("[sol:bogus] Inspect and report.", cfg)[0], "sol")
+                self.assertEqual(plugin._codex_tier_efforts(cfg), FALLBACK_TIER_LEVELS)
+            literal_warnings = [r for r in logged.records if "literal Codex effort labels" in r.getMessage()]
+            self.assertEqual(len(literal_warnings), 1, [r.getMessage() for r in logged.records])
+            self.assertTrue(plugin._CODEX_TIER_EFFORTS_WARNING_EMITTED)
 
     def test_fallback_literals_are_pinned_to_the_host_model_vocabularies(self):
         self.assertEqual(host_tier_levels(), FALLBACK_TIER_LEVELS)
@@ -198,37 +230,66 @@ class ExactEffortLabelTests(unittest.TestCase):
         self.assertIn("sol", result)
         self.assertIn("low, medium, high, xhigh, max", result)
 
-    def test_pre_tool_refuses_bad_level_before_triage_charges_the_budget(self):
+    def test_pre_tool_refuses_bad_level_before_triage_charges_the_worker_budget(self):
         triage.reset_state()
         self.addCleanup(triage.reset_state)
         cfg = shipped_config()
+        cfg["triage"] = {
+            "enabled": True, "max_workers_per_turn": 4, "max_children_per_worker": 1,
+        }
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(router, "_requested_delegation_targets", return_value=()):
+            before = dict(triage._TURN_WORKERS)
+            refused = router.on_pre_tool_call(
+                "delegate_task", {"goal": "[sol:bogus] Inspect and report."}, turn_id="f09-budget",
+            )
+            self.assertIsNotNone(refused)
+            self.assertEqual(refused["action"], "block")
+            self.assertIn("Unsupported sol effort 'bogus'", refused["message"])
+            self.assertEqual(triage._TURN_WORKERS, before)
+            self.assertEqual(triage._TURN_WORKERS, {})
+            for _ in range(4):
+                self.assertIsNone(router.on_pre_tool_call(
+                    "delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-budget",
+                ))
+            self.assertEqual(sum(triage._TURN_WORKERS.values()), 4)
+            self.assertEqual(
+                router.on_pre_tool_call(
+                    "delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-budget",
+                )["action"],
+                "block",
+            )
+
+    def test_pre_tool_refuses_bad_level_before_the_bounded_task_budget_is_written(self):
+        triage.reset_state()
+        self.addCleanup(triage.reset_state)
+        cfg = shipped_config()
+        cfg["triage"] = {"enabled": False}
         with tempfile.TemporaryDirectory() as directory:
             bounded_path = Path(directory) / "bounded-budget.jsonl"
-            cfg["triage"] = {
-                "enabled": True, "max_workers_per_turn": 4, "max_children_per_worker": 1,
-                "path": str(Path(directory) / "triage.jsonl"),
-            }
             cfg["task_budget"] = {"enabled": True, "path": str(bounded_path)}
             with patch.object(router, "_load_config", return_value=cfg), \
                  patch.object(router, "_requested_delegation_targets", return_value=()):
                 refused = router.on_pre_tool_call(
-                    "delegate_task", {"goal": "[sol:bogus] Inspect and report."}, turn_id="f09-budget",
+                    "delegate_task", {"goal": "[sol:bogus] Inspect and report."}, turn_id="f09-bounded",
                 )
                 self.assertIsNotNone(refused)
                 self.assertEqual(refused["action"], "block")
                 self.assertIn("Unsupported sol effort 'bogus'", refused["message"])
-                self.assertEqual(triage._TURN_WORKERS, {})
                 self.assertFalse(bounded_path.exists())
-                for _ in range(4):
-                    self.assertIsNone(router.on_pre_tool_call(
-                        "delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-budget",
-                    ))
-                self.assertEqual(
-                    router.on_pre_tool_call(
-                        "delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-budget",
-                    )["action"],
-                    "block",
+                # The refused call used no allowance: the one permitted worker is still free.
+                self.assertIsNone(router.on_pre_tool_call(
+                    "delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-bounded",
+                ))
+                records = [json.loads(line) for line in bounded_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([record["event"] for record in records], ["bounded_worker_admitted"])
+                second = router.on_pre_tool_call(
+                    "delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-bounded",
                 )
+                self.assertIsNotNone(second)
+                self.assertEqual(second["action"], "block")
+                self.assertIn("Low-risk task routing budget reached", second["message"])
+                self.assertEqual(len(bounded_path.read_text(encoding="utf-8").splitlines()), 1)
 
     def test_pre_tool_refuses_a_bad_second_task_without_charging_the_batch(self):
         triage.reset_state()
@@ -264,6 +325,71 @@ class ExactEffortLabelTests(unittest.TestCase):
                 root = router.classify_request(request(goal, cfg), config=cfg)
                 unlabelled = router.classify_request(request("Inspect and report.", cfg), config=cfg)
                 self.assertEqual((root.tier, root.effort), (unlabelled.tier, unlabelled.effort))
+
+    def test_a_supported_level_followed_by_text_is_not_refused_and_other_malformed_labels_are(self):
+        # (goal, expected _unsupported_label (tier, level) or None, is a valid label)
+        cases = (
+            ("[sol:high]text", None, False),
+            ("[sol:high],", None, False),
+            ("[sol:HIGH]text", None, False),
+            ("[terra:xhigh]: do it", None, False),
+            ("[sol:high]. Do x", None, False),
+            ("[sol:high] x", None, True),
+            ("[sol] x", None, True),
+            ("[sol:bogus] x", ("sol", "bogus"), False),
+            ("[sol:x-high] x", ("sol", "x-high"), False),
+            ("[sol: high] x", ("sol", " high"), False),
+            ("[sol:] x", ("sol", ""), False),
+            ("[sol:high-2] x", ("sol", "high-2"), False),
+            ("[spark:max]text", ("spark", "max"), False),
+        )
+        cfg = shipped_config()
+        for goal, expected, is_label in cases:
+            with self.subTest(goal=goal):
+                unsupported = router._unsupported_label(goal, cfg)
+                self.assertEqual(unsupported[:2] if unsupported else None, expected)
+                self.assertEqual(router._label_match(goal, cfg) is not None, is_label)
+                if not is_label:
+                    stripped = re.sub(r"^\s*\[[^\]]*\]", "", goal)
+                    root = router.classify_request(request(goal, cfg), config=cfg)
+                    plain = router.classify_request(request(stripped, cfg), config=cfg)
+                    self.assertEqual((root.tier, root.effort), (plain.tier, plain.effort))
+
+    def test_guard_dispatches_a_supported_level_followed_by_text_and_blocks_a_malformed_level(self):
+        cfg = shipped_config()
+        for goal, dispatched in (("[sol:high]text", True), ("[sol:x-high] x", False)):
+            with self.subTest(goal=goal):
+                call = Mock(return_value="dispatched")
+                with patch.object(router, "_load_config", return_value=cfg), \
+                     patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", cfg["models"]["terra"])), \
+                     patch.object(router, "_delegation_targets_detail", return_value={}), \
+                     patch.object(router, "_delegated_claude_review_status", return_value=(None, "not a review")), \
+                     patch.object(worker_admission, "refusal", return_value=""):
+                    result = worker_admission.guard_tool_execution(
+                        tool_name="delegate_task", args={"tasks": [{"goal": goal}]}, next_call=call,
+                    )
+                self.assertEqual(call.call_count, 1 if dispatched else 0)
+                if dispatched:
+                    self.assertEqual(result, "dispatched")
+                else:
+                    self.assertIn("Unsupported sol effort 'x-high'", result)
+
+    def test_pre_tool_hook_dispatches_a_supported_level_followed_by_text_and_blocks_a_malformed_level(self):
+        triage.reset_state()
+        self.addCleanup(triage.reset_state)
+        cfg = shipped_config()
+        cfg["triage"] = {"enabled": False}
+        cfg["task_budget"] = {"enabled": False}
+        for goal, dispatched in (("[sol:high]text", True), ("[sol:x-high] x", False)):
+            with self.subTest(goal=goal), patch.object(router, "_load_config", return_value=cfg), \
+                 patch.object(router, "_requested_delegation_targets", return_value=()):
+                result = router.on_pre_tool_call("delegate_task", {"goal": goal}, turn_id="f09-boundary")
+                if dispatched:
+                    self.assertIsNone(result)
+                else:
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result["action"], "block")
+                    self.assertIn("Unsupported sol effort 'x-high'", result["message"])
 
     def test_an_unsupported_root_level_routes_as_unlabelled_text(self):
         cfg = shipped_config()

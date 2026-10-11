@@ -851,7 +851,14 @@ def _unsupported_label(text: str, cfg: Optional[Dict[str, Any]] = None) -> Optio
     if not malformed:
         return None
     tier = malformed.group("tier").casefold()
-    return tier, malformed.group("level").casefold(), _codex_tier_efforts(cfg)[tier]
+    levels = _codex_tier_efforts(cfg)[tier]
+    level = malformed.group("level").casefold()
+    # A supported level that is merely not followed by whitespace (``[sol:high]text``)
+    # never was a label and routed as plain text before; it is not an effort error.
+    # Compared exactly: ``[sol: high]`` carries a space inside the brackets and stays refused.
+    if level in levels:
+        return None
+    return tier, level, levels
 
 
 def _unsupported_label_message(unsupported: Tuple[str, str, Tuple[str, ...]]) -> str:
