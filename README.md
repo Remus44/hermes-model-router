@@ -648,10 +648,11 @@ effort:
 
 When the user states effort for a Codex model, the parent writes
 `[<tier>:<level>]`. The requested level reaches the route and wire exactly; it
-is never remapped between `high` and `xhigh`. Each tier accepts only the levels
-its configured host model supports; an unsupported level (including `none`) is
-refused before delegation, while an unsupported label on a root user message is
-ordinary unlabelled text. Otherwise the parent writes a bare `[<tier>]` label.
+is never remapped between `high` and `xhigh`. Luna, Terra, and Sol accept
+`low`, `medium`, `high`, `xhigh`, and `max`; Spark accepts `low`, `medium`,
+`high`, and `xhigh`. No tier accepts `none`. An unsupported level is refused
+before delegation, while an unsupported label on a root user message is ordinary
+unlabelled text. Otherwise the parent writes a bare `[<tier>]` label.
 
 `explicit_<tier>` and `explicit_<tier>_xhigh` are retired effort keys. The router
 ignores them in a local overlay and never rewrites that overlay automatically.

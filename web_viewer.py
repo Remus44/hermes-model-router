@@ -2577,7 +2577,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with _CONFIG_LOCK:
                     config = _read_router_config()
-                    local = _load_yaml_mapping(_local_config_path())
+                    try:
+                        local = _load_yaml_mapping(_local_config_path())
+                    except Exception:
+                        local = {}
                     router = _router_module()
                     work_kinds = list(getattr(router, "WORK_KINDS", ())) if router else []
                     response = {

@@ -33,17 +33,20 @@ from . import usage_guard
 from . import worker_admission
 from . import triage
 from .hermes_paths import hermes_path
-from agent.reasoning_effort import CODEX_ASTRA_EFFORTS, CODEX_GPT56_EFFORTS, CODEX_LEGACY_EFFORTS
 
 
-# Exact per-label Codex vocabularies. These are intentionally derived from the
-# host's wire tables, not from the dashboard's shared editable levels.
-_CODEX_TIER_EFFORTS = {
-    "luna": tuple(level for level in CODEX_GPT56_EFFORTS if level != "none"),
-    "spark": tuple(level for level in CODEX_LEGACY_EFFORTS if level != "none"),
-    "terra": tuple(level for level in CODEX_GPT56_EFFORTS if level != "none"),
-    "sol": tuple(CODEX_ASTRA_EFFORTS),
+# Exact fallback per-label Codex vocabularies.  They deliberately mirror the
+# shipped model families so a missing/renamed host effort module cannot disable
+# all router hooks at import time.
+_FALLBACK_CODEX_TIER_EFFORTS = {
+    "luna": ("low", "medium", "high", "xhigh", "max"),
+    "spark": ("low", "medium", "high", "xhigh"),
+    "terra": ("low", "medium", "high", "xhigh", "max"),
+    "sol": ("low", "medium", "high", "xhigh", "max"),
 }
+_CODEX_TIER_EFFORTS_LOCK = threading.Lock()
+_CODEX_TIER_EFFORTS_CACHE: Dict[Tuple[Tuple[str, str], ...], Dict[str, Tuple[str, ...]]] = {}
+_CODEX_TIER_EFFORTS_WARNING_EMITTED = False
 
 _logger = logging.getLogger("model_router")
 
@@ -763,32 +766,97 @@ _SPARK_CONSEQUENTIAL_WORK = re.compile(
 )
 
 
+def _codex_tier_efforts(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Tuple[str, ...]]:
+    """Return per-tier supported label levels without coupling plugin import to Hermes.
+
+    The cache is keyed by the configured model names, so a local ``models:``
+    overlay immediately changes the accepted vocabulary.  Importing the host is
+    deliberately outside the lock: an update/stale-install retry may touch the
+    filesystem and must not serialize unrelated label checks.
+    """
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    configured_models = config.get("models") if isinstance(config.get("models"), dict) else {}
+    model_key = tuple(
+        (tier, str(configured_models.get(tier) or _DEFAULT_CONFIG["models"][tier]))
+        for tier in _FALLBACK_CODEX_TIER_EFFORTS
+    )
+    with _CODEX_TIER_EFFORTS_LOCK:
+        cached = _CODEX_TIER_EFFORTS_CACHE.get(model_key)
+    if cached is not None:
+        return cached
+
+    levels: Dict[str, Tuple[str, ...]] = dict(_FALLBACK_CODEX_TIER_EFFORTS)
+    failure: Optional[Exception] = None
+    try:
+        import importlib
+
+        usage_guard._import_hermes("agent.reasoning_effort")
+        reasoning_effort = importlib.import_module("agent.reasoning_effort")
+        supported = getattr(reasoning_effort, "codex_supported_efforts", None)
+        if callable(supported):
+            derived = {
+                tier: tuple(level for level in supported(model) if level != "none")
+                for tier, model in model_key
+            }
+            if not all(derived.values()):
+                raise ValueError("host codex_supported_efforts returned an empty label vocabulary")
+            levels = derived
+        else:
+            gpt56 = getattr(reasoning_effort, "CODEX_GPT56_EFFORTS")
+            legacy = getattr(reasoning_effort, "CODEX_LEGACY_EFFORTS")
+            astra = getattr(reasoning_effort, "CODEX_ASTRA_EFFORTS")
+            levels = {
+                "luna": tuple(level for level in gpt56 if level != "none"),
+                "spark": tuple(level for level in legacy if level != "none"),
+                "terra": tuple(level for level in gpt56 if level != "none"),
+                "sol": tuple(level for level in astra if level != "none"),
+            }
+    except Exception as exc:  # host compatibility must not disable the router
+        failure = exc
+
+    global _CODEX_TIER_EFFORTS_WARNING_EMITTED
+    with _CODEX_TIER_EFFORTS_LOCK:
+        if failure is not None and not _CODEX_TIER_EFFORTS_WARNING_EMITTED:
+            _logger.warning("using literal Codex effort labels; host reasoning_effort unavailable: %s", failure)
+            _CODEX_TIER_EFFORTS_WARNING_EMITTED = True
+        return _CODEX_TIER_EFFORTS_CACHE.setdefault(model_key, levels)
+
+
 _CODEX_LABEL = re.compile(r"^\s*\[(?P<tier>luna|spark|terra|sol)(?::(?P<level>[a-z]+))?\](?:\s|$)", re.I)
+_MALFORMED_CODEX_LEVEL = re.compile(r"^\s*\[(?P<tier>luna|spark|terra|sol):(?P<level>[^\]]*)\]", re.I)
 # A valid router label only: an unsupported level is deliberately not a label on
 # a root turn, while dispatch admission recognises it separately and refuses it.
-_PLAN_LABEL = _CODEX_LABEL
 _CLAUDE_REVIEW_LABEL = re.compile(r"^\s*\[(opus|sonnet)5?-review\](?:\s|$)")
 
 
-def _label_match(text: str) -> Optional[re.Match[str]]:
+def _label_match(text: str, cfg: Optional[Dict[str, Any]] = None) -> Optional[re.Match[str]]:
     match = _CODEX_LABEL.match(text or "")
     if not match:
         return None
     level = match.group("level")
     tier = match.group("tier").casefold()
-    if level is None or level.casefold() in _CODEX_TIER_EFFORTS[tier]:
+    if level is None or level.casefold() in _codex_tier_efforts(cfg)[tier]:
         return match
     return None
 
 
-def _unsupported_label(text: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+def _unsupported_label(text: str, cfg: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
     match = _CODEX_LABEL.match(text or "")
-    if not match or match.group("level") is None:
+    if match and match.group("level") is not None:
+        tier = match.group("tier").casefold()
+        level = match.group("level").casefold()
+        levels = _codex_tier_efforts(cfg)[tier]
+        return None if level in levels else (tier, level, levels)
+    malformed = _MALFORMED_CODEX_LEVEL.match(text or "")
+    if not malformed:
         return None
-    tier = match.group("tier").casefold()
-    level = match.group("level").casefold()
-    levels = _CODEX_TIER_EFFORTS[tier]
-    return None if level in levels else (tier, level, levels)
+    tier = malformed.group("tier").casefold()
+    return tier, malformed.group("level").casefold(), _codex_tier_efforts(cfg)[tier]
+
+
+def _unsupported_label_message(unsupported: Tuple[str, str, Tuple[str, ...]]) -> str:
+    tier, level, levels = unsupported
+    return f"Unsupported {tier} effort '{level}'; supported levels: {', '.join(levels)}. Nothing was spawned."
 
 # A goal that names an external target the way a Sol or Spark goal names its
 # tier. It is not a route and never has been -- the override regex knows only
@@ -826,7 +894,7 @@ def _misdispatched_external_label(text: str, active_model: str, cfg: Dict[str, A
     return name
 
 
-def _is_plan_labelled_worker(text: str) -> bool:
+def _is_plan_labelled_worker(text: str, cfg: Optional[Dict[str, Any]] = None) -> bool:
     """True when this text is a delegated worker goal labelled by this router.
 
     The keyword test predates the planner. It exists because the router once had
@@ -837,7 +905,7 @@ def _is_plan_labelled_worker(text: str) -> bool:
     -- and it cannot even tell the cases apart: `_is_design_request` is true both
     for "identify the layout branches" and for "implement a responsive CSS card".
     """
-    return _label_match(text) is not None
+    return _label_match(text, cfg) is not None
 
 
 def _is_design_request(text: str) -> bool:
@@ -1449,7 +1517,7 @@ def _kind_for_goal(goal: str, cfg: Dict[str, Any]) -> str:
     never associated with it.
     """
     # A route label describes the stopped worker, not the semantic work kind.
-    label = _label_match(goal)
+    label = _label_match(goal, cfg)
     if label:
         goal = goal[label.end():]
     else:
@@ -1873,7 +1941,7 @@ def _classify_request(
     # decisions on one turn. Only the conductor label is exempt; a [spark] or
     # [sol] leaf still faces the gate, and Sol still owns every [sol] leaf.
     if _is_design_request(user_text) and not (
-        allow_plan_label_over_design and _is_plan_labelled_worker(text)
+        allow_plan_label_over_design and _is_plan_labelled_worker(text, cfg)
     ):
         return _decision("sol", "design analysis or implementation is Sol-only", cfg, mandatory=True, kind="design")
 
@@ -1886,7 +1954,7 @@ def _classify_request(
                 return _decision("terra", "Spark is restricted to non-design read-only subtasks", cfg)
         return _decision(benchmark_force, "benchmark environment force override", cfg, explicit=True)
 
-    override = _label_match(text)
+    override = _label_match(text, cfg)
     if override:
         tier = override.group("tier").casefold()
         if tier == "spark" and has_image_attachment:
@@ -4133,7 +4201,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     session_policy = cfg.get("session_policy") or {}
     latest_user_text, _ = _last_user_text_and_index(_request_items(request))
     latest_user_text = _without_host_injected_context(_without_router_contract(latest_user_text))
-    explicit_root_override = _label_match(_normalise(latest_user_text)) is not None
+    explicit_root_override = _label_match(_normalise(latest_user_text), cfg) is not None
     if (
         not subagent_marker
         and bool(session_policy.get("pin_root_parent", False))
@@ -4206,7 +4274,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # A rejected leaf fared worse -- "consequential Spark task requires Sol"
         # was demoted to Terra, turning a deliberate escalation into the exact
         # tier the escalation existed to avoid.
-        and _label_match(_normalise(latest_user_text)) is None
+        and _label_match(_normalise(latest_user_text), cfg) is None
     ):
         # The delegation default is Terra so the forced first child is a real
         # planner. Unlabelled child work remains with the default_model rather
@@ -6249,6 +6317,18 @@ def _declined_conductor_goal(args: Dict[str, Any], cfg: Dict[str, Any], turn_id:
     )
 
 
+def _unsupported_delegation_label(args: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+    """The first invalid effort label in a single or batched delegation payload."""
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else [args]
+    for task in tasks:
+        entry = task if isinstance(task, dict) else {}
+        goal = str(entry.get("goal") or args.get("goal") or "")
+        unsupported = _unsupported_label(goal, cfg)
+        if unsupported:
+            return unsupported
+    return None
+
+
 def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **_: Any) -> Optional[Dict[str, str]]:
     """Apply the worker budget and refuse unavailable delegation targets.
 
@@ -6271,6 +6351,9 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         return None
     try:
         cfg = _load_config()
+        unsupported = _unsupported_delegation_label(args, cfg)
+        if unsupported:
+            return {"action": "block", "message": _unsupported_label_message(unsupported)}
         if triage.enabled(cfg):
             over_budget = triage.spawn_block(tool_name, args, cfg, _)
             if over_budget:

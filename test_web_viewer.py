@@ -3112,6 +3112,52 @@ class ReasoningEffortSettingsTests(DashboardProbeMixin, unittest.TestCase):
         self.assertIn("function renderLegacyEffortNotice()", HTML)
         self.assertIn("remove_legacy_effort_keys:true", HTML)
 
+    def test_get_ignores_a_broken_local_overlay_when_listing_legacy_effort_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = self._write_config(directory)
+            config_path.with_name("router_config.local.yaml").write_text("effort: [broken\n", encoding="utf-8")
+            status, payload = self._request(config_path, "GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["legacy_effort_keys"], [])
+
+    def test_invalid_effort_with_legacy_removal_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = self._write_config(directory)
+            local = config_path.with_name("router_config.local.yaml")
+            original = "effort:\n  explicit_sol: low\n  terra: high\n"
+            local.write_text(original, encoding="utf-8")
+            status, page = self._request(config_path, "GET")
+            self.assertEqual(status, 200, page)
+            status, body = self._request(config_path, "POST", {
+                "revision": page["revision"], "effort": {"terra": "max"},
+                "remove_legacy_effort_keys": True,
+            })
+            after = local.read_text(encoding="utf-8")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(after, original)
+
+    def test_false_or_non_boolean_legacy_removal_is_rejected_without_writing(self):
+        for flag in (False, "true", 1):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as directory:
+                config_path = self._write_config(directory)
+                local = config_path.with_name("router_config.local.yaml")
+                original = "effort:\n  explicit_sol: low\n"
+                local.write_text(original, encoding="utf-8")
+                status, body = self._request(config_path, "POST", {"remove_legacy_effort_keys": flag})
+                self.assertEqual(status, 400, body)
+                self.assertEqual(local.read_text(encoding="utf-8"), original)
+
+    def test_an_ordinary_save_preserves_explicit_keys_until_owner_requests_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = self._write_config(directory)
+            local = config_path.with_name("router_config.local.yaml")
+            local.write_text("effort:\n  explicit_sol: low\n  terra: low\n", encoding="utf-8")
+            status, body = self._request(config_path, "POST", {"effort": {"terra": "high"}})
+            written = web_viewer.yaml.safe_load(local.read_text(encoding="utf-8"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(written["effort"]["explicit_sol"], "low")
+        self.assertEqual(written["effort"]["terra"], "high")
+
     def test_a_valid_effort_save_writes_only_the_local_delta_and_preserves_the_shipped_file(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = self._write_config(directory)
