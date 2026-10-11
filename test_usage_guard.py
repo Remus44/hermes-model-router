@@ -93,6 +93,31 @@ class GuardRuleTests(unittest.TestCase):
                 self.assertEqual(usage_guard.state(account, _cfg(), _reading(75)), "soft")
                 self.assertEqual(usage_guard.state(account, _cfg(), _reading(90)), "closed")
 
+    def test_equal_soft_and_hard_is_open_below_and_closed_at_or_above_the_limit(self):
+        for account in ACCOUNTS:
+            with self.subTest(account=account):
+                cfg = _cfg()
+                limits = cfg["usage_guard"]["accounts"][account]
+                limits["soft_percent"] = limits["hard_percent"] = 90
+                self.assertEqual(usage_guard.state(account, cfg, _reading(89)), "open")
+                for usage in (90, 95):
+                    self.assertEqual(usage_guard.state(account, cfg, _reading(usage)), "closed")
+
+    def test_equal_soft_and_hard_never_steps_down_and_refuses_at_or_above_the_limit(self):
+        for account in ACCOUNTS:
+            heavy, lighter = STEP[account]
+            with self.subTest(account=account):
+                cfg = _cfg()
+                limits = cfg["usage_guard"]["accounts"][account]
+                limits["soft_percent"] = limits["hard_percent"] = 90
+                below = usage_guard.apply(account, heavy, cfg, _reading(89))
+                self.assertEqual((below.tier, below.adjusted), (heavy, ""))
+                self.assertNotEqual(below.tier, lighter)
+                for usage in (90, 95):
+                    outcome = usage_guard.apply(account, heavy, cfg, _reading(usage))
+                    self.assertEqual(outcome.tier, heavy)
+                    self.assertTrue(outcome.refused)
+
     def test_open_usage_is_reported_and_an_unlisted_tier_is_unaffected(self):
         """An "open" reading carries the usage string, and a tier absent from
         ``step_down`` (haiku on anthropic, luna on openai-codex) is never touched,

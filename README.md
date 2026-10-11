@@ -1118,6 +1118,8 @@ usage_guard:
         sol: terra
 ```
 
+`soft_percent` may equal `hard_percent`: hard is checked first, so the soft band and step-down are off for that account; the dashboard accepts `0 < soft <= hard <= 100`.
+
 An account absent from `usage_guard.accounts` is never touched: no reading is
 fetched for it and its state reports `unknown`. Codex is stepped down by the
 router itself (`_usage_step_down`); Claude is stepped down inside

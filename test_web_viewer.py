@@ -1468,16 +1468,19 @@ class AccountsApiTests(unittest.TestCase):
 
             before = json.loads(json.dumps(config))
             invalid_payloads = (
-                {"anthropic": {"soft_percent": 90, "hard_percent": 85}},
-                {"anthropic": {"soft_percent": 10, "hard_percent": 150}},
-                {"anthropic": {"soft_percent": 0, "hard_percent": 90}},
-                {"anthropic": {"soft_percent": "nope", "hard_percent": 90}},
-                {"nope": {"soft_percent": 10, "hard_percent": 90}},
+                ({"anthropic": {"soft_percent": 90, "hard_percent": 85}},
+                 "Limits for 'anthropic' must satisfy 0 < soft <= hard <= 100"),
+                ({"anthropic": {"soft_percent": 10, "hard_percent": 150}}, None),
+                ({"anthropic": {"soft_percent": 0, "hard_percent": 90}}, None),
+                ({"anthropic": {"soft_percent": "nope", "hard_percent": 90}}, None),
+                ({"nope": {"soft_percent": 10, "hard_percent": 90}}, None),
             )
-            for payload in invalid_payloads:
+            for payload, expected_error in invalid_payloads:
                 with self.subTest(payload=payload):
                     error = web_viewer._save_usage_limits(payload, config)
                     self.assertIsNotNone(error)
+                    if expected_error:
+                        self.assertEqual(error, expected_error)
                     self.assertEqual(config, before)
 
     def test_save_usage_limits_accepts_equal_thresholds_as_integers(self):
@@ -1496,16 +1499,24 @@ class AccountsApiTests(unittest.TestCase):
         self.assertIsInstance(accounts["openai-codex"]["hard_percent"], int)
 
     def test_save_usage_limits_rejects_mixed_payload_without_writing_any_account(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config, _, _ = self._build_config(directory)
-            before = json.loads(json.dumps(config))
-            error = web_viewer._save_usage_limits({
+        mixed_payloads = (
+            {
                 "anthropic": {"soft_percent": 98, "hard_percent": 98},
                 "openai-codex": {"soft_percent": 100, "hard_percent": 99},
-            }, config)
-
-        self.assertEqual(error, "Limits for 'openai-codex' must satisfy 0 < soft <= hard <= 100")
-        self.assertEqual(config, before)
+            },
+            {
+                "anthropic": {"soft_percent": 60, "hard_percent": 85},
+                "openai-codex": {"soft_percent": 95, "hard_percent": 90},
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for payload in mixed_payloads:
+                with self.subTest(payload=payload):
+                    config, _, _ = self._build_config(directory)
+                    before = json.loads(json.dumps(config))
+                    error = web_viewer._save_usage_limits(payload, config)
+                    self.assertEqual(error, "Limits for 'openai-codex' must satisfy 0 < soft <= hard <= 100")
+                    self.assertEqual(config, before)
 
     def test_full_page_usage_limits_payload_accepts_equal_limits_and_preserves_step_down(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2015,9 +2026,24 @@ class AccountCardTests(DashboardProbeMixin, unittest.TestCase):
         self.assertNotIn("data-account-toggle", codex_card)
 
     def test_limit_inputs_allow_equal_soft_and_hard_values(self):
-        card = self._card("anthropic", self.CLAUDE_INFO)
-        self.assertIn('min="1" max="100" data-limit="soft"', card)
-        self.assertIn('min="1" max="100" data-limit="hard"', card)
+        from html.parser import HTMLParser
+
+        class LimitInputs(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.bounds = {}
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "input":
+                    attrs = dict(attrs)
+                    limit = attrs.get("data-limit")
+                    if limit in {"soft", "hard"}:
+                        self.bounds[limit] = (attrs.get("min"), attrs.get("max"))
+
+        parser = LimitInputs()
+        parser.feed(self._card("anthropic", self.CLAUDE_INFO))
+        self.assertEqual(parser.bounds["soft"], ("1", "100"))
+        self.assertEqual(parser.bounds["hard"], ("1", "100"))
 
     def test_an_account_without_a_usage_source_shows_the_none_message_and_disabled_limits(self):
         card = self._card("qwen-token", self.NO_USAGE_SOURCE_INFO)
