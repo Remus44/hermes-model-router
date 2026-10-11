@@ -56,7 +56,7 @@ def delegate_task_route():
 
 
 def guard_tool_execution(**kwargs):
-    from . import _delegated_claude_review_status, _load_config, _delegation_targets_detail
+    from . import _delegated_claude_review_status, _load_config, _delegation_targets_detail, _unsupported_label
     from .claude_delegation import TIER_FOR_TARGET
     from .claude_opus_bridge import CLAUDE_REVIEW_MODELS
 
@@ -86,6 +86,15 @@ def guard_tool_execution(**kwargs):
     for task in tasks if isinstance(tasks, list) else [args]:
         task = task if isinstance(task, dict) else {}
         goal = str(task.get("goal") or args.get("goal") or "")
+        unsupported = _unsupported_label(goal)
+        if unsupported:
+            tier, level, levels = unsupported
+            return json.dumps({
+                "error": (
+                    f"Unsupported {tier} effort '{level}'; supported levels: {', '.join(levels)}. "
+                    "Nothing was spawned."
+                )
+            })
         requested_model = str(task.get("model") or args.get("model") or "").strip()
         # The review lookup reads paths out of the goal text. Raising from here
         # would make Hermes skip this whole guard (execution middleware fails

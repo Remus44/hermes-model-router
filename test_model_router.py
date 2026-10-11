@@ -473,15 +473,15 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(decision.tier, "terra")
         self.assertEqual(decision.effort, "medium")
 
-    def test_explicit_sol_override_is_limited_to_medium_effort(self):
+    def test_bare_sol_override_uses_plain_sol_effort(self):
         decision = classify_request(chat_request("[sol] Oldd meg ezt a kritikus production hibát"), 1)
         self.assertEqual(decision.tier, "sol")
-        self.assertEqual(decision.effort, "high")
+        self.assertEqual(decision.effort, "medium")
 
-    def test_xhigh_override_is_still_capped_at_medium(self):
+    def test_stated_sol_xhigh_reaches_the_decision_unchanged(self):
         decision = classify_request(chat_request("[sol:xhigh] Készíts részletes implementációs tervet."), 1)
         self.assertEqual(decision.tier, "sol")
-        self.assertEqual(decision.effort, "high")
+        self.assertEqual(decision.effort, "xhigh")
 
     def test_completed_terra_supervisor_review_stays_with_terra_despite_long_result(self):
         result = "[ASYNC DELEGATION BATCH COMPLETE — deleg_test] Role: orchestrator [terra] " + ("reviewed evidence " * 500)

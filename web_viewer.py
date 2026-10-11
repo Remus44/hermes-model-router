@@ -1032,6 +1032,24 @@ def _has_legacy_claude_keys(local: dict) -> bool:
     return isinstance(local, dict) and ("workflow" in local or (isinstance(block, dict) and "enabled" in block))
 
 
+def _legacy_effort_keys(local: dict) -> tuple[str, ...]:
+    effort = local.get("effort") if isinstance(local, dict) else None
+    if not isinstance(effort, dict):
+        return ()
+    return tuple(sorted(str(key) for key in effort if str(key).startswith("explicit_")))
+
+
+def _remove_legacy_effort_keys(local: dict) -> None:
+    effort = local.get("effort") if isinstance(local, dict) else None
+    if not isinstance(effort, dict):
+        return
+    for key in tuple(effort):
+        if str(key).startswith("explicit_"):
+            effort.pop(key, None)
+    if not effort:
+        local.pop("effort", None)
+
+
 def _effective_router_config(shipped: dict, local: dict) -> dict:
     """``local`` over ``shipped``, with the retired keys translated exactly as the router does.
 
@@ -1307,7 +1325,7 @@ label{display:grid;gap:5px;color:var(--muted);font-size:12px}input,select,button
 <div class="cards"><div class="card"><div class="n" id="total">0</div><div class="k" data-i18n="card.total">Összes routing döntés</div></div><div class="card luna"><div class="n" id="luna">0</div><div class="k" data-i18n="card.luna">GPT-6 Luna</div></div><div class="card spark"><div class="n" id="spark">0</div><div class="k" data-i18n="card.spark">GPT-5.3 Spark</div></div><div class="card terra"><div class="n" id="terra">0</div><div class="k" data-i18n="card.terra">GPT-5.6 Terra</div></div><div class="card sol"><div class="n" id="sol">0</div><div class="k" data-i18n="card.sol">GPT-6 Sol</div></div><div class="card opus5"><div class="n" id="opus5">0</div><div class="k" data-i18n="card.opus5">Claude Opus 5.5</div></div><div class="card sonnet5"><div class="n" id="sonnet5">0</div><div class="k" data-i18n="card.sonnet5">Claude Sonnet 5</div></div><div class="card haiku"><div class="n" id="haiku">0</div><div class="k" data-i18n="card.haiku">Claude Haiku 4.5</div></div><div class="card qwen"><div class="n" id="qwen">0</div><div class="k" data-i18n="card.qwen">Qwen 3.7 Plus</div></div><div class="card grok"><div class="n" id="grok">0</div><div class="k" data-i18n="card.grok">Grok 4.7</div></div></div>
 <div class="account-groups" id="account-groups"></div>
 <div id="runs" class="router-runs" aria-live="polite"></div><div class="table-wrap" hidden><table id="log-table"><colgroup><col style="width:55px"><col style="width:110px"><col style="width:90px"><col style="width:350px"><col style="width:90px"><col style="width:230px"><col style="width:480px"></colgroup><thead><tr><th class="expand"></th><th data-i18n="th.date">Dátum</th><th data-i18n="th.time">Idő (CET/CEST)</th><th data-i18n="th.prompt">Prompt</th><th class="calls" data-i18n="th.calls">Hívások</th><th data-i18n="th.route">Útvonal</th><th data-i18n="th.reason">Indok</th></tr></thead><tbody id="rows"></tbody></table></div></section>
-<section id="settings-panel" class="panel" hidden><h2 class="panel-heading"><span data-i18n="settings.heading">Beállítások</span> <span class="settings-status" id="settings-status"></span></h2><div class="sub" data-i18n="settings.sub">Modellek hívhatósága és alapértelmezett modell</div><div class="settings"><div class="settings-section"><h3 data-i18n="settings.accounts.heading">Fiókok</h3><div class="account-cards" id="account-cards"></div></div><div class="settings-section" id="balance-section" hidden><h3 data-i18n="settings.balance.heading">Terheléselosztás</h3><div id="balance-settings"></div></div><div class="settings-section"><h3 data-i18n="settings.main.heading">Fő agent</h3><div class="sub"><span data-i18n="settings.main.sub"></span> <b class="fb-file" data-i18n="settings.fb.file"></b></div><div class="pref-kinds" id="main-chain"></div></div><div class="settings-section"><h3 data-i18n="settings.workers.heading">Workerek</h3><div class="sub" data-i18n="settings.workers.sub"></div><div class="pref-kinds" id="worker-settings"></div></div><div class="settings-section"><h3 data-i18n="settings.prefs.heading">Preferált modellek munkatípusonként</h3><div class="sub" data-i18n="settings.prefs.sub">Sorrendben, a legjobb elöl. A router az első hívható elemet választja.</div><div class="pref-kinds" id="pref-kinds"></div></div><div class="settings-section"><h3 data-i18n="settings.language">Nyelv</h3><div class="default-model-row"><label><span data-i18n="settings.language">Nyelv</span><select id="language-select"><option value="en" data-i18n="settings.lang.en">English</option><option value="hu" data-i18n="settings.lang.hu">Magyar</option></select></label></div></div></div></section>
+<section id="settings-panel" class="panel" hidden><h2 class="panel-heading"><span data-i18n="settings.heading">Beállítások</span> <span class="settings-status" id="settings-status"></span></h2><div class="sub" data-i18n="settings.sub">Modellek hívhatósága és alapértelmezett modell</div><div id="legacy-effort-notice"></div><div class="settings"><div class="settings-section"><h3 data-i18n="settings.accounts.heading">Fiókok</h3><div class="account-cards" id="account-cards"></div></div><div class="settings-section" id="balance-section" hidden><h3 data-i18n="settings.balance.heading">Terheléselosztás</h3><div id="balance-settings"></div></div><div class="settings-section"><h3 data-i18n="settings.main.heading">Fő agent</h3><div class="sub"><span data-i18n="settings.main.sub"></span> <b class="fb-file" data-i18n="settings.fb.file"></b></div><div class="pref-kinds" id="main-chain"></div></div><div class="settings-section"><h3 data-i18n="settings.workers.heading">Workerek</h3><div class="sub" data-i18n="settings.workers.sub"></div><div class="pref-kinds" id="worker-settings"></div></div><div class="settings-section"><h3 data-i18n="settings.prefs.heading">Preferált modellek munkatípusonként</h3><div class="sub" data-i18n="settings.prefs.sub">Sorrendben, a legjobb elöl. A router az első hívható elemet választja.</div><div class="pref-kinds" id="pref-kinds"></div></div><div class="settings-section"><h3 data-i18n="settings.language">Nyelv</h3><div class="default-model-row"><label><span data-i18n="settings.language">Nyelv</span><select id="language-select"><option value="en" data-i18n="settings.lang.en">English</option><option value="hu" data-i18n="settings.lang.hu">Magyar</option></select></label></div></div></div></section>
 <section id="command-panel" class="panel" hidden><h2 class="panel-heading"><span data-i18n="tab.command">Hermes Command Center</span></h2><div class="sub">A Hermes hivatalos helyi kezelőfelülete</div><iframe class="command-frame" title="Hermes Command Center" src="http://127.0.0.1:9119/"></iframe></section>
 </main>
 <script>
@@ -1457,6 +1475,8 @@ const I18N = {
     'settings.effort.medium': 'medium',
     'settings.effort.high': 'high',
     'settings.effort.xhigh': 'xhigh',
+    'settings.effort.legacy.notice': 'Retired local effort keys: {keys}. Remove them to keep the local overlay clear; labelled requests use their stated effort.',
+    'settings.effort.legacy.remove': 'Remove retired effort keys',
     'settings.claude_effort.haiku_no_reasoning': 'no reasoning allowed',
     'settings.claude_effort.default': 'Default ({level})',
     'settings.prefs.heading': 'Routing: preferred models per kind of work',
@@ -1690,6 +1710,8 @@ const I18N = {
     'settings.effort.medium': 'medium',
     'settings.effort.high': 'high',
     'settings.effort.xhigh': 'xhigh',
+    'settings.effort.legacy.notice': 'Elavult helyi erőfeszítés-kulcsok: {keys}. Távolítsd el őket a helyi felülírás tisztán tartásához; a címkézett kérések a megadott erőfeszítést használják.',
+    'settings.effort.legacy.remove': 'Elavult erőfeszítés-kulcsok eltávolítása',
     'settings.claude_effort.haiku_no_reasoning': 'nincs gondolkodás',
     'settings.claude_effort.default': 'Alapértelmezett ({level})',
     'settings.prefs.heading': 'Útválasztás: preferált modellek munkatípusonként',
@@ -1838,6 +1860,7 @@ function renderSettings(){
   const modelLabels={luna:t('card.luna'),spark:t('card.spark'),terra:t('card.terra'),sol:t('card.sol'),opus5:t('card.opus5'),sonnet5:t('card.sonnet5'),haiku:t('card.haiku'),qwen:t('card.qwen'),grok:t('card.grok')};
   const modelDescriptions={luna:t('model.desc.luna'),spark:t('model.desc.spark'),terra:t('model.desc.terra'),sol:t('model.desc.sol'),opus5:t('model.desc.opus5'),sonnet5:t('model.desc.sonnet5'),haiku:t('model.desc.haiku'),qwen:t('model.desc.qwen'),grok:t('model.desc.grok')};
   renderAccounts();
+  renderLegacyEffortNotice();
   renderBalance();
   renderPreferences(modelLabels);
   renderMainChain(modelLabels,models);
@@ -1911,6 +1934,8 @@ function balanceControl(balance){if(!balance)return '';
 function renderBalance(){const section=$('balance-section');if(!section)return;
   const shown=!!currentConfig.balance&&balanceAccounts(currentConfig.accounts,currentConfig.callable||{})>=2;
   section.hidden=!shown;$('balance-settings').innerHTML=shown?balanceControl(currentConfig.balance):''}
+function renderLegacyEffortNotice(){const box=$('legacy-effort-notice'),keys=currentConfig.legacy_effort_keys||[];if(!box)return;box.replaceChildren();if(!keys.length)return;const note=document.createElement('div');note.className='pref-note';note.textContent=t('settings.effort.legacy.notice').replace('{keys}',keys.join(', '));const button=document.createElement('button');button.type='button';button.textContent=t('settings.effort.legacy.remove');button.addEventListener('click',removeLegacyEffortKeys);note.append(document.createElement('br'),button);box.append(note)}
+async function removeLegacyEffortKeys(){if(!currentConfig)return;const statusEl=$('settings-status');try{statusEl.textContent=t('settings.saving');statusEl.style.color='#c4b5fd';const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision:currentConfig.revision,remove_legacy_effort_keys:true})});const result=await response.json();if(!response.ok||!result.success)throw new Error(result.error||`HTTP ${response.status}`);currentConfig.revision=result.revision;currentConfig.legacy_effort_keys=[];renderLegacyEffortNotice();statusEl.textContent=t('settings.saved');statusEl.style.color='#88e36f'}catch(error){statusEl.textContent=t('settings.error.prefix')+error.message+' '+t('settings.reload');statusEl.style.color='#ff6b7a'}}
 function renderAccounts(){const box=$('account-cards');if(!box)return;const accounts=currentConfig.accounts||{};box.innerHTML=Object.entries(accounts).map(([a,info])=>accountCard(a,info)).join('')}
 async function refreshUsage(account){const errors=currentConfig.usage_errors=currentConfig.usage_errors||{};try{const r=await fetch(`/api/usage/refresh?account=${encodeURIComponent(account)}`,{method:'POST'});const body=await r.json().catch(()=>({}));if(r.ok){delete errors[account];currentConfig.accounts[account]=body.account}else errors[account]=body.error||`HTTP ${r.status}`}catch(e){errors[account]=String(e.message||e)}renderAccounts()}
 const defaultWidths=[55,110,90,350,90,230,480],widthStore='model-router-column-widths-v3';
@@ -2365,6 +2390,11 @@ def _save_config_payload(data):
         local_path = _local_config_path()
         local, dump = _read_router_config_for_update(local_path)
         local_plain = _load_yaml_mapping(local_path)
+        if "remove_legacy_effort_keys" in data:
+            if data["remove_legacy_effort_keys"] is not True:
+                return 400, {"success": False, "error": "remove_legacy_effort_keys must be true"}
+            _remove_legacy_effort_keys(local)
+            _remove_legacy_effort_keys(local_plain)
         legacy = _has_legacy_claude_keys(local_plain)
         config = _effective_router_config(shipped, local_plain)
         hermes_before = HERMES_CONFIG_PATH.read_bytes() if HERMES_CONFIG_PATH.exists() else None
@@ -2547,6 +2577,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with _CONFIG_LOCK:
                     config = _read_router_config()
+                    local = _load_yaml_mapping(_local_config_path())
                     router = _router_module()
                     work_kinds = list(getattr(router, "WORK_KINDS", ())) if router else []
                     response = {
@@ -2556,6 +2587,7 @@ class Handler(BaseHTTPRequestHandler):
                         "balance": _balance_status(config),
                         "default_model": config.get("default_model", "terra"),
                         "effort": _effort_status(config),
+                        "legacy_effort_keys": list(_legacy_effort_keys(local)),
                         "claude_reasoning_effort": _claude_reasoning_status(config),
                         "preferences": config.get("preferences") or {},
                         "work_kinds": work_kinds,

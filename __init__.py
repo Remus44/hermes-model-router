@@ -33,6 +33,17 @@ from . import usage_guard
 from . import worker_admission
 from . import triage
 from .hermes_paths import hermes_path
+from agent.reasoning_effort import CODEX_ASTRA_EFFORTS, CODEX_GPT56_EFFORTS, CODEX_LEGACY_EFFORTS
+
+
+# Exact per-label Codex vocabularies. These are intentionally derived from the
+# host's wire tables, not from the dashboard's shared editable levels.
+_CODEX_TIER_EFFORTS = {
+    "luna": tuple(level for level in CODEX_GPT56_EFFORTS if level != "none"),
+    "spark": tuple(level for level in CODEX_LEGACY_EFFORTS if level != "none"),
+    "terra": tuple(level for level in CODEX_GPT56_EFFORTS if level != "none"),
+    "sol": tuple(CODEX_ASTRA_EFFORTS),
+}
 
 _logger = logging.getLogger("model_router")
 
@@ -93,15 +104,12 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "luna_max_chars": 700,
         "sol_min_chars": 3500,
     },
-    # Keyed by tier, by ``explicit_<tier>`` for a labelled route, and by
-    # ``explicit_<tier>_xhigh`` for one that asked to be escalated. Unset keys
-    # degrade to the plain tier, so adding a tier here is optional.
+    # Plain per-tier configured effort. Explicit [tier:level] labels bypass this
+    # configuration and use the exact stated supported level; sol_long remains a
+    # separate automatic long-request setting.
     "effort": {
         "luna": "low", "spark": "low", "terra": "medium", "sol": "high", "qwen": "medium",
         "grok": "medium",
-        "explicit_sol": "xhigh",
-        "explicit_luna_xhigh": "high", "explicit_spark_xhigh": "high",
-        "explicit_terra_xhigh": "high", "explicit_sol_xhigh": "xhigh",
     },
     # Provider mapping per tier: which Hermes provider handles each tier.
     "tier_providers": {
@@ -755,8 +763,33 @@ _SPARK_CONSEQUENTIAL_WORK = re.compile(
 )
 
 
-_PLAN_LABEL = re.compile(r"^\s*\[(luna|spark|terra|sol)(?::xhigh)?\](?:\s|$)")
+_CODEX_LABEL = re.compile(r"^\s*\[(?P<tier>luna|spark|terra|sol)(?::(?P<level>[a-z]+))?\](?:\s|$)", re.I)
+# A valid router label only: an unsupported level is deliberately not a label on
+# a root turn, while dispatch admission recognises it separately and refuses it.
+_PLAN_LABEL = _CODEX_LABEL
 _CLAUDE_REVIEW_LABEL = re.compile(r"^\s*\[(opus|sonnet)5?-review\](?:\s|$)")
+
+
+def _label_match(text: str) -> Optional[re.Match[str]]:
+    match = _CODEX_LABEL.match(text or "")
+    if not match:
+        return None
+    level = match.group("level")
+    tier = match.group("tier").casefold()
+    if level is None or level.casefold() in _CODEX_TIER_EFFORTS[tier]:
+        return match
+    return None
+
+
+def _unsupported_label(text: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+    match = _CODEX_LABEL.match(text or "")
+    if not match or match.group("level") is None:
+        return None
+    tier = match.group("tier").casefold()
+    level = match.group("level").casefold()
+    levels = _CODEX_TIER_EFFORTS[tier]
+    return None if level in levels else (tier, level, levels)
+
 # A goal that names an external target the way a Sol or Spark goal names its
 # tier. It is not a route and never has been -- the override regex knows only
 # the four tiers of the default provider -- so the leaf runs on whatever the
@@ -804,7 +837,7 @@ def _is_plan_labelled_worker(text: str) -> bool:
     -- and it cannot even tell the cases apart: `_is_design_request` is true both
     for "identify the layout branches" and for "implement a responsive CSS card".
     """
-    return bool(_PLAN_LABEL.match(text))
+    return _label_match(text) is not None
 
 
 def _is_design_request(text: str) -> bool:
@@ -1416,8 +1449,11 @@ def _kind_for_goal(goal: str, cfg: Dict[str, Any]) -> str:
     never associated with it.
     """
     # A route label describes the stopped worker, not the semantic work kind.
-    goal = re.sub(r"^\s*\[(?:luna|spark|terra|sol|opus5|sonnet5|haiku|qwen|grok)(?::xhigh)?\]\s*",
-                  "", goal, flags=re.I)
+    label = _label_match(goal)
+    if label:
+        goal = goal[label.end():]
+    else:
+        goal = re.sub(r"^\s*\[(?:opus5|sonnet5|haiku|qwen|grok)\]\s*", "", goal, flags=re.I)
     if not goal.strip():
         return "default"
     try:
@@ -1657,33 +1693,19 @@ def _decision(
     *,
     explicit: bool = False,
     effort_key: Optional[str] = None,
+    stated_effort: Optional[str] = None,
     mandatory: bool = False,
     kind: str = "",
 ) -> RouteDecision:
     efforts = cfg.get("effort") or {}
-    if effort_key is None:
-        # The explicit-label bump used to be Sol's alone, so ``explicit_<tier>``
-        # was unreadable config for every other tier. It is consulted for all of
-        # them now, but only where the operator actually wrote the key: an absent
-        # one must leave that tier exactly as it routed before.
-        #
-        # Sol keeps its unconditional form. There the missing key deliberately
-        # falls through to the built-in tier default rather than the configured
-        # ``sol`` value -- an explicit Sol label is an escalation, and the tests
-        # pin that behaviour.
-        explicit_key = f"explicit_{tier}"
-        use_explicit = explicit and (tier == "sol" or explicit_key in efforts)
-        effort_key = explicit_key if use_explicit else tier
-    # An escalation degrades to the tier's explicit key, never to its floor: a
-    # missing ``explicit_<tier>_xhigh`` means "no escalation configured", and
-    # answering that with the plain tier value would silently cap [sol:xhigh].
-    candidates = [effort_key]
-    if effort_key.endswith("_xhigh"):
-        candidates.append(effort_key[: -len("_xhigh")])
-    effort = next(
-        (str(efforts[key]).casefold() for key in candidates if efforts.get(key)),
-        _DEFAULT_EFFORT.get(tier, "medium"),
-    )
+    # A bare label shares the dashboard's tier setting. A stated level has
+    # already been validated against this tier's host vocabulary and must reach
+    # the wire exactly; retired explicit_* keys are intentionally invisible.
+    if stated_effort is not None:
+        effort = stated_effort
+    else:
+        key = effort_key or tier
+        effort = str(efforts.get(key) or _DEFAULT_EFFORT.get(tier, "medium")).casefold()
     return RouteDecision(
         tier=tier, model=cfg["models"][tier], reason=reason, effort=effort,
         mandatory=mandatory, kind=kind,
@@ -1864,9 +1886,9 @@ def _classify_request(
                 return _decision("terra", "Spark is restricted to non-design read-only subtasks", cfg)
         return _decision(benchmark_force, "benchmark environment force override", cfg, explicit=True)
 
-    override = re.match(r"^\s*\[(luna|spark|terra|sol)(?::(xhigh))?\](?:\s|$)", text)
+    override = _label_match(text)
     if override:
-        tier = override.group(1)
+        tier = override.group("tier").casefold()
         if tier == "spark" and has_image_attachment:
             return _decision("terra", "image attachment requires a vision-capable route", cfg, mandatory=True)
         # A delegated leaf carries a conductor's declaration, so the router
@@ -1888,13 +1910,10 @@ def _classify_request(
             if _is_design_request(user_text):
                 return _decision("sol", "design analysis or implementation is Sol-only", cfg, mandatory=True, kind="design")
             return _decision("terra", f"{tier.capitalize()} is restricted to non-design read-only subtasks", cfg)
-        requested_effort = override.group(2)
-        # Escalation is not Sol's alone. The ``:xhigh`` suffix parsed for every
-        # tier and was then discarded for all but Sol, so [luna:xhigh] silently
-        # ran at Luna's floor effort with no way to say otherwise.
-        effort_key = f"explicit_{tier}_xhigh" if requested_effort == "xhigh" else None
+        requested_effort = override.group("level")
+        requested_effort = requested_effort.casefold() if requested_effort else None
         label = f"{tier}:{requested_effort}" if requested_effort else tier
-        return _decision(tier, f"explicit [{label}] override", cfg, explicit=True, effort_key=effort_key)
+        return _decision(tier, f"explicit [{label}] override", cfg, explicit=True, stated_effort=requested_effort)
 
     # The durable completion of a [terra] orchestrator includes the complete
     # reviewed evidence and can be much longer than the normal Sol threshold.
@@ -3948,6 +3967,7 @@ def _routing_note(request: Dict[str, Any], kwargs: Dict[str, Any], cfg: Dict[str
                      f"(soft {limits['soft_percent']:.0f}%, hard {limits['hard_percent']:.0f}%)")
     if usage:
         lines.append("Usage: " + "; ".join(usage) + ".")
+    lines.append("When the user states a model effort, write [tier:level]; otherwise use a bare [tier] label.")
     lines.append(_DEFERRED_DELEGATION_HINT.rstrip())
     lines.append("Advisory: if you route differently, say why in one line.")
     return "\n\n" + "\n".join(lines) + "\n"
@@ -4113,9 +4133,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     session_policy = cfg.get("session_policy") or {}
     latest_user_text, _ = _last_user_text_and_index(_request_items(request))
     latest_user_text = _without_host_injected_context(_without_router_contract(latest_user_text))
-    explicit_root_override = bool(
-        re.match(r"^\s*\[(?:luna|spark|terra|sol)(?::xhigh)?\](?:\s|$)", _normalise(latest_user_text))
-    )
+    explicit_root_override = _label_match(_normalise(latest_user_text)) is not None
     if (
         not subagent_marker
         and bool(session_policy.get("pin_root_parent", False))
@@ -4188,7 +4206,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # A rejected leaf fared worse -- "consequential Spark task requires Sol"
         # was demoted to Terra, turning a deliberate escalation into the exact
         # tier the escalation existed to avoid.
-        and not _PLAN_LABEL.match(_normalise(latest_user_text))
+        and _label_match(_normalise(latest_user_text)) is None
     ):
         # The delegation default is Terra so the forced first child is a real
         # planner. Unlabelled child work remains with the default_model rather

@@ -3043,9 +3043,7 @@ class ReasoningEffortSettingsTests(DashboardProbeMixin, unittest.TestCase):
         "tier_providers": {"luna": "openai-codex", "spark": "openai-codex", "terra": "openai-codex", "sol": "openai-codex", "grok": "xai-oauth"},
         "effort": {
             "luna": "low", "spark": "medium", "terra": "medium", "sol": "medium", "grok": "medium",
-            "opus5": "external", "sol_long": "medium", "explicit_sol": "medium",
-            "explicit_sol_xhigh": "medium", "explicit_luna_xhigh": "high",
-            "explicit_spark_xhigh": "high", "explicit_terra_xhigh": "high",
+            "opus5": "external", "sol_long": "medium",
         },
     }
 
@@ -3087,6 +3085,32 @@ class ReasoningEffortSettingsTests(DashboardProbeMixin, unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["effort"], {"luna": "low", "spark": "medium", "terra": "medium", "sol": "medium", "grok": "medium"})
         self.assertNotIn("opus5", payload["effort"])
+
+    def test_legacy_effort_keys_are_not_written_until_owner_removes_them(self):
+        shipped = json.loads(json.dumps(self.CONFIG))
+        for key in tuple(shipped["effort"]):
+            if key.startswith("explicit_"):
+                shipped["effort"].pop(key)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "router_config.yaml"
+            config_path.write_text(web_viewer.yaml.safe_dump(shipped), encoding="utf-8")
+            local = config_path.with_name("router_config.local.yaml")
+            original = "effort:\n  terra: high\n  explicit_sol: low\n  explicit_terra_xhigh: high\n"
+            local.write_text(original, encoding="utf-8")
+            status, payload = self._request(config_path, "GET")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["legacy_effort_keys"], ["explicit_sol", "explicit_terra_xhigh"])
+            self.assertEqual(local.read_text(encoding="utf-8"), original)
+            status, body = self._request(config_path, "POST", {
+                "revision": payload["revision"], "remove_legacy_effort_keys": True,
+            })
+            self.assertEqual(status, 200, body)
+            self.assertTrue(body["success"])
+            self.assertEqual(web_viewer.yaml.safe_load(local.read_text(encoding="utf-8")), {"effort": {"terra": "high"}})
+        for key in ("settings.effort.legacy.notice", "settings.effort.legacy.remove"):
+            self.i18n(key)
+        self.assertIn("function renderLegacyEffortNotice()", HTML)
+        self.assertIn("remove_legacy_effort_keys:true", HTML)
 
     def test_a_valid_effort_save_writes_only_the_local_delta_and_preserves_the_shipped_file(self):
         with tempfile.TemporaryDirectory() as directory:

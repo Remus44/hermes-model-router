@@ -633,8 +633,10 @@ protects ordinary save failures; it is not a cross-file crash transaction.
 
 ### Reasoning effort per tier
 
-A route carries an effort level, not just a model name. `effort:` sets it per tier,
-and separately for the cases where the same tier means different work:
+A route carries an effort level, not just a model name. `effort:` sets the one
+configured default for each tier; a bare `[<tier>]` label uses that same value the
+Settings tab shows. `sol_long` remains a separate automatic setting for long
+requests, not a label override:
 
 ```yaml
 effort:
@@ -642,35 +644,27 @@ effort:
   terra: medium
   sol: medium
   sol_long: medium            # reached by length, not by choice
-  explicit_sol: medium        # you asked for Sol
-  explicit_sol_xhigh: high    # you asked for Sol and said how hard
-  explicit_luna_xhigh: high   # ...and the same for every other tier
-  explicit_terra_xhigh: high
 ```
 
-`[<tier>:xhigh]` is the label form. It parsed for every tier from the start but
-was honoured only for Sol, so `[luna:xhigh]` ran silently at Luna's floor with no
-way to say otherwise; `explicit_<tier>` was unreadable config everywhere else for
-the same reason. Both keys are general since 1.9.5.
+When the user states effort for a Codex model, the parent writes
+`[<tier>:<level>]`. The requested level reaches the route and wire exactly; it
+is never remapped between `high` and `xhigh`. Each tier accepts only the levels
+its configured host model supports; an unsupported level (including `none`) is
+refused before delegation, while an unsupported label on a root user message is
+ordinary unlabelled text. Otherwise the parent writes a bare `[<tier>]` label.
 
-Resolution walks from the most specific key to the plain tier, and **a key you
-have not written changes nothing** — that is what makes adding a tier here
-optional rather than a behaviour change. An escalation degrades to its tier's
-`explicit_` key rather than to the tier's floor, so a missing
-`explicit_<tier>_xhigh` means "no escalation configured" instead of silently
-capping the request.
-
-The Settings tab edits the five plain routed-tier keys: `luna`, `spark`,
-`terra`, `sol`, and `grok`, in dropdowns beside their switches in the Codex and
-Grok account cards' **Models** blocks. `effort.grok` reaches Grok the same way
-as the Codex tiers' effort. `opus5` is a route/log marker; Qwen has no dashboard effort
-control because the router strips reasoning; and Claude-only `haiku` / `sonnet5`
-are not routed here — this `effort:` map cannot reach a delegated Claude child at
-all, since the router never runs on that call. Sonnet and Opus have their own
-controls beside their switches in the Claude account card: see [Claude reasoning
-effort](#claude-reasoning-effort). The situational `sol_long` and
-`explicit_<tier>` / `explicit_<tier>_xhigh` keys remain file-only in
-`router_config.yaml` or its local overlay.
+`explicit_<tier>` and `explicit_<tier>_xhigh` are retired effort keys. The router
+ignores them in a local overlay and never rewrites that overlay automatically.
+When they remain in `router_config.local.yaml`, Settings names them and offers an
+owner-triggered removal that writes only the local delta. The Settings tab edits
+the five plain routed-tier keys: `luna`, `spark`, `terra`, `sol`, and `grok`, in
+dropdowns beside their switches in the Codex and Grok account cards' **Models**
+blocks. `effort.grok` reaches Grok the same way as the Codex tiers' effort.
+`opus5` is a route/log marker; Qwen has no dashboard effort control because the
+router strips reasoning; and Claude-only `haiku` / `sonnet5` are not routed here
+— this `effort:` map cannot reach a delegated Claude child at all. Sonnet and
+Opus have their own controls beside their switches in the Claude account card:
+see [Claude reasoning effort](#claude-reasoning-effort).
 
 ### Images force a vision-capable route
 
@@ -1932,9 +1926,10 @@ points the agent at a working route; before, the call reached the disabled accou
 Spark, Terra and Sol. The picker offers the four shared provider levels — `low`,
 `medium`, `high` and `xhigh` — and writes only its changed tier into
 `router_config.local.yaml`; `router_config.yaml` remains the shipped default.
-Route markers and situational effort keys, including `opus5`, `sol_long` and the
-`explicit_*` keys, stay file-only because they do not mean one ordinary tier
-setting.
+Route markers and situational effort keys, including `opus5` and `sol_long`, stay
+file-only because they do not mean one ordinary tier setting. Retired `explicit_*`
+keys are detected as local migration leftovers and can be removed by their owner in
+Settings.
 
 **1.16.0** — The Luna and Sol tiers run GPT-6 Luna (`gpt-6-luna`) and GPT-6 Sol (`gpt-6-sol`) instead of GPT-5.6. The `models.luna` and `models.sol` defaults moved together, while the tier keys stay `luna` and `sol`; preference chains, fallbacks and existing logs need no rewrite. The dashboard still counts older GPT-5.6 Luna and Sol log lines under the same cards.
 
