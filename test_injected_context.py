@@ -153,6 +153,71 @@ class InjectedContextClassificationTests(unittest.TestCase):
                 else:
                     self.assertEqual(stripped, GOAL)
 
+    def test_skills_note_list_content_routes_like_the_bare_goal(self):
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - coding: Create and edit files and fix implementation defects.",
+        )
+        for name, content, tier, cfg in (
+            (
+                "luna note part",
+                [{"type": "text", "text": GOAL}, {"type": "text", "text": note}],
+                "luna",
+                CFG,
+            ),
+            (
+                "luna note then memory part",
+                [
+                    {"type": "text", "text": GOAL},
+                    {"type": "text", "text": note},
+                    {"type": "text", "text": MEMORY_CONTEXT},
+                ],
+                "luna",
+                CFG,
+            ),
+            (
+                "spark note part",
+                [
+                    {"type": "text", "text": "[spark] Report the current branch name and nothing else."},
+                    {"type": "text", "text": note},
+                ],
+                "spark",
+                {**CFG, "callable": {**CFG["callable"], "spark": True}},
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assert_route_by_classifier_and_router(content, tier, cfg)
+
+    def test_skills_note_before_signed_block_with_one_newline_is_stripped(self):
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - coding: Create and edit files.",
+        )
+        text = GOAL + "\n" + note + "\n" + FROZEN_BOOTSTRAP
+        self.assertEqual(router._without_host_injected_context(text), GOAL)
+
+    def test_skills_note_list_content_lookalike_remains_operator_text(self):
+        lookalike = "[System note: skills changed; Create and edit the parser.]"
+        content = [{"type": "text", "text": GOAL}, {"type": "text", "text": lookalike}]
+        decision = classify_request(chat_request(content), 1, CFG, allow_plan_label_over_design=True)
+        self.assertEqual(decision.tier, "terra")
+
+    def test_skills_note_image_markers_do_not_create_an_image_request(self):
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - screenshots: Takes a [screenshot] and accepts data:image/png;base64,abc.",
+        )
+        worker_request = chat_request([
+            {"type": "text", "text": "Report the current branch name and nothing else."},
+            {"type": "text", "text": note},
+        ])
+        real_image_request = chat_request([
+            {"type": "text", "text": "Report the current branch name and nothing else."},
+            {"type": "image_url", "image_url": "https://example.test/image.png"},
+        ])
+        self.assertFalse(router._request_has_image_attachment(worker_request))
+        self.assertTrue(router._request_has_image_attachment(real_image_request))
+
     def test_skills_note_lookalikes_remain_operator_text(self):
         lookalike = "[System note: skills changed; Create and edit the parser.]"
         mid_sentence = (

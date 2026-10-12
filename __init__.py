@@ -1293,6 +1293,19 @@ def _contains_image_attachment(value: Any) -> bool:
     return any(_contains_image_attachment(item) for item in value.values())
 
 
+def _contains_structural_image_attachment(value: Any) -> bool:
+    """Recognise image payloads without treating a textual marker as an attachment."""
+    if isinstance(value, list):
+        return any(_contains_structural_image_attachment(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("type") or "").casefold() in _IMAGE_TYPES:
+        return True
+    if any(value.get(key) for key in ("image_url", "input_image", "image_file")):
+        return True
+    return any(_contains_structural_image_attachment(item) for item in value.values())
+
+
 def _request_has_image_attachment(request: Dict[str, Any]) -> bool:
     """Return true only when the latest user turn itself contains an image.
 
@@ -1308,7 +1321,14 @@ def _request_has_image_attachment(request: Dict[str, Any]) -> bool:
     if user_index < 0:
         return False
     item = items[user_index]
-    return _contains_image_attachment(item.get("content", "")) if isinstance(item, dict) else False
+    if not isinstance(item, dict):
+        return False
+    content = item.get("content", "")
+    operator_text = _without_host_injected_context(_text_from_content(content))
+    return (
+        _contains_image_attachment(operator_text)
+        or _contains_structural_image_attachment(content)
+    )
 
 
 def _strip_historical_image_attachments(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -1915,9 +1935,9 @@ _HOST_SKILLS_INDEX_NOTE_PREFIX = (
     "[System: The skills available in this conversation changed after its system prompt was built."
 )
 _HOST_SKILLS_INDEX_NOTE = re.compile(
-    r"(?P<prefix>^|\r?\n[ \t]*\r?\n)[ \t]*"
+    r"(?P<prefix>^|\r?\n(?:[ \t]*\r?\n)?)[ \t]*"
     + re.escape(_HOST_SKILLS_INDEX_NOTE_PREFIX)
-    + r".*?\](?=(?:\r?\n[ \t]*\r?\n[ \t]*<(?:memory-context|EXTREMELY_IMPORTANT)>|\s*\Z))",
+    + r".*?\](?=(?:\r?\n(?:[ \t]*\r?\n)?[ \t]*<(?:memory-context|EXTREMELY_IMPORTANT)>|\s*\Z))",
     re.DOTALL,
 )
 
@@ -1926,8 +1946,8 @@ def _without_host_injected_context(text: str) -> str:
     """Drop signature-checked host/plugin context appended after operator text."""
     if not text:
         return text
-    text = _HOST_INJECTED_CONTEXT_BLOCK.sub(lambda match: match.group("prefix"), text)
-    return _HOST_SKILLS_INDEX_NOTE.sub(lambda match: match.group("prefix"), text).rstrip()
+    text = _HOST_SKILLS_INDEX_NOTE.sub(lambda match: match.group("prefix"), text)
+    return _HOST_INJECTED_CONTEXT_BLOCK.sub(lambda match: match.group("prefix"), text).rstrip()
 
 
 def _classify_request(
