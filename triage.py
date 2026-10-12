@@ -165,13 +165,13 @@ def skip_reason(kwargs: Dict[str, Any], cfg: Dict[str, Any], kind: str = "") -> 
         return "no_triage_tool"
     items = _request_items(request)
     user_text, user_index = _last_user_text_and_index(items)
-    if not user_text:
+    operator_text = _without_host_injected_context(_without_router_contract(user_text))
+    if not operator_text:
         return "no_user_text"
-    if _is_delegation_outcome_text(user_text) or _lifecycle_event_kind(request):
+    if _is_delegation_outcome_text(operator_text) or _lifecycle_event_kind(request):
         return "lifecycle_event"
     if _current_turn_has_tool_activity(items, user_index):
         return "tool_activity_before_first_call"
-    operator_text = _without_host_injected_context(_without_router_contract(user_text))
     text = _normalise(operator_text)
     if not text:
         return "no_user_text"

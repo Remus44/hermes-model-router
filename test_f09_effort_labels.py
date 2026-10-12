@@ -426,7 +426,7 @@ class ExactEffortLabelTests(unittest.TestCase):
             self.assertEqual(local.read_text(encoding="utf-8"), local_text)
         self.assertEqual(decision.effort, "high")
 
-    def test_host_skills_delta_note_currently_changes_luna_read_only_classification(self):
+    def test_host_skills_delta_note_does_not_change_luna_read_only_classification(self):
         cfg = shipped_config()
         goal = "[luna] Inspect the configuration and report only."
         skills_delta = (
@@ -436,7 +436,7 @@ class ExactEffortLabelTests(unittest.TestCase):
         )
         plain = router.classify_request(request(goal, cfg), config=cfg)
         noted = router.classify_request(request(goal + "\n\n" + skills_delta, cfg), config=cfg)
-        self.assertEqual((plain.tier, noted.tier), ("luna", "terra"))
+        self.assertEqual((plain.tier, noted.tier), ("luna", "luna"))
 
     def test_typed_labels_keep_read_only_routing_and_admission_with_triage_on_or_off(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
