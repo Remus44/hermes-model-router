@@ -1293,6 +1293,19 @@ def _contains_image_attachment(value: Any) -> bool:
     return any(_contains_image_attachment(item) for item in value.values())
 
 
+def _contains_structural_image_attachment(value: Any) -> bool:
+    """Recognise image payloads without treating a textual marker as an attachment."""
+    if isinstance(value, list):
+        return any(_contains_structural_image_attachment(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("type") or "").casefold() in _IMAGE_TYPES:
+        return True
+    if any(value.get(key) for key in ("image_url", "input_image", "image_file")):
+        return True
+    return any(_contains_structural_image_attachment(item) for item in value.values())
+
+
 def _request_has_image_attachment(request: Dict[str, Any]) -> bool:
     """Return true only when the latest user turn itself contains an image.
 
@@ -1308,7 +1321,14 @@ def _request_has_image_attachment(request: Dict[str, Any]) -> bool:
     if user_index < 0:
         return False
     item = items[user_index]
-    return _contains_image_attachment(item.get("content", "")) if isinstance(item, dict) else False
+    if not isinstance(item, dict):
+        return False
+    content = item.get("content", "")
+    operator_text = _without_host_injected_context(_text_from_content(content))
+    return (
+        _contains_image_attachment(operator_text)
+        or _contains_structural_image_attachment(content)
+    )
 
 
 def _strip_historical_image_attachments(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -1400,7 +1420,7 @@ def _logged_prompt_preview(request: Any, log_cfg: Dict[str, Any]) -> str:
 
 def _lifecycle_event_kind(request: Any) -> Optional[str]:
     """Classify synthetic internal turns without exposing their raw envelope."""
-    text = _prompt_preview(request).casefold()
+    text = _without_host_injected_context(_without_router_contract(_prompt_preview(request))).casefold()
     if text.startswith("[async delegation batch complete") or text.startswith("[async delegation complete"):
         return "async_delegation_completion"
     if text.startswith("[context compaction"):
@@ -1409,9 +1429,10 @@ def _lifecycle_event_kind(request: Any) -> Optional[str]:
 
 
 def _completion_delegation_id(request: Any) -> str:
+    text = _without_host_injected_context(_without_router_contract(_prompt_preview(request)))
     match = re.match(
         r"^\[ASYNC DELEGATION(?: BATCH)? COMPLETE\s+[—-]\s*([^\]\s]+)",
-        _prompt_preview(request),
+        text,
         re.I,
     )
     return match.group(1) if match else ""
@@ -1685,6 +1706,7 @@ def _quota_redispatch_instruction(request: Any, cfg: Dict[str, Any]) -> str:
     work would be the hardcoded selection this design exists to avoid.
     """
     text, _index = _last_user_text_and_index(_request_items(request))
+    text = _without_host_injected_context(_without_router_contract(text))
     if not text:
         return ""
     candidates = (_failed_delegation_blocks(text) or _single_failure_block(text)
@@ -1904,12 +1926,27 @@ _HOST_INJECTED_CONTEXT_BLOCK = re.compile(
     + r")",
     re.DOTALL,
 )
+# Unlike the tagged blocks above, the skills-index delta rides the same user-message
+# channel untagged. Its literal opening sentence is the host's provenance signature.
+# It is only removed as a complete appended note (at end, or immediately before a
+# separately signature-checked host block), never from an operator sentence that
+# merely quotes the prefix.
+_HOST_SKILLS_INDEX_NOTE_PREFIX = (
+    "[System: The skills available in this conversation changed after its system prompt was built."
+)
+_HOST_SKILLS_INDEX_NOTE = re.compile(
+    r"(?P<prefix>^|\r?\n(?:[ \t]*\r?\n)?)[ \t]*"
+    + re.escape(_HOST_SKILLS_INDEX_NOTE_PREFIX)
+    + r".*?\](?=(?:\r?\n(?:[ \t]*\r?\n)?[ \t]*<(?:memory-context|EXTREMELY_IMPORTANT)>|\s*\Z))",
+    re.DOTALL,
+)
 
 
 def _without_host_injected_context(text: str) -> str:
-    """Drop exact host/plugin context blocks appended after the operator text."""
+    """Drop signature-checked host/plugin context appended after operator text."""
     if not text:
         return text
+    text = _HOST_SKILLS_INDEX_NOTE.sub(lambda match: match.group("prefix"), text)
     return _HOST_INJECTED_CONTEXT_BLOCK.sub(lambda match: match.group("prefix"), text).rstrip()
 
 
@@ -3617,13 +3654,13 @@ def _orchestration_skip_reason(
         return "no_delegate_task_tool"
     items = _request_items(request)
     user_text, user_index = _last_user_text_and_index(items)
-    if not user_text:
+    operator_text = _without_host_injected_context(_without_router_contract(user_text))
+    if not operator_text:
         return "no_user_text"
     # Read what the operator actually asked for, not host/plugin context appended
     # after it -- the superpowers bootstrap names delegate_task in its own text, so
     # reading raw text here made every bootstrapped root turn look like an explicit
     # delegation choice and lose its forced preflight.
-    operator_text = _without_host_injected_context(_without_router_contract(user_text))
     # The operator explicitly named a delegation tool for this turn -- the forced
     # delegate_task planning preflight would override that choice. `user_text` is
     # the incoming request's own latest user turn, read before this same call adds
@@ -3658,7 +3695,7 @@ def _orchestration_skip_reason(
     # path intentionally runs inside an existing tool loop.
     if not is_rescue and _current_turn_has_tool_activity(items, user_index):
         return "tool_activity_before_first_call"
-    text = _normalise(user_text)
+    text = _normalise(operator_text)
     # Completion delivery is the Terra supervisor's reviewed hand-back, never a
     # fresh task to fan out again. Without this guard it can recursively create
     # another orchestration cycle merely because the consolidated evidence is long.
@@ -3790,6 +3827,7 @@ def _shadow_eligible(kwargs: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
         return False
     items = _request_items(request)
     text, user_index = _last_user_text_and_index(items)
+    text = _without_host_injected_context(_without_router_contract(text))
     if not text or _current_turn_has_tool_activity(items, user_index):
         return False
     if "[image attached" in _normalise(text) or "[screenshot]" in _normalise(text):
@@ -3997,6 +4035,7 @@ def _routing_note(request: Dict[str, Any], kwargs: Dict[str, Any], cfg: Dict[str
     if not set(_tool_names(request)) & _NOTE_TOOL_NAMES:
         return ""
     text, _index = _last_user_text_and_index(_request_items(request))
+    text = _without_host_injected_context(_without_router_contract(text))
     if not text or _is_delegation_outcome_text(text) or _lifecycle_event_kind(request):
         return ""
     try:
@@ -4152,7 +4191,9 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
             _quota_redispatch_instruction(request, cfg)
             if isinstance(request, dict)
             and _is_delegation_outcome_text(
-                _last_user_text_and_index(_request_items(request))[0]
+                _without_host_injected_context(_without_router_contract(
+                    _last_user_text_and_index(_request_items(request))[0]
+                ))
             )
             else ""
         )
@@ -4598,7 +4639,9 @@ def _durable_fallback_model(
     if (
         active_tier == "sol"
         and isinstance(request, dict)
-        and _is_design_request(_last_user_text_and_index(_request_items(request))[0])
+        and _is_design_request(_without_host_injected_context(_without_router_contract(
+            _last_user_text_and_index(_request_items(request))[0]
+        )))
     ):
         return None
     chain = cfg.get("fallbacks") or {}
@@ -4629,7 +4672,9 @@ def _transient_fallback_model(active_model: str, cfg: Dict[str, Any], request: O
     if (
         active_model == models.get("sol")
         and isinstance(request, dict)
-        and _is_design_request(_last_user_text_and_index(_request_items(request))[0])
+        and _is_design_request(_without_host_injected_context(_without_router_contract(
+            _last_user_text_and_index(_request_items(request))[0]
+        )))
     ):
         # A provider outage must not downgrade design analysis/implementation
         # to Terra or Spark. Preserve the original error for a later Sol retry.
@@ -5838,7 +5883,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
 
     from .claude_opus_bridge import classify_coding_dispatch
 
-    eligible, _reason = classify_coding_dispatch(text)
+    eligible, _reason = classify_coding_dispatch(routing_text)
     if not eligible:
         return None
     repo = str(coding_cfg.get("default_repo") or "").strip()

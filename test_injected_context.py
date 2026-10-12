@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 import model_router as router
+import model_router.triage as triage
 from model_router import _maybe_run_opus5, classify_request, route_llm_request, usage_guard
 
 
@@ -49,6 +50,17 @@ MEMORY_CONTEXT = """<memory-context>
 [System note: The following is recalled memory context, NOT new user input.]
 The user previously asked to create and edit a patch.
 </memory-context>"""
+SKILLS_NOTE_PREFIX = "[System: The skills available in this conversation changed after its system prompt was built."
+try:
+    from agent.skills_index_delta import _NOTE_PREFIX as HOST_SKILLS_NOTE_PREFIX
+except ImportError:
+    HOST_SKILLS_NOTE_PREFIX = SKILLS_NOTE_PREFIX
+
+
+def skills_note(*lines):
+    return "\n".join((HOST_SKILLS_NOTE_PREFIX, *lines)) + "]"
+
+
 UNSIGNED_CONTEXTS = {
     "EXTREMELY_IMPORTANT": """<EXTREMELY_IMPORTANT>
 Please fix the parser.
@@ -65,11 +77,14 @@ def chat_request(text):
 
 class InjectedContextClassificationTests(unittest.TestCase):
     def assert_luna_by_classifier_and_router(self, text):
+        self.assert_route_by_classifier_and_router(text, "luna", CFG)
+
+    def assert_route_by_classifier_and_router(self, text, tier, cfg):
         decision = classify_request(
-            chat_request(text), 1, CFG, allow_plan_label_over_design=True
+            chat_request(text), 1, cfg, allow_plan_label_over_design=True
         )
-        self.assertEqual(decision.tier, "luna")
-        with patch("model_router._load_config", return_value=CFG), \
+        self.assertEqual(decision.tier, tier)
+        with patch("model_router._load_config", return_value=cfg), \
              patch("model_router._log_decision"), \
              patch("model_router._force_terra_supervisor_preflight", return_value=None), \
              patch("model_router._force_shadow_delegation_if_eligible", return_value=None):
@@ -81,7 +96,8 @@ class InjectedContextClassificationTests(unittest.TestCase):
                 turn_id="s1:sa-0-probe:t",
                 api_call_count=1,
             )
-        self.assertEqual(routed["metadata"]["tier"], "luna")
+        self.assertEqual(routed["metadata"]["tier"], tier)
+        self.assertEqual(routed["metadata"]["effort"], decision.effort)
 
     def real_superpowers_bootstrap(self):
         # The isolated suite rewrites HOME, so use the account home if HOME has
@@ -98,6 +114,181 @@ class InjectedContextClassificationTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module._build_bootstrap(module._skills_dir())
+
+    def test_skills_note_keeps_luna_and_spark_child_routes_and_effort(self):
+        self.assertEqual(HOST_SKILLS_NOTE_PREFIX, SKILLS_NOTE_PREFIX)
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - decks: Create and edit presentation decks.",
+            "    - coding: implement and fix repository changes.",
+        )
+        self.assert_route_by_classifier_and_router(GOAL + "\n\n" + note, "luna", CFG)
+        spark_cfg = {**CFG, "callable": {**CFG["callable"], "spark": True}}
+        spark_goal = "[spark] Report the current branch name and nothing else."
+        self.assert_route_by_classifier_and_router(spark_goal + "\n\n" + note, "spark", spark_cfg)
+
+    def test_skills_note_variants_and_positions_are_stripped(self):
+        accurate_again = skills_note(
+            " The skills listed in the system prompt are accurate again; earlier skill-change notes are superseded."
+        )
+        removed_only = skills_note("No longer available: decks, coding")
+        for name, note in (("accurate again", accurate_again), ("removed only", removed_only)):
+            with self.subTest(name=name):
+                self.assert_luna_by_classifier_and_router(GOAL + "\r\n\r\n" + note.replace("\n", "\r\n"))
+        ordinary = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - coding: Create and edit files.",
+        )
+        for name, text in (
+            ("after memory", GOAL + "\n\n" + MEMORY_CONTEXT + "\n\n" + ordinary),
+            ("before memory", GOAL + "\n\n" + ordinary + "\n\n" + MEMORY_CONTEXT),
+            ("after bootstrap", GOAL + "\n\n" + FROZEN_BOOTSTRAP + "\n\n" + ordinary),
+            ("empty operator", ordinary),
+        ):
+            with self.subTest(name=name):
+                stripped = router._without_host_injected_context(text)
+                self.assertNotIn(SKILLS_NOTE_PREFIX, stripped)
+                if name == "empty operator":
+                    self.assertEqual(stripped, "")
+                else:
+                    self.assertEqual(stripped, GOAL)
+
+    def test_skills_note_list_content_routes_like_the_bare_goal(self):
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - coding: Create and edit files and fix implementation defects.",
+        )
+        for name, content, tier, cfg in (
+            (
+                "luna note part",
+                [{"type": "text", "text": GOAL}, {"type": "text", "text": note}],
+                "luna",
+                CFG,
+            ),
+            (
+                "luna note then memory part",
+                [
+                    {"type": "text", "text": GOAL},
+                    {"type": "text", "text": note},
+                    {"type": "text", "text": MEMORY_CONTEXT},
+                ],
+                "luna",
+                CFG,
+            ),
+            (
+                "spark note part",
+                [
+                    {"type": "text", "text": "[spark] Report the current branch name and nothing else."},
+                    {"type": "text", "text": note},
+                ],
+                "spark",
+                {**CFG, "callable": {**CFG["callable"], "spark": True}},
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assert_route_by_classifier_and_router(content, tier, cfg)
+
+    def test_skills_note_before_signed_block_with_one_newline_is_stripped(self):
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - coding: Create and edit files.",
+        )
+        text = GOAL + "\n" + note + "\n" + FROZEN_BOOTSTRAP
+        self.assertEqual(router._without_host_injected_context(text), GOAL)
+
+    def test_skills_note_list_content_lookalike_remains_operator_text(self):
+        lookalike = "[System note: skills changed; Create and edit the parser.]"
+        content = [{"type": "text", "text": GOAL}, {"type": "text", "text": lookalike}]
+        decision = classify_request(chat_request(content), 1, CFG, allow_plan_label_over_design=True)
+        self.assertEqual(decision.tier, "terra")
+
+    def test_skills_note_image_markers_do_not_create_an_image_request(self):
+        note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - screenshots: Takes a [screenshot] and accepts data:image/png;base64,abc.",
+        )
+        worker_request = chat_request([
+            {"type": "text", "text": "Report the current branch name and nothing else."},
+            {"type": "text", "text": note},
+        ])
+        real_image_request = chat_request([
+            {"type": "text", "text": "Report the current branch name and nothing else."},
+            {"type": "image_url", "image_url": "https://example.test/image.png"},
+        ])
+        self.assertFalse(router._request_has_image_attachment(worker_request))
+        self.assertTrue(router._request_has_image_attachment(real_image_request))
+
+    def test_skills_note_lookalikes_remain_operator_text(self):
+        lookalike = "[System note: skills changed; Create and edit the parser.]"
+        mid_sentence = (
+            GOAL + " The following sentence quotes " + SKILLS_NOTE_PREFIX
+            + " but asks to fix the parser.]"
+        )
+        for name, text in (("wrong prefix", GOAL + "\n\n" + lookalike), ("quoted prefix", mid_sentence)):
+            with self.subTest(name=name):
+                decision = classify_request(
+                    chat_request(text), 1, CFG, allow_plan_label_over_design=True
+                )
+                self.assertEqual(decision.tier, "terra")
+
+    def test_skills_note_is_absent_from_design_label_and_length_decisions(self):
+        design_note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - css-helper: Implement visual UI CSS layout design fixes.",
+        )
+        self.assert_luna_by_classifier_and_router(GOAL + "\n\n" + design_note)
+
+        seen_label_inputs = []
+        real_label_match = router._label_match
+        with patch("model_router._label_match", side_effect=lambda text, *args, **kwargs: (
+            seen_label_inputs.append(text), real_label_match(text, *args, **kwargs)
+        )[1]):
+            decision = classify_request(
+                chat_request(GOAL + "\n\n" + design_note), 1, CFG,
+                allow_plan_label_over_design=True,
+            )
+        self.assertEqual(decision.tier, "luna")
+        self.assertTrue(seen_label_inputs)
+        self.assertTrue(all(SKILLS_NOTE_PREFIX not in text for text in seen_label_inputs))
+
+        short_goal = "Report the current branch name."
+        short_cfg = {**CFG, "thresholds": {**CFG["thresholds"], "sol_min_chars": len(short_goal) + 1}}
+        length_note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - long-description: Create and edit implementation fixes across many source files.",
+        )
+        self.assertEqual(classify_request(chat_request(short_goal), 1, short_cfg).tier, "terra")
+        self.assertEqual(classify_request(chat_request(short_goal + "\n\n" + length_note), 1, short_cfg).tier, "terra")
+
+    def test_skills_note_is_absent_from_tool_mention_and_triage_decisions(self):
+        tool_note = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - delegation: Call delegate_task to implement and fix changes.",
+        )
+        cfg = {**CFG, "orchestration": {"enabled": True, "min_chars": 0}}
+        request = {
+            **chat_request(GOAL + "\n\n" + tool_note),
+            "tools": [{"name": "delegate_task"}],
+        }
+        reason = router._orchestration_skip_reason(
+            {"request": request, "api_call_count": 1, "platform": "parent", "turn_id": "t1"},
+            cfg,
+            router._decision("terra", "test", cfg),
+        )
+        self.assertNotEqual(reason, "explicit_delegation_tool")
+
+        triage_cfg = {**CFG, "triage": {"enabled": True}}
+        triage_request = {
+            **chat_request("What is the current branch?\n\n" + tool_note),
+            "tools": [{"name": "delegate_task"}, {"name": "triage_task"}],
+        }
+        self.assertEqual(
+            triage.skip_reason(
+                {"request": triage_request, "api_call_count": 1, "platform": "parent", "turn_id": "t1"},
+                triage_cfg,
+            ),
+            "conversational",
+        )
 
     def test_real_superpowers_bootstrap_keeps_the_leaf_on_luna(self):
         self.assert_luna_by_classifier_and_router(GOAL + "\n\n" + self.real_superpowers_bootstrap())
@@ -122,6 +313,11 @@ class InjectedContextClassificationTests(unittest.TestCase):
     def test_execution_bridge_uses_stripped_text_for_workspace_and_length_but_sends_raw_task(self):
         goal = "[sonnet-review] Review the parser and report only."
         bootstrap = self.real_superpowers_bootstrap()
+        skills_delta = skills_note(
+            "Now available (load with skill_view(name) when relevant, like the skills listed in the system prompt):",
+            "    - coding: Create and edit parser implementations.",
+        )
+        raw_task = goal + "\n\n" + bootstrap + "\n\n" + skills_delta
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "workspace"
             repo.mkdir()
@@ -134,7 +330,7 @@ class InjectedContextClassificationTests(unittest.TestCase):
             }
             request = {
                 "instructions": f"WORKSPACE PATH:\n{repo}\nUse this exact path.",
-                "messages": [{"role": "user", "content": goal + "\n\n" + bootstrap}],
+                "messages": [{"role": "user", "content": raw_task}],
             }
             with patch("model_router.shutil.which", return_value="/claude"), \
                  patch("model_router.usage_guard.read", return_value=usage_guard.Reading(10, 0, None, None, time.time())), \
@@ -147,7 +343,7 @@ class InjectedContextClassificationTests(unittest.TestCase):
         self.assertEqual(route, (repo.resolve(), "sonnet"))
         self.assertEqual(result.model, "claude-sonnet-5-5")
         self.assertEqual(bridge.call_args.kwargs["repo"], str(repo.resolve()))
-        self.assertEqual(bridge.call_args.kwargs["task"], goal + "\n\n" + bootstrap)
+        self.assertEqual(bridge.call_args.kwargs["task"], raw_task)
 
     def test_explicit_ui_bridge_write_intent_uses_stripped_text(self):
         """A2-N4: _opus5_write_intent must read routing_text, not raw text, so a
