@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -14,7 +15,7 @@ from unittest.mock import Mock, patch
 import yaml
 
 import model_router as router
-from model_router import triage, worker_admission
+from model_router import triage, usage_guard, worker_admission
 
 
 ROOT = Path(__file__).resolve().parent
@@ -130,6 +131,24 @@ class ExactEffortLabelTests(unittest.TestCase):
                 turn_id="f09-label-wire",
             )
 
+    def route_and_record(self, text, cfg, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            route_log = Path(directory) / "router.jsonl"
+            cfg["logging"] = {"enabled": True, "path": str(route_log)}
+            with patch.object(router, "_load_config", return_value=cfg):
+                routed = router.route_llm_request(
+                    request=request(text, cfg),
+                    provider="openai-codex",
+                    model=cfg["models"]["terra"],
+                    api_call_count=1,
+                    turn_id="f09-stated-effort",
+                    **kwargs,
+                )
+            record = json.loads(route_log.read_text(encoding="utf-8").strip())
+        self.assertEqual(record["effort"], routed["metadata"]["effort"])
+        self.assertEqual(record["effort"], routed["request"]["reasoning"]["effort"])
+        return routed, record
+
     def test_plugin_import_and_label_validation_fall_back_when_host_effort_module_is_missing(self):
         cfg = shipped_config()
         with plugin_without_reasoning_effort() as plugin:
@@ -182,6 +201,113 @@ class ExactEffortLabelTests(unittest.TestCase):
                 self.assertEqual(routed["metadata"]["tier"], tier)
                 self.assertEqual(routed["metadata"]["effort"], expected)
                 self.assertEqual(routed["request"]["reasoning"]["effort"], expected)
+
+    def test_stated_levels_survive_the_r12_3_route_matrix_and_match_the_route_record(self):
+        cfg = shipped_config()
+        for level in ("high", "xhigh", "max"):
+            with self.subTest(case="same-tier Sol design", level=level):
+                routed, _record = self.route_and_record(
+                    f"[sol:{level}] Design the responsive dashboard layout.", cfg,
+                )
+                self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("sol", level))
+
+        soft_cfg = shipped_config()
+        soft_cfg["effort"]["terra"] = "high"
+        reading = usage_guard.Reading(75.0, None, None, None, time.time())
+        with patch.object(usage_guard, "peek", return_value=reading):
+            routed, _record = self.route_and_record(
+                "[sol:xhigh] Inspect the implementation and report.", soft_cfg, platform="subagent",
+            )
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("sol", "xhigh"))
+        self.assertNotIn("usage soft limit", routed["reason"])
+
+        disabled_sol_cfg = shipped_config()
+        disabled_sol_cfg["callable"]["sol"] = False
+        routed, _record = self.route_and_record(
+            "[sol:xhigh] Inspect the implementation and report.", disabled_sol_cfg,
+        )
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "xhigh"))
+
+        shipped_spark_cfg = yaml.safe_load((ROOT / "router_config.yaml").read_text(encoding="utf-8"))
+        shipped_spark_cfg["triage"] = {"enabled": False}
+        shipped_spark_cfg["orchestration"] = {"enabled": False}
+        shipped_spark_cfg["session_policy"] = {"pin_root_parent": False}
+        shipped_spark_cfg["shadow"] = {"enabled": False}
+        routed, _record = self.route_and_record(
+            "[spark:xhigh] Inspect the local implementation and report.", shipped_spark_cfg,
+        )
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("luna", "xhigh"))
+
+        read_only_cfg = shipped_config()
+        routed, _record = self.route_and_record("[luna:high] Fix the parser module.", read_only_cfg)
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "high"))
+
+    def test_stated_level_dispatch_refuses_an_unavailable_or_non_read_only_label_before_budgeting(self):
+        triage.reset_state()
+        self.addCleanup(triage.reset_state)
+        unavailable_cfg = shipped_config()
+        unavailable_cfg["triage"] = {"enabled": True, "max_workers_per_turn": 4, "max_children_per_worker": 1}
+        unavailable_cfg["callable"]["sol"] = False
+        with patch.object(router, "_load_config", return_value=unavailable_cfg):
+            refused = router.on_pre_tool_call(
+                "delegate_task", {"goal": "[sol:xhigh] Inspect the implementation and report."}, turn_id="f09-unavailable",
+            )
+        self.assertIsNotNone(refused)
+        self.assertEqual(refused["action"], "block")
+        self.assertIn("sol", refused["message"].casefold())
+        self.assertEqual(triage._TURN_WORKERS, {})
+
+        read_only_cfg = shipped_config()
+        read_only_cfg["triage"] = {"enabled": True, "max_workers_per_turn": 4, "max_children_per_worker": 1}
+        with patch.object(router, "_load_config", return_value=read_only_cfg):
+            refused = router.on_pre_tool_call(
+                "delegate_task", {"goal": "[luna:high] Fix the parser module."}, turn_id="f09-read-only",
+            )
+        self.assertIsNotNone(refused)
+        self.assertEqual(refused["action"], "block")
+        self.assertIn("luna", refused["message"].casefold())
+        self.assertIn("read-only", refused["message"].casefold())
+        self.assertEqual(triage._TURN_WORKERS, {})
+
+    def test_bare_labels_still_use_the_destination_tier_effort_and_match_the_route_record(self):
+        cfg = shipped_config()
+        cfg["effort"].update({"sol": "low", "terra": "high"})
+        for text, tier, effort in (
+            ("[sol] Inspect the implementation and report.", "sol", "low"),
+            ("[terra] Implement the bounded repair.", "terra", "high"),
+        ):
+            with self.subTest(text=text):
+                routed, _record = self.route_and_record(text, cfg)
+                self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), (tier, effort))
+
+    def test_retry_carries_a_stated_level_to_its_substitute_and_logs_only_after_submission(self):
+        cfg = shipped_config()
+        cfg["callable"]["spark"] = True
+        cfg["effort"]["spark"] = "high"
+        with tempfile.TemporaryDirectory() as directory:
+            route_log = Path(directory) / "router.jsonl"
+            cfg["logging"] = {"enabled": True, "path": str(route_log)}
+            submitted = []
+
+            def next_call(_request):
+                raise RuntimeError("HTTP 503: upstream connect error")
+
+            def retry_call(retry_request):
+                submitted.append(copy.deepcopy(retry_request))
+                return "recovered"
+
+            with patch.object(router, "_load_config", return_value=cfg):
+                result = router.run_llm_with_transient_failover(
+                    request={**request("[sol:xhigh] Inspect the implementation and report.", cfg), "model": cfg["models"]["sol"]},
+                    next_call=next_call,
+                    retry_call=retry_call,
+                    provider="openai-codex",
+                )
+            record = json.loads(route_log.read_text(encoding="utf-8").strip())
+        self.assertEqual(result, "recovered")
+        self.assertEqual(submitted[0]["model"], cfg["models"]["spark"])
+        self.assertEqual(submitted[0]["reasoning"]["effort"], "xhigh")
+        self.assertEqual(record["effort"], submitted[0]["reasoning"]["effort"])
 
     def test_max_is_valid_for_luna_terra_and_sol_but_not_spark_and_none_is_never_valid(self):
         cfg = shipped_config()

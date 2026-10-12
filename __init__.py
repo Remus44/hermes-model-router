@@ -239,6 +239,10 @@ class RouteDecision:
     # list names one. The router cannot route across providers, so this travels
     # as advice to the conductor rather than as the route itself.
     prefer_target: str = ""
+    # A validated explicit ``[tier:level]`` label. Keep it separate from the
+    # effective effort so a later tier substitution preserves it instead of
+    # reading ``effort.<destination>``.
+    stated_effort: str = ""
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -334,6 +338,32 @@ def _apply_preferences(decision: RouteDecision, cfg: Dict[str, Any]) -> RouteDec
     return replace(preferred, vetoed_by=decision.vetoed_by, prefer_target=target)
 
 
+def _carried_stated_effort(
+    stated_effort: Optional[str], source_tier: str, target_tier: str, cfg: Dict[str, Any]
+) -> Optional[str]:
+    """Keep a validated label exact across a tier change, or reject it visibly."""
+    if stated_effort is None:
+        return None
+    if stated_effort in _codex_tier_efforts(cfg).get(target_tier, ()):
+        return stated_effort
+    raise RuntimeError(
+        f"Stated effort '{stated_effort}' for '{source_tier}' cannot run on substitute "
+        f"tier '{target_tier}': {target_tier} does not support that effort."
+    )
+
+
+def _decision_with_carried_stated_effort(
+    target_tier: str, reason: str, cfg: Dict[str, Any], source: RouteDecision, *, kind: Optional[str] = None
+) -> RouteDecision:
+    return _decision(
+        target_tier,
+        reason,
+        cfg,
+        kind=source.kind if kind is None else kind,
+        stated_effort=_carried_stated_effort(source.stated_effort or None, source.tier, target_tier, cfg),
+    )
+
+
 def _resolve_callable_fallback(
     decision: RouteDecision, cfg: Dict[str, Any]
 ) -> RouteDecision:
@@ -354,9 +384,8 @@ def _resolve_callable_fallback(
     for tier in prefs:
         if tier != chosen_tier and _is_routable_tier(tier, cfg) and _is_callable_tier(tier, cfg):
             try:
-                return _decision(
-                    tier, f"preferred {decision.kind} fallback from {chosen_tier}",
-                    cfg, kind=decision.kind,
+                return _decision_with_carried_stated_effort(
+                    tier, f"preferred {decision.kind} fallback from {chosen_tier}", cfg, decision,
                 )
             except (KeyError, ValueError):
                 continue
@@ -378,8 +407,9 @@ def _resolve_callable_fallback(
         if next_tier and next_tier not in visited:
             if _is_callable_tier(next_tier, cfg):
                 try:
-                    return _decision(next_tier, f"fallback from disabled {chosen_tier}", cfg,
-                                     kind=decision.kind)
+                    return _decision_with_carried_stated_effort(
+                        next_tier, f"fallback from disabled {chosen_tier}", cfg, decision,
+                    )
                 except (KeyError, ValueError):
                     break
             visited.add(next_tier)
@@ -620,6 +650,8 @@ def _usage_step_down(decision: RouteDecision, cfg: Dict[str, Any]) -> RouteDecis
         if not _is_routable_tier(target, cfg) or not _is_callable_tier(target, cfg):
             return replace(decision, reason=f"{decision.reason}; usage {label} limit: "
                                             f"{decision.tier}→{target} skipped ({target} unavailable)")
+        if decision.stated_effort:
+            return decision
         step_reason = f"usage {label} limit: {decision.tier}→{target} ({window_reason})"
         stepped = _decision(target, f"{decision.reason}; {step_reason}", cfg)
         return replace(stepped, kind=decision.kind)
@@ -1805,7 +1837,7 @@ def _decision(
         effort = str(efforts.get(key) or _DEFAULT_EFFORT.get(tier, "medium")).casefold()
     return RouteDecision(
         tier=tier, model=cfg["models"][tier], reason=reason, effort=effort,
-        mandatory=mandatory, kind=kind,
+        mandatory=mandatory, kind=kind, stated_effort=stated_effort or "",
     )
 
 
@@ -1984,10 +2016,19 @@ def _classify_request(
     # conducting and the [sol] leaf it was meant to delegate -- 15 of 16 routing
     # decisions on one turn. Only the conductor label is exempt; a [spark] or
     # [sol] leaf still faces the gate, and Sol still owns every [sol] leaf.
+    design_label = _label_match(text, cfg)
+    design_stated_effort = (
+        design_label.group("level").casefold()
+        if design_label and design_label.group("tier").casefold() == "sol" and design_label.group("level")
+        else None
+    )
     if _is_design_request(user_text) and not (
         allow_plan_label_over_design and _is_plan_labelled_worker(text, cfg)
     ):
-        return _decision("sol", "design analysis or implementation is Sol-only", cfg, mandatory=True, kind="design")
+        return _decision(
+            "sol", "design analysis or implementation is Sol-only", cfg,
+            stated_effort=design_stated_effort, mandatory=True, kind="design",
+        )
 
     benchmark_force = _normalise(os.getenv("MODEL_ROUTER_BENCHMARK_FORCE_MODEL", ""))
     if benchmark_force in ("luna", "spark", "terra", "sol"):
@@ -2001,6 +2042,9 @@ def _classify_request(
     override = _label_match(text, cfg)
     if override:
         tier = override.group("tier").casefold()
+        requested_effort = override.group("level")
+        requested_effort = requested_effort.casefold() if requested_effort else None
+        label = f"{tier}:{requested_effort}" if requested_effort else tier
         if tier == "spark" and has_image_attachment:
             return _decision("terra", "image attachment requires a vision-capable route", cfg, mandatory=True)
         # A delegated leaf carries a conductor's declaration, so the router
@@ -2018,13 +2062,19 @@ def _classify_request(
         # wording because downstream branches match these reasons verbatim.
         if tier in ("spark", "luna") and not label_read_only:
             if _is_consequential_spark_request(user_text):
-                return _decision("sol", f"consequential {tier.capitalize()} task requires Sol", cfg, mandatory=True)
+                return _decision(
+                    "sol", f"consequential {tier.capitalize()} task requires Sol", cfg,
+                    stated_effort=_carried_stated_effort(requested_effort, tier, "sol", cfg), mandatory=True,
+                )
             if _is_design_request(user_text):
-                return _decision("sol", "design analysis or implementation is Sol-only", cfg, mandatory=True, kind="design")
-            return _decision("terra", f"{tier.capitalize()} is restricted to non-design read-only subtasks", cfg)
-        requested_effort = override.group("level")
-        requested_effort = requested_effort.casefold() if requested_effort else None
-        label = f"{tier}:{requested_effort}" if requested_effort else tier
+                return _decision(
+                    "sol", "design analysis or implementation is Sol-only", cfg,
+                    stated_effort=_carried_stated_effort(requested_effort, tier, "sol", cfg), mandatory=True, kind="design",
+                )
+            return _decision(
+                "terra", f"{tier.capitalize()} is restricted to non-design read-only subtasks", cfg,
+                stated_effort=_carried_stated_effort(requested_effort, tier, "terra", cfg),
+            )
         return _decision(tier, f"explicit [{label}] override", cfg, explicit=True, stated_effort=requested_effort)
 
     # The durable completion of a [terra] orchestrator includes the complete
@@ -6147,35 +6197,51 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
         if quota_exhausted:
             _remember_spark_quota_exhaustion(str(kwargs.get("turn_id") or ""))
 
-        fallback_request = dict(request)
-        fallback_request["model"] = fallback_model
         fallback_tier = next(
             (tier for tier, model in (cfg.get("models") or {}).items() if model == fallback_model),
             "fallback",
         )
-        reasoning = dict(fallback_request.get("reasoning") or {})
-        reasoning["effort"] = (
-            _quota_fallback_effort(cfg, fallback_tier)
-            if quota_exhausted
-            else str((cfg.get("effort") or {}).get(fallback_tier) or "medium")
+        retry_text, _ = _last_user_text_and_index(_request_items(request))
+        retry_label = _label_match(
+            _normalise(_without_host_injected_context(_without_router_contract(retry_text))), cfg,
         )
-        fallback_request["reasoning"] = reasoning
-        _log_decision(
-            RouteDecision(
-                fallback_tier,
-                fallback_model,
-                (
-                    f"Spark quota exhausted; failover from {active_model}"
+        stated_effort = (
+            retry_label.group("level").casefold()
+            if retry_label and retry_label.group("level")
+            else None
+        )
+        try:
+            fallback_effort = str(
+                _carried_stated_effort(stated_effort, active_tier, fallback_tier, cfg)
+                if stated_effort is not None
+                else (
+                    _quota_fallback_effort(cfg, fallback_tier)
                     if quota_exhausted
-                    else f"{active_model} unavailable on this account; configured failover"
-                    if unavailable
-                    else f"transient failover from {active_model}"
-                ),
+                    else str((cfg.get("effort") or {}).get(fallback_tier) or "medium")
+                )
+            )
+        except RuntimeError as effort_error:
+            return worker_admission.stopped_response(str(effort_error), active_model)
+        fallback_request = dict(request)
+        fallback_request["model"] = fallback_model
+        reasoning = dict(fallback_request.get("reasoning") or {})
+        reasoning["effort"] = fallback_effort
+        fallback_request["reasoning"] = reasoning
+        fallback_decision = RouteDecision(
+            tier=fallback_tier,
+            model=fallback_model,
+            reason=(
+                f"Spark quota exhausted; failover from {active_model}"
+                if quota_exhausted
+                else f"{active_model} unavailable on this account; configured failover"
+                if unavailable
+                else f"transient failover from {active_model}"
             ),
-            {**kwargs, "request": fallback_request},
-            cfg,
+            effort=fallback_effort,
+            stated_effort=stated_effort or "",
         )
         retry_response = retry_call(fallback_request)
+        _log_decision(fallback_decision, {**kwargs, "request": fallback_request}, cfg)
         return delivered(retry_response)
 
 
@@ -6456,6 +6522,29 @@ def _unsupported_delegation_label(args: Dict[str, Any], cfg: Dict[str, Any]) -> 
     return None
 
 
+def _stated_delegation_label_block(args: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    """Refuse labelled effort before a switched-off or read-only tier can be substituted."""
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else [args]
+    for task in tasks:
+        entry = task if isinstance(task, dict) else {}
+        goal = str(entry.get("goal") or args.get("goal") or "")
+        label = _label_match(goal, cfg)
+        if not label or not label.group("level"):
+            continue
+        tier = label.group("tier").casefold()
+        effort = label.group("level").casefold()
+        if not _is_callable_tier(tier, cfg):
+            cooling = _tier_cooldown_remaining(tier, cfg)
+            state = f"cooling down for another {int(cooling)}s" if cooling else "switched off"
+            return f"Stated effort label [{tier}:{effort}] is refused because {tier} is {state}."
+        if tier in {"luna", "spark"} and not _is_spark_read_only_work(goal):
+            return (
+                f"Stated effort label [{tier}:{effort}] is refused because {tier.capitalize()} is "
+                "restricted to non-design read-only subtasks."
+            )
+    return ""
+
+
 def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **_: Any) -> Optional[Dict[str, str]]:
     """Apply the worker budget and refuse unavailable delegation targets.
 
@@ -6481,6 +6570,9 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         unsupported = _unsupported_delegation_label(args, cfg)
         if unsupported:
             return {"action": "block", "message": _unsupported_label_message(unsupported)}
+        stated_label_block = _stated_delegation_label_block(args, cfg)
+        if stated_label_block:
+            return {"action": "block", "message": stated_label_block}
         if triage.enabled(cfg):
             over_budget = triage.spawn_block(tool_name, args, cfg, _)
             if over_budget:
