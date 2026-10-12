@@ -643,20 +643,22 @@ class AccountOfExecutionTests(unittest.TestCase):
                     'the parent-side stop detector must recognize every exact failure')
 
     def _exact_preselection_run(self, directory, *, callable_sonnet=True, which='/claude', goal='[sonnet-review] Review parser',
-                                cooling=0, repo=Path('/tmp'), allowed=None, resolve_error=None, patches=()):
+                                cooling=0, repo: Path | None=Path('/tmp'), allowed=None, resolve_error=None, patches=(),
+                                coding_enabled=False, delegated_review_enabled=True,
+                                provider='openai-codex', api_mode='codex_responses'):
         from contextlib import ExitStack
         from hermes_cli.middleware import run_llm_execution_middleware
 
         routes = Path(directory) / 'routes.jsonl'
         audits = Path(directory) / 'claude-audit.jsonl'
-        policy = {'enabled': True, 'selection_mode': 'exact', 'requested_model': 'claude-sonnet-5-5',
-                  'max_chars': 8000}
+        policy = {'enabled': delegated_review_enabled, 'selection_mode': 'exact',
+                  'requested_model': 'claude-sonnet-5-5', 'max_chars': 8000}
         if allowed is not None:
             policy['models'] = allowed
         cfg = {
             'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
             'callable': {'sonnet5': callable_sonnet, 'opus5': True},
-            'coding_agent': {'enabled': False, 'delegated_review': policy},
+            'coding_agent': {'enabled': coding_enabled, 'delegated_review': policy},
             'logging': {'enabled': True, 'path': str(routes)},
             'claude_delegation': {'log_path': str(audits)},
         }
@@ -679,8 +681,8 @@ class AccountOfExecutionTests(unittest.TestCase):
                 stack.enter_context(item)
             bridge = stack.enter_context(patch.object(router, '_run_opus5_bridge'))
             launches = stack.enter_context(patch('model_router.claude_opus_bridge.subprocess.run'))
-            stopped = run_llm_execution_middleware(request, downstream, provider='openai-codex',
-                api_mode='codex_responses', platform='subagent', turn_id='s:sa-1')
+            stopped = run_llm_execution_middleware(request, downstream, provider=provider,
+                api_mode=api_mode, platform='subagent', turn_id='s:sa-1')
         audit_entries = [json.loads(line) for line in audits.read_text().splitlines()] if audits.exists() else []
         return stopped, downstream, bridge, launches, routes, audit_entries
 
@@ -721,6 +723,25 @@ class AccountOfExecutionTests(unittest.TestCase):
                     self.assertNotIn('tier is unknown', text)
                 elif name == 'unknown tier alias map':
                     self.assertIn('tier is unknown', json.dumps(run[5][0]))
+
+    def test_exact_disabled_review_stops_on_each_reachable_provider_before_any_launch(self):
+        # The installed host passes the leaf's provider and API mode into the real
+        # execution middleware. The first three rows were the G-12 escapes; the
+        # coding-agent-on row proves the harness also covers the existing control.
+        cases = (
+            ('configured Codex leaf', 'openai-codex', 'codex_responses', False),
+            ('Anthropic-routed leaf', 'anthropic', 'anthropic_messages', False),
+            ('Qwen-routed leaf', 'qwen-token', 'chat_completions', False),
+            ('coding-agent-on control', 'openai-codex', 'codex_responses', True),
+        )
+        for name, provider, api_mode, coding_enabled in cases:
+            with self.subTest(provider=name), tempfile.TemporaryDirectory() as directory:
+                run = self._exact_preselection_run(
+                    directory, repo=None, coding_enabled=coding_enabled,
+                    delegated_review_enabled=False, provider=provider, api_mode=api_mode,
+                )
+                stopped = self._assert_stopped_refusal(run)
+                self.assertIn('exact Claude CLI review route was refused', stopped.output_text)
 
     def test_exact_preselection_resolve_target_raise_still_stops(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -5621,8 +5621,69 @@ def on_transform_llm_output(response_text: Any = None, turn_id: Any = None, **_:
     return response_text.rstrip() + "\n\n" + _provenance_annotation(marker)
 
 
+def _mandatory_exact_review_preselection(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> None:
+    """Refuse an exact delegated review before any eligibility or provider exit."""
+    if not (
+        str(kwargs.get("platform", "")).casefold() == "subagent"
+        or ":sa-" in str(kwargs.get("turn_id", ""))
+    ):
+        return
+    coding_cfg = cfg.get("coding_agent") or {}
+    policy = coding_cfg.get("delegated_review") or {}
+    if str(policy.get("selection_mode") or "profile_preferred") != "exact":
+        return
+    source_request = kwargs.get("original_request")
+    if not isinstance(source_request, dict):
+        source_request = request
+    text = _last_user_text_and_index(_request_items(source_request))[0]
+    routing_text = _without_host_injected_context(_without_router_contract(text))
+    from .claude_opus_bridge import ClaudeBridgeFailure, review_model_alias
+    requested_alias = review_model_alias(routing_text)
+    if requested_alias is None:
+        return
+    requested_model = str(policy.get("requested_model") or "").strip() or None
+
+    def refuse(message: str) -> None:
+        from . import target_identity
+        try:
+            identity = target_identity.resolve_target(
+                requested_alias, transport="claude_cli", selection_mode="exact",
+                requested_model=requested_model, cfg=cfg,
+            ).identity
+        except Exception:
+            identity = None
+        turn_id = str(kwargs.get("parent_turn_id") or kwargs.get("turn_id") or "")
+        session_id = str(kwargs.get("parent_session_id") or kwargs.get("session_id")
+                         or turn_id.split(":", 1)[0])
+        claude_delegation._log(cfg, {
+            "event": "bridge_claude", "tier_requested": requested_alias,
+            "tier_used": "none", "outcome": "refused", "message": message,
+            "session_id": session_id, "turn_id": turn_id,
+        })
+        raise ClaudeBridgeFailure(message, "capability", identity=identity, refused=True)
+
+    delegated = _verified_delegated_claude_review(routing_text, cfg, request=source_request)
+    if delegated is None:
+        try:
+            _route, route_reason = _delegated_claude_review_status(
+                routing_text, cfg, request=source_request,
+            )
+        except Exception:
+            route_reason = "the Claude CLI review route could not be established"
+        refuse("exact Claude CLI review route was refused before bridge selection: " + route_reason)
+    if not coding_cfg.get("enabled") and not policy.get("enabled"):
+        refuse("exact Claude CLI review route is disabled by both coding_agent and delegated_review policy")
+    if str(kwargs.get("api_mode") or "") != "codex_responses":
+        refuse("exact Claude CLI review route is unavailable outside the Codex responses execution path")
+    provider = str(kwargs.get("provider") or "").casefold()
+    configured_provider = str(cfg.get("provider") or "openai-codex").casefold()
+    if provider and provider != configured_provider:
+        refuse("exact Claude CLI review route is unavailable on the routed provider")
+
+
 def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> Optional[Any]:
     """Execute the first safe, non-design coding call through Claude Code OAuth."""
+    _mandatory_exact_review_preselection(request, cfg, **kwargs)
     coding_cfg = cfg.get("coding_agent") or {}
     if not coding_cfg.get("enabled") and not (coding_cfg.get("delegated_review") or {}).get("enabled"):
         return None
@@ -5941,6 +6002,20 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     if not isinstance(request, dict) or not callable(next_call) or provider != configured_provider:
         if not isinstance(request, dict) or not callable(next_call):
             return next_call(request)
+        if provider != configured_provider:
+            exact_context = {key: value for key, value in kwargs.items() if key != "request"}
+            try:
+                _mandatory_exact_review_preselection(request, cfg, **exact_context)
+            except Exception as error:
+                identity = getattr(error, "identity", None)
+                selection_mode = str(getattr(identity, "selection_mode", ""))
+                if getattr(error, "refused", False) or selection_mode == "exact":
+                    message = str(getattr(error, "route_reason", "") or error).strip() or "exact Claude CLI review was refused"
+                    return worker_admission.stopped_response(
+                        "Exact Claude CLI review was not completed: " + message,
+                        str(request.get("model", "")),
+                    )
+                raise
         stopped = stop_if_closed()
         if stopped is not None:
             return stopped
