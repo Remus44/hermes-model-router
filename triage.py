@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import threading
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -39,6 +40,14 @@ _LOCK = threading.Lock()
 _TURN_WORKERS: Dict[str, int] = {}
 _WORKER_CHILDREN: Dict[str, int] = {}
 _ROOT_TURN_BY_SESSION: Dict[str, str] = {}
+# child session -> (originating root turn, recorded-at). A depth-1 caller is charged to the
+# root turn it came from, not to whichever root turn the parent session admitted last.
+# Bounded: entries expire after the TTL and the map keeps at most _ORIGIN_MAX of them.
+_ORIGIN_BY_CHILD: Dict[str, Tuple[str, float]] = {}
+_ORIGIN_MAX = 512
+_ORIGIN_TTL_SECONDS = 6 * 60 * 60
+_ORIGIN_AMBIGUOUS = "\x00ambiguous"
+_monotonic = time.monotonic
 
 SCHEMA_PARAMETERS: Dict[str, Any] = {
     "type": "object",
@@ -358,10 +367,49 @@ def _requested_count(tool_name: str, args: Dict[str, Any]) -> int:
     return 1
 
 
+def record_child_origin(child_session: Optional[str], parent_turn_id: Optional[str]) -> bool:
+    """Bind a child session to the root turn that started it (the ``subagent_start`` payload).
+
+    Recorded only when the origin is unambiguous: a non-empty parent turn that is not itself a
+    sub-agent turn. A second, different origin for the same child marks it ambiguous; the gate
+    then refuses its spawns rather than guess. Returns True when a link (or ambiguity) was stored.
+    """
+    child_session = str(child_session or "")
+    parent_turn_id = str(parent_turn_id or "")
+    if not child_session or not parent_turn_id or ":sa-" in parent_turn_id:
+        return False
+    now = _monotonic()
+    with _LOCK:
+        for key in [k for k, (_, at) in _ORIGIN_BY_CHILD.items() if now - at > _ORIGIN_TTL_SECONDS]:
+            del _ORIGIN_BY_CHILD[key]
+        known = _ORIGIN_BY_CHILD.pop(child_session, None)
+        root = parent_turn_id
+        if known is not None and known[0] != parent_turn_id:
+            root = _ORIGIN_AMBIGUOUS
+        _ORIGIN_BY_CHILD[child_session] = (root, now)
+        while len(_ORIGIN_BY_CHILD) > max(1, _ORIGIN_MAX):
+            del _ORIGIN_BY_CHILD[next(iter(_ORIGIN_BY_CHILD))]
+    return True
+
+
+def _child_origin_locked(child_session: str) -> Optional[str]:
+    """Recorded root turn for a child (``_ORIGIN_AMBIGUOUS`` when conflicting); None if unknown or expired."""
+    entry = _ORIGIN_BY_CHILD.get(child_session)
+    if entry is None:
+        return None
+    if _monotonic() - entry[1] > _ORIGIN_TTL_SECONDS:
+        del _ORIGIN_BY_CHILD[child_session]
+        return None
+    return entry[0]
+
+
 def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook: Dict[str, Any]) -> str:
     """Refusal text when this spawn breaks the turn's worker budget; "" admits it.
 
     Counts are charged on admission, so a refused call never consumes budget.
+    A depth-1 caller is charged to the root turn recorded for its own session at
+    ``subagent_start``; a child with no (or an expired) record falls back to its parent
+    session's latest root turn and the event says so (``origin_source``).
     """
     name = str(tool_name or "").removeprefix("mcp__")
     if not enabled(cfg) or name not in _SPAWN_TOOLS or not isinstance(args, dict):
@@ -377,22 +425,32 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
         depth = 1 if ":sa-" in turn_id else 0
     requested = _requested_count(name, args)
     cap = max_workers(cfg)
+    root: Optional[str] = None
+    origin_source: Optional[str] = None
     with _LOCK:
         if depth >= 2:
             verdict, used = "sub_worker_cannot_delegate", None
         elif depth == 1:
-            parent_session = str(getattr(agent, "_parent_session_id", "") or "")
-            root = _ROOT_TURN_BY_SESSION.get(parent_session) or f"session:{parent_session or session}"
-            used = _TURN_WORKERS.get(root, 0)
-            own = _WORKER_CHILDREN.get(session, 0)
-            if own + requested > max_children(cfg):
-                verdict = "worker_child_limit"
-            elif used + requested > cap:
-                verdict = "turn_worker_limit"
+            linked = _child_origin_locked(session)
+            if linked == _ORIGIN_AMBIGUOUS:
+                verdict, used, origin_source = "turn_origin_ambiguous", None, "ambiguous"
             else:
-                verdict = ""
-                _WORKER_CHILDREN[session] = own + requested
-                _TURN_WORKERS[root] = used + requested
+                if linked is not None:
+                    root, origin_source = linked, "child_link"
+                else:
+                    parent_session = str(getattr(agent, "_parent_session_id", "") or "")
+                    root = _ROOT_TURN_BY_SESSION.get(parent_session) or f"session:{parent_session or session}"
+                    origin_source = "latest_session_pointer"
+                used = _TURN_WORKERS.get(root, 0)
+                own = _WORKER_CHILDREN.get(session, 0)
+                if own + requested > max_children(cfg):
+                    verdict = "worker_child_limit"
+                elif used + requested > cap:
+                    verdict = "turn_worker_limit"
+                else:
+                    verdict = ""
+                    _WORKER_CHILDREN[session] = own + requested
+                    _TURN_WORKERS[root] = used + requested
         else:
             root = turn_id or f"session:{session}"
             if session:
@@ -405,7 +463,11 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
                 _TURN_WORKERS[root] = used + requested
     _log(cfg, {"event": "spawn_blocked" if verdict else "spawn_admitted", "reason": verdict or None,
                "tool": name, "depth": depth, "requested": requested, "used_before": used,
+               "root_turn": root, "origin_source": origin_source,
                "turn_id": turn_id, "session_id": session})
+    if verdict == "turn_origin_ambiguous":
+        return ("The user turn this worker started from is ambiguous (conflicting origin records), so its "
+                "budget cannot be charged to a turn. Finish the remaining work yourself. Nothing was spawned.")
     if verdict == "sub_worker_cannot_delegate":
         return "Sub-workers cannot delegate further. Finish this task yourself. Nothing was spawned."
     if verdict == "worker_child_limit":
@@ -424,3 +486,4 @@ def reset_state() -> None:
         _TURN_WORKERS.clear()
         _WORKER_CHILDREN.clear()
         _ROOT_TURN_BY_SESSION.clear()
+        _ORIGIN_BY_CHILD.clear()

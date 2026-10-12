@@ -384,26 +384,189 @@ class F08PostMergeTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "P04: advisory rewrite"):
             self._assert_p04_advisory_is_not_forced()
 
-    def _assert_p05_late_child_keeps_origin(self):
-        root = SimpleNamespace(session_id="root", _delegate_depth=0)
-        child = SimpleNamespace(session_id="child", _delegate_depth=1, _parent_session_id="root")
-        with patch.object(triage, "_caller", return_value=root):
-            self.assertEqual(triage.spawn_block("delegate_task", {"tasks": [{"goal": "a"}] * 4}, self.cfg,
-                                                {"turn_id": "root:old"}), "")
-            self.assertEqual(triage.spawn_block("delegate_task", {"goal": "new"}, self.cfg,
-                                                {"turn_id": "root:new"}), "")
-        with patch.object(triage, "_caller", return_value=child):
-            triage.spawn_block("delegate_task", {"goal": "late-child"}, self.cfg, {"turn_id": "child:turn"})
+    # --- P05: a late child is charged to the root turn it came from -------------------------
+    # The host reports the originating turn to the router in the subagent_start hook; the
+    # tests drive the real hook (router.on_subagent_start) and the real gate (spawn_block).
+
+    def _p05_root(self, session="root"):
+        return SimpleNamespace(session_id=session, _delegate_depth=0)
+
+    def _p05_child(self, session):
+        return SimpleNamespace(session_id=session, _delegate_depth=1, _parent_session_id="root")
+
+    def _p05_spawn(self, agent, turn_id, *, tool="delegate_task", tasks=1, cfg=None):
+        args = {"tasks": [{"goal": f"g{i}"} for i in range(tasks)]} if tasks > 1 else {"goal": "g"}
+        with patch.object(triage, "_caller", return_value=agent):
+            return triage.spawn_block(tool, args, cfg or self.cfg, {"turn_id": turn_id})
+
+    def _p05_start(self, child_session, parent_turn_id, *, parent_session="root", cfg=None):
+        with patch.object(router, "_load_config", return_value=cfg or self.cfg):
+            router.on_subagent_start(parent_session_id=parent_session, parent_turn_id=parent_turn_id,
+                                     child_session_id=child_session, child_subagent_id=f"sa-{child_session}",
+                                     child_role="leaf", child_goal="late work")
+
+    def test_p05_late_child_keeps_its_originating_root_turn(self):
+        """Old turn at its ceiling, newer turn admitted, then the old turn's child asks to spawn."""
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        self._p05_start("child", "root:old")
+        self._p05_spawn(self._p05_child("child"), "child:turn")
         self.assertEqual(self._events()[-1]["reason"], "turn_worker_limit",
                          "P05: late child was charged to the newest root turn")
+        self.assertEqual(triage._TURN_WORKERS, {"root:old": 4, "root:new": 1})
+        self.assertEqual(self._events()[-1].get("origin_source"), "child_link")
+        self.assertEqual(self._events()[-1].get("root_turn"), "root:old")
 
-    @unittest.expectedFailure  # F08 P05: owner decision pending
-    def test_p05_late_child_keeps_its_originating_root_turn(self):
-        self._assert_p05_late_child_keeps_origin()
+    def test_p05_older_child_is_charged_to_its_origin_not_the_full_newer_turn(self):
+        """Reverse case: the newer turn is full, the older turn has headroom."""
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old"), "")
+        self.assertEqual(self._p05_spawn(root, "root:new", tasks=4), "")
+        self._p05_start("child", "root:old")
+        self.assertEqual(self._p05_spawn(self._p05_child("child"), "child:turn"), "",
+                         "P05: older turn's child was refused because a newer turn is full")
+        self.assertEqual(triage._TURN_WORKERS, {"root:old": 2, "root:new": 4})
+        self.assertEqual(self._events()[-1].get("root_turn"), "root:old")
 
-    def test_p05_red_evidence_is_an_assertion(self):
-        with self.assertRaisesRegex(AssertionError, "P05: late child"):
-            self._assert_p05_late_child_keeps_origin()
+    def test_p05_several_children_of_two_turns_each_use_their_own_allowance(self):
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=2), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        for child, origin in (("a", "root:old"), ("b", "root:old"), ("c", "root:old"), ("n", "root:new")):
+            self._p05_start(child, origin)
+        self.assertEqual(self._p05_spawn(self._p05_child("a"), "a:turn"), "")
+        self.assertEqual(self._p05_spawn(self._p05_child("b"), "b:turn"), "")
+        refused = self._p05_spawn(self._p05_child("c"), "c:turn")
+        self.assertIn("4 of 4", refused, "P05: third child of the old turn was not held to its ceiling")
+        self.assertEqual(self._events()[-1]["reason"], "turn_worker_limit")
+        self.assertEqual(self._events()[-1].get("root_turn"), "root:old")
+        self.assertEqual(self._p05_spawn(self._p05_child("n"), "n:turn"), "")
+        self.assertEqual(triage._TURN_WORKERS, {"root:old": 4, "root:new": 2})
+
+    def test_p05_both_spawn_transports_resolve_the_origin(self):
+        for tool in ("delegate_task", "delegate_claude"):
+            with self.subTest(tool=tool):
+                triage.reset_state()
+                root = self._p05_root()
+                self.assertEqual(self._p05_spawn(root, "root:old", tasks=4, tool=tool), "")
+                self.assertEqual(self._p05_spawn(root, "root:new", tool=tool), "")
+                self._p05_start("child", "root:old")
+                refused = self._p05_spawn(self._p05_child("child"), "child:turn", tool=tool)
+                self.assertIn("4 of 4", refused, f"P05: {tool} child charged to the newest turn")
+                self.assertEqual(self._events()[-1]["tool"], tool)
+                self.assertEqual(self._events()[-1].get("root_turn"), "root:old")
+                self.assertEqual(triage._TURN_WORKERS, {"root:old": 4, "root:new": 1})
+
+    def test_p05_origin_is_honoured_through_the_pre_tool_call_hook(self):
+        for tool in ("delegate_task", "delegate_claude"):
+            with self.subTest(tool=tool):
+                triage.reset_state()
+                root = self._p05_root()
+                self.assertEqual(self._p05_spawn(root, "root:old", tasks=4, tool=tool), "")
+                self.assertEqual(self._p05_spawn(root, "root:new", tool=tool), "")
+                self._p05_start("child", "root:old")
+                with patch.object(router, "_load_config", return_value=self.cfg), \
+                     patch.object(router, "_delegation_targets_detail", return_value={}), \
+                     patch.object(triage, "_caller", return_value=self._p05_child("child")):
+                    refusal = router.on_pre_tool_call(tool, {"goal": "late"}, session_id="child",
+                                                      turn_id="child:turn")
+                self.assertEqual((refusal or {}).get("action"), "block")
+                self.assertIn("4 of 4", (refusal or {}).get("message", ""))
+                self.assertEqual(self._events()[-1].get("root_turn"), "root:old")
+
+    def test_p05_unknown_child_falls_back_and_the_event_says_so(self):
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        self.assertEqual(self._p05_spawn(self._p05_child("stranger"), "stranger:turn"), "")
+        event = self._events()[-1]
+        self.assertEqual(event.get("origin_source"), "latest_session_pointer")
+        self.assertEqual(event.get("root_turn"), "root:new")
+        self.assertEqual(triage._TURN_WORKERS, {"root:old": 4, "root:new": 2})
+
+    def test_p05_a_link_is_not_recorded_without_an_unambiguous_origin(self):
+        off_cfg = _cfg(self.directory.name, triage_enabled=False)
+        cases = {
+            "triage off": ("off", "root:old", off_cfg),
+            "empty parent turn": ("empty", "", None),
+            "sub-agent parent turn": ("sub", "w1:sa-0-x:turn", None),
+        }
+        for label, (child, parent_turn, cfg) in cases.items():
+            with self.subTest(label):
+                triage.reset_state()
+                root = self._p05_root()
+                self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+                self.assertEqual(self._p05_spawn(root, "root:new"), "")
+                self._p05_start(child, parent_turn, cfg=cfg)
+                self.assertEqual(self._p05_spawn(self._p05_child(child), f"{child}:turn"), "")
+                self.assertEqual(self._events()[-1].get("origin_source"), "latest_session_pointer")
+                self.assertEqual(self._events()[-1].get("root_turn"), "root:new")
+
+    def test_p05_conflicting_origins_are_refused_not_guessed(self):
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old"), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        self._p05_start("child", "root:old")
+        self._p05_start("child", "root:new")
+        refused = self._p05_spawn(self._p05_child("child"), "child:turn")
+        self.assertIn("ambiguous", refused)
+        self.assertEqual(self._events()[-1]["reason"], "turn_origin_ambiguous")
+        self.assertEqual(triage._TURN_WORKERS, {"root:old": 1, "root:new": 1})
+
+    def test_p05_repeated_start_for_the_same_origin_is_not_ambiguous(self):
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old"), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        self._p05_start("child", "root:old")
+        self._p05_start("child", "root:old")
+        self.assertEqual(self._p05_spawn(self._p05_child("child"), "child:turn"), "")
+        self.assertEqual(self._events()[-1].get("root_turn"), "root:old")
+
+    def test_p05_origin_map_is_capped_oldest_first(self):
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        with patch.object(triage, "_ORIGIN_MAX", 2, create=True):
+            for child in ("c1", "c2", "c3"):
+                self._p05_start(child, "root:old")
+        self.assertEqual(len(getattr(triage, "_ORIGIN_BY_CHILD", {})), 2)
+        for child in ("c2", "c3"):
+            self.assertIn("4 of 4", self._p05_spawn(self._p05_child(child), f"{child}:turn"),
+                          f"P05: surviving link for {child} was ignored")
+            self.assertEqual(self._events()[-1].get("origin_source"), "child_link")
+        self.assertEqual(self._p05_spawn(self._p05_child("c1"), "c1:turn"), "")
+        self.assertEqual(self._events()[-1].get("origin_source"), "latest_session_pointer")
+
+    def test_p05_origin_links_expire(self):
+        clock = [1000.0]
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        with patch.object(triage, "_monotonic", lambda: clock[0], create=True), \
+             patch.object(triage, "_ORIGIN_TTL_SECONDS", 60, create=True):
+            self._p05_start("c1", "root:old")
+            clock[0] = 1030.0
+            self._p05_start("c2", "root:old")
+            clock[0] = 1061.0  # c1 is 61s old, c2 31s
+            self.assertEqual(self._p05_spawn(self._p05_child("c1"), "c1:turn"), "")
+            self.assertEqual(self._events()[-1].get("origin_source"), "latest_session_pointer")
+            self.assertIn("4 of 4", self._p05_spawn(self._p05_child("c2"), "c2:turn"))
+            self.assertEqual(self._events()[-1].get("origin_source"), "child_link")
+            self._p05_start("c3", "root:old")  # recording purges the expired c1
+            self.assertEqual(len(getattr(triage, "_ORIGIN_BY_CHILD", {})), 2)
+
+    def test_p05_reset_state_clears_the_origin_links(self):
+        root = self._p05_root()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        self._p05_start("child", "root:old")
+        self.assertIn("4 of 4", self._p05_spawn(self._p05_child("child"), "child:turn"))
+        triage.reset_state()
+        self.assertEqual(self._p05_spawn(root, "root:old", tasks=4), "")
+        self.assertEqual(self._p05_spawn(root, "root:new"), "")
+        self.assertEqual(self._p05_spawn(self._p05_child("child"), "child:turn"), "")
+        self.assertEqual(self._events()[-1].get("origin_source"), "latest_session_pointer")
 
     def test_p06_triage_guidance_is_not_structured_execution_authority(self):
         scratch_cfg = _cfg(self.directory.name)

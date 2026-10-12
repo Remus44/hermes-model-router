@@ -6286,6 +6286,13 @@ def on_subagent_start(**kwargs: Any) -> None:
     """Attach child lifecycle records to real supervisor work and legacy shadows."""
     cfg = _load_config()
     parent_turn_id = str(kwargs.get("parent_turn_id") or "")
+    try:
+        # P05: remember which root user turn this child came from, so a late spawn by it is
+        # charged to that turn and not to the newest one (bounded map inside triage).
+        if triage.enabled(cfg):
+            triage.record_child_origin(kwargs.get("child_session_id"), parent_turn_id)
+    except Exception as exc:
+        _logger.debug("triage origin link not recorded: %s", exc)
     orchestrated = _orchestration_forced_event(cfg, parent_turn_id)
     if orchestrated:
         _orchestration_event(

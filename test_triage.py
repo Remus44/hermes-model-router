@@ -301,6 +301,34 @@ class WorkerBudgetTests(_Patched):
         self.assertIsNone(self.spawn(self.worker("w1")))
         self.assertIn("4 of 4", self.spawn(self.worker("w2"))["message"])
 
+    def start_worker(self, name, turn_id):
+        router.on_subagent_start(parent_session_id="root", parent_turn_id=turn_id,
+                                 child_session_id=name, child_subagent_id=f"sa-{name}",
+                                 child_role="leaf", child_goal="late")
+
+    def test_a_late_worker_is_charged_to_the_turn_it_started_from(self):
+        self.spawn(self.root, tasks=4)
+        self.spawn(self.root, turn_id="root:root:turn2")
+        self.start_worker("w1", "root:root:turn1")
+        blocked = self.spawn(self.worker("w1"), turn_id="w1:sa-0-x:t")
+        self.assertIn("4 of 4", blocked["message"])
+        event = self.events()[-1]
+        self.assertEqual((event["origin_source"], event["root_turn"]), ("child_link", "root:root:turn1"))
+
+    def test_a_worker_of_the_newest_turn_keeps_its_own_allowance(self):
+        self.spawn(self.root, tasks=4)
+        self.spawn(self.root, turn_id="root:root:turn2")
+        self.start_worker("w2", "root:root:turn2")
+        self.assertIsNone(self.spawn(self.worker("w2"), turn_id="w2:sa-0-x:t"))
+        self.assertEqual(triage._TURN_WORKERS, {"root:root:turn1": 4, "root:root:turn2": 2})
+
+    def test_an_unlinked_worker_falls_back_to_the_latest_turn_and_says_so(self):
+        self.spawn(self.root)
+        self.assertIsNone(self.spawn(self.worker("w1"), turn_id="w1:sa-0-x:t"))
+        event = self.events()[-1]
+        self.assertEqual((event["origin_source"], event["root_turn"]),
+                         ("latest_session_pointer", "root:root:turn1"))
+
     def test_a_sub_worker_never_delegates(self):
         leaf = SimpleNamespace(session_id="leaf", _delegate_depth=2, _parent_session_id="w1")
         self.assertIn("cannot delegate further", self.spawn(leaf)["message"])
