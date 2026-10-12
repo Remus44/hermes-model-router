@@ -10,6 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent import relay_tools, tool_executor
+from agent.tool_call_batches import expand_local_tool_batches
+import model_tools
 import model_router as router
 from model_router import execution_adapters, runtime_capabilities as runtime, triage, worker_admission
 from model_router.host_delegation_fixtures import delegate_task_request, host_delegation
@@ -84,16 +87,23 @@ class F08PostMergeTests(unittest.TestCase):
         self.assertIsInstance(calls, dict, "P01: triage replaced the advertised calls[] bridge envelope")
         self.assertEqual(parameters["required"], ["calls"],
                          "P01: triage replaced the advertised calls[] bridge envelope")
-        self.assertEqual(calls["items"]["properties"]["name"].get("enum"), [triage.TOOL_NAME],
-                         "P01: calls[*].name is not pinned to triage_task")
+        name_schema = calls["items"]["properties"]["name"]
+        single_value_pin = (
+            "const" in name_schema
+            or (isinstance(name_schema.get("enum"), list) and len(name_schema["enum"]) == 1)
+        )
+        self.assertFalse(
+            single_value_pin,
+            "P01: calls[*].name is pinned to a single value",
+        )
 
     @unittest.expectedFailure  # F08 P01: owner decision pending
     def test_p01_advertised_calls_envelope_remains_pinned(self):
-        """The installed bridge must pin each advertised calls[].name to triage_task."""
+        """The installed bridge must not pin each advertised calls[].name to one tool."""
         self._assert_p01_advertised_calls_envelope()
 
     def test_p01_red_evidence_is_an_assertion(self):
-        with self.assertRaisesRegex(AssertionError, "P01: (triage replaced|calls\\[\\*\\].name)"):
+        with self.assertRaisesRegex(AssertionError, "P01: (triage replaced|calls\\[\\*\\].name is pinned)"):
             self._assert_p01_advertised_calls_envelope()
 
     def test_p01_host_validation_distinguishes_conflicting_prefixed_and_malformed_calls(self):
@@ -113,27 +123,47 @@ class F08PostMergeTests(unittest.TestCase):
         self.assertEqual(malformed, [])
         self.assertIn("calls[0] requires a 'name'", malformed_error)
 
-    def test_p02_retained_replay_differs_between_normal_executor_and_registry_entrypoints(self):
-        """F05's outer claim replays before normal pre-hooks, but not registry pre-hooks."""
+    def test_p02_retained_replay_uses_host_entrypoint_orderings_and_real_admission_counts(self):
+        """The host wrappers, not a test-owned counter, expose the two replay orderings."""
         root = SimpleNamespace(session_id="p02-root", _delegate_depth=0)
         raw_result = json.dumps({"delegation_id": "child-1"})
 
+        def dispatch_router_pre_hook(name, args, **hook):
+            decision = router.on_pre_tool_call(name, args, **hook)
+            return (decision or {}).get("message"), None
+
         def run_normal_executor():
-            book, raw_calls, pre_hooks = execution_adapters.ReservationBook(), [], []
+            book, raw_calls = execution_adapters.ReservationBook(), []
+            agent = SimpleNamespace(
+                session_id="p02-normal",
+                _current_turn_id="p02:normal",
+                _current_api_request_id="",
+                _tool_guardrails=SimpleNamespace(
+                    before_call=lambda *_args: SimpleNamespace(allows_execution=True)),
+            )
 
             def downstream(sent):
-                pre_hooks.append(router.on_pre_tool_call(
-                    "delegate_task", sent, session_id="p02-normal", turn_id="p02:normal",
-                ))
-                self.assertIsNone(pre_hooks[-1])
-                raw_calls.append(sent)
-                return raw_result
+                outcome = tool_executor._run_agent_tool_execution_middleware(
+                    agent,
+                    function_name="delegate_task",
+                    function_args=sent,
+                    effective_task_id="p02-normal",
+                    tool_call_id="same",
+                    execute=lambda final: raw_calls.append(final) or raw_result,
+                )
+                return outcome.result
 
             with patch.object(execution_adapters, "RESERVATIONS", book), \
                  patch.object(router, "_load_config", return_value=self.cfg), \
                  patch.object(router, "_delegation_targets_detail", return_value={}), \
                  patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
-                 patch.object(triage, "_caller", return_value=root):
+                 patch.object(triage, "_caller", return_value=root), \
+                 patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=dispatch_router_pre_hook), \
+                 patch.object(relay_tools, "execute", side_effect=lambda _name, args, callback, **_kw: (callback(args), args)), \
+                 patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=lambda _name, args, **_kw: SimpleNamespace(payload=args, trace=[])), \
+                 patch("hermes_cli.middleware.run_tool_execution_middleware", side_effect=lambda _name, args, callback, **_kw: callback(args)), \
+                 patch.object(tool_executor, "_begin_tool_execution"), \
+                 patch.object(tool_executor, "_run_with_activity_heartbeat", side_effect=lambda _agent, _name, call: call()):
                 first = execution_adapters.guard_legacy_tool_execution(
                     tool_name="delegate_task", args={"goal": "normal"}, next_call=downstream,
                     session_id="p02-normal", turn_id="p02:normal", tool_call_id="same",
@@ -142,39 +172,137 @@ class F08PostMergeTests(unittest.TestCase):
                     tool_name="delegate_task", args={"goal": "normal"}, next_call=downstream,
                     session_id="p02-normal", turn_id="p02:normal", tool_call_id="same",
                 )
-            return first, replay, raw_calls, pre_hooks
+            return first, replay, raw_calls
 
         def run_direct_registry():
-            book, raw_calls, pre_hooks = execution_adapters.ReservationBook(), [], []
+            book, raw_calls = execution_adapters.ReservationBook(), []
 
-            def registry_call():
-                blocked = router.on_pre_tool_call(
-                    "delegate_task", {"goal": "registry"}, session_id="p02-registry", turn_id="p02:registry",
-                )
-                pre_hooks.append(blocked)
-                self.assertIsNone(blocked)
+            def guarded_registry_execute(function_name, function_args, _original_args, ids, **_kwargs):
                 return execution_adapters.guard_legacy_tool_execution(
-                    tool_name="delegate_task", args={"goal": "registry"},
-                    next_call=lambda sent: raw_calls.append(sent) or raw_result,
-                    session_id="p02-registry", turn_id="p02:registry", tool_call_id="same",
+                    tool_name=function_name,
+                    args=function_args,
+                    next_call=lambda final: raw_calls.append(final) or raw_result,
+                    session_id=ids.session_id,
+                    turn_id=ids.turn_id,
+                    tool_call_id=ids.tool_call_id,
                 )
 
             with patch.object(execution_adapters, "RESERVATIONS", book), \
                  patch.object(router, "_load_config", return_value=self.cfg), \
                  patch.object(router, "_delegation_targets_detail", return_value={}), \
                  patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
-                 patch.object(triage, "_caller", return_value=root):
-                first, replay = registry_call(), registry_call()
-            return first, replay, raw_calls, pre_hooks
+                 patch.object(triage, "_caller", return_value=root), \
+                 patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=dispatch_router_pre_hook), \
+                 patch.object(model_tools, "_AGENT_LOOP_TOOLS", model_tools._AGENT_LOOP_TOOLS - {"delegate_task"}), \
+                 patch.object(model_tools, "_execute_tool", side_effect=guarded_registry_execute):
+                first = model_tools.handle_function_call(
+                    "delegate_task", {"goal": "registry"}, tool_call_id="same",
+                    session_id="p02-registry", turn_id="p02:registry",
+                    skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+                )
+                replay = model_tools.handle_function_call(
+                    "delegate_task", {"goal": "registry"}, tool_call_id="same",
+                    session_id="p02-registry", turn_id="p02:registry",
+                    skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+                )
+            return first, replay, raw_calls
 
+        before_normal = dict(triage._TURN_WORKERS)
         normal = run_normal_executor()
+        normal_delta = triage._TURN_WORKERS.get("p02:normal", 0) - before_normal.get("p02:normal", 0)
+        before_registry = dict(triage._TURN_WORKERS)
         registry = run_direct_registry()
+        registry_delta = triage._TURN_WORKERS.get("p02:registry", 0) - before_registry.get("p02:registry", 0)
         self.assertEqual(normal[:2], (raw_result, raw_result))
         self.assertEqual(registry[:2], (raw_result, raw_result))
         self.assertEqual(len(normal[2]), 1, "P02 normal executor replay reached raw dispatch twice")
         self.assertEqual(len(registry[2]), 1, "P02 registry replay reached raw dispatch twice")
-        self.assertEqual(len(normal[3]), 1, "P02 normal executor charged a sealed replay")
-        self.assertEqual(len(registry[3]), 2, "P02 registry path did not charge before sealed replay")
+        self.assertEqual(normal_delta, 1, "P02 normal executor charged a sealed replay")
+        self.assertEqual(registry_delta, 2, "P02 registry path did not charge before sealed replay")
+
+    def test_f08_triage_switch_replaces_preflight_shadow_and_budget_but_keeps_the_note(self):
+        decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")
+        kwargs = {"request": _openai_request(), "model": "gpt-5.6-terra", "turn_id": "f08:i1", "api_call_count": 1}
+        triaged = _openai_request()
+        with patch.object(router, "_load_config", return_value=self.cfg), \
+             patch.object(router, "classify_request", return_value=decision), \
+             patch.object(router, "_require_callable", side_effect=lambda value, _cfg: value), \
+             patch.object(router, "_triage_request", return_value=triaged) as triage_request, \
+             patch.object(router, "_force_terra_supervisor_preflight") as preflight, \
+             patch.object(router, "_force_shadow_delegation_if_eligible") as shadow, \
+             patch.object(router, "_routing_note", return_value="\\nROUTING NOTE") as note:
+            routed = router._route_llm_request(**kwargs)
+        triage_request.assert_called_once()
+        preflight.assert_not_called()
+        shadow.assert_not_called()
+        note.assert_called_once()
+        self.assertIn("ROUTING NOTE", str(routed["request"]))
+
+        off = _cfg(self.directory.name, triage_enabled=False)
+        preflight_request = _openai_request()
+        with patch.object(router, "_load_config", return_value=off), \
+             patch.object(router, "classify_request", return_value=decision), \
+             patch.object(router, "_require_callable", side_effect=lambda value, _cfg: value), \
+             patch.object(router, "_triage_request", return_value=None), \
+             patch.object(router, "_force_terra_supervisor_preflight", return_value=preflight_request) as preflight, \
+             patch.object(router, "_force_shadow_delegation_if_eligible") as shadow:
+            routed = router._route_llm_request(**kwargs)
+        preflight.assert_called_once()
+        shadow.assert_not_called()
+        self.assertEqual(routed["request"]["model"], "gpt-5.6-terra")
+
+        with patch.object(router, "_load_config", return_value=self.cfg), \
+             patch.object(triage, "spawn_block", return_value="") as spawn, \
+             patch.object(router, "_bounded_dispatch_block", return_value="") as bounded:
+            self.assertIsNone(router.on_pre_tool_call("delegate_task", {"goal": "x"}, turn_id="f08:on"))
+        spawn.assert_called_once()
+        bounded.assert_not_called()
+        with patch.object(router, "_load_config", return_value=off), \
+             patch.object(triage, "spawn_block", return_value="") as spawn, \
+             patch.object(router, "_bounded_dispatch_block", return_value="") as bounded:
+            self.assertIsNone(router.on_pre_tool_call("delegate_task", {"goal": "x"}, turn_id="f08:off"))
+        spawn.assert_not_called()
+        bounded.assert_called_once()
+
+    def test_f08_mixed_local_batch_expansion_has_stable_ids_and_charges_each_delegate_entry(self):
+        mixed_entries = [
+            {"name": "delegate_task", "arguments": {"goal": "first"}},
+            {"name": "triage_task", "arguments": {"decision": "solo"}},
+            {"name": "web_search", "arguments": {"query": "non-local"}},
+        ]
+        singleton_entry = {"name": "delegate_task", "arguments": {"goal": "singleton"}}
+        connector_entries = [
+            {"name": "connectors__drive__list", "arguments": {}},
+            {"name": "connectors__drive__search", "arguments": {"query": "x"}},
+        ]
+        def bridge_call(call_id, entries):
+            return SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(
+                name="tool_call", arguments=json.dumps({"calls": entries})))
+
+        original = [bridge_call("mixed", mixed_entries), bridge_call("singleton", [singleton_entry]),
+                    bridge_call("connector-only", connector_entries)]
+        expanded = expand_local_tool_batches(original)
+        rerun_ids = [call.id for call in expand_local_tool_batches(original)]
+        expanded_entries = [json.loads(call.function.arguments)["calls"] for call in expanded]
+        self.assertEqual(expanded_entries[:3], [[entry] for entry in mixed_entries])
+        self.assertEqual(expanded_entries[3:], [[singleton_entry], connector_entries])
+        self.assertEqual(len(expanded), 5)
+        self.assertEqual([call.id for call in expanded], rerun_ids)
+        self.assertEqual(expanded[0].id, "mixed")
+        self.assertEqual(len({call.id for call in expanded}), len(expanded))
+
+        root = SimpleNamespace(session_id="p02-batch-root", _delegate_depth=0)
+        with patch.object(router, "_load_config", return_value=self.cfg), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(triage, "_caller", return_value=root):
+            for call in expanded:
+                entries, error = normalize_tool_call_entries(json.loads(call.function.arguments))
+                self.assertIsNone(error)
+                for entry in entries:
+                    self.assertIsNone(router.on_pre_tool_call(
+                        entry["name"], entry["arguments"], session_id="p02-batch-root", turn_id="p02:batch"))
+        self.assertEqual(triage._TURN_WORKERS, {"p02:batch": 2})
 
     def test_p03_downstream_conductor_refusal_retains_the_admitted_worker_allowance(self):
         cfg = _cfg(self.directory.name)
@@ -253,6 +381,10 @@ class F08PostMergeTests(unittest.TestCase):
         self.assertEqual(capabilities.capabilities, ())
         self.assertTrue(Path(scratch_cfg["triage"]["path"]).exists())
 
+    def test_p07_code_defaults_retire_explicit_effort_keys(self):
+        self.assertEqual(router._DEFAULT_CONFIG["effort"]["sol"], "high")
+        self.assertNotIn("explicit_sol", router._DEFAULT_CONFIG["effort"])
+
     def test_p07_shipped_config_keeps_bare_and_stated_sol_effort_distinct(self):
         shipped = router.yaml.safe_load(Path(__file__).with_name("router_config.yaml").read_text(encoding="utf-8"))
         bare = router._classify_request(_openai_request("[sol] Inspect and report."), config=shipped)
@@ -273,6 +405,8 @@ class F08PostMergeTests(unittest.TestCase):
         advisory_cases = (
             ("claude-opus-5-5", True),
             ("claude-opus-5-5", False),
+            ("claude-sonnet-5-5", True),
+            ("claude-sonnet-5-5", False),
             ("claude-haiku-4-5", True),
         )
         for model, thinking in advisory_cases:
@@ -287,14 +421,22 @@ class F08PostMergeTests(unittest.TestCase):
         codex = triage.force(_openai_request(), self.cfg, anthropic=False)
         self.assertEqual(codex["tool_choice"], "required")
 
-    def test_f08_conductor_preflight_keeps_claude_five_toolset_advisory(self):
-        routed = router._prepare_orchestration_delegation(
-            _anthropic_request("claude-opus-5-5"), "f08-plan", 1, cfg=self.cfg,
-            force_tools=False, parent_tier="terra",
-        )
-        self.assertNotIn("tool_choice", routed)
-        self.assertEqual(len(routed["tools"]), 2)
-        self.assertIn("[INTERNAL ORCHESTRATOR PREFLIGHT]", routed["messages"][-1]["content"][-1]["text"])
+    def test_f08_conductor_preflight_reaches_the_claude_five_force_choice_decision(self):
+        cfg = _cfg(self.directory.name)
+        cfg["orchestration"] = {"enabled": True, "max_tasks": 3}
+        decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")
+        preflight = _anthropic_request("claude-sonnet-5-5")
+        kwargs = {"request": preflight, "turn_id": "f08-preflight", "api_call_count": 1}
+        sentinel = {"preflight": "routed"}
+        with patch.object(router, "_orchestration_skip_reason", return_value=None), \
+             patch.object(router, "_orchestration_forced_event", return_value=False), \
+             patch.object(router, "_orchestration_event"), \
+             patch.object(router, "_claude_first_choice", return_value=("", "", "")), \
+             patch.object(router, "_prepare_orchestration_delegation", return_value=sentinel) as prepare:
+            routed = router._force_terra_supervisor_preflight(kwargs, cfg, decision)
+        self.assertIs(routed, sentinel)
+        self.assertFalse(prepare.call_args.kwargs["force_tools"])
+        self.assertEqual(prepare.call_args.args[0]["model"], "claude-sonnet-5-5")
 
     def test_f08_triage_on_off_and_host_depth_are_distinct(self):
         root = SimpleNamespace(session_id="root", _delegate_depth=0)
