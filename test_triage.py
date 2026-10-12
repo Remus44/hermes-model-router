@@ -104,9 +104,14 @@ class TriageIsForcedTests(_Patched):
         request = self.route()["request"]
         self.assertEqual([t["name"] for t in request["tools"]], ["tool_call"])
         self.assertEqual(request["tool_choice"], "required")
-        props = request["tools"][0]["parameters"]["properties"]
-        self.assertEqual(props["name"]["enum"], ["triage_task"])
-        self.assertEqual(props["arguments"]["properties"]["decision"]["enum"], ["solo", "delegate"])
+        parameters = request["tools"][0]["parameters"]
+        self.assertEqual(parameters["required"], ["calls"])
+        calls = parameters["properties"]["calls"]
+        self.assertEqual((calls["minItems"], calls["maxItems"]), (1, 1))
+        entry = calls["items"]
+        self.assertEqual(entry["required"], ["name", "arguments"])
+        self.assertEqual(entry["properties"]["name"]["enum"], ["triage_task"])
+        self.assertEqual(entry["properties"]["arguments"]["properties"]["decision"]["enum"], ["solo", "delegate"])
         text = request["input"][-1]["content"][-1]["text"]
         self.assertIn("[ROUTER TRIAGE]", text)
         self.assertIn("at most 4 workers", text)

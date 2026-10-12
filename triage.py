@@ -235,6 +235,8 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
     tool, via_bridge = vehicle
     from . import _append_user_instruction, _rejects_forced_tool_choice, _tool_schema_slot
 
+    routed = deepcopy(request)
+    advisory = anthropic and _rejects_forced_tool_choice(routed)
     pinned = deepcopy(tool)
     owner, key = _tool_schema_slot(pinned)
     if via_bridge:
@@ -244,9 +246,24 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
             properties["name"] = {"type": "string", "enum": [TOOL_NAME],
                                   "description": "The triage tool."}
             properties["arguments"] = deepcopy(SCHEMA_PARAMETERS)
-            schema["required"] = ["name", "arguments"]
-    routed = deepcopy(request)
-    if anthropic and _rejects_forced_tool_choice(routed):
+            if not advisory:
+                raw_calls = properties.get("calls")
+                calls: Dict[str, Any] = raw_calls if isinstance(raw_calls, dict) else {"type": "array"}
+                properties["calls"] = calls
+                calls["minItems"] = 1
+                calls["maxItems"] = 1
+                raw_items = calls.get("items")
+                items: Dict[str, Any] = raw_items if isinstance(raw_items, dict) else {"type": "object"}
+                calls["items"] = items
+                entry_properties = items.setdefault("properties", {})
+                entry_properties["name"] = {"type": "string", "enum": [TOOL_NAME],
+                                            "description": "The triage tool."}
+                entry_properties["arguments"] = deepcopy(SCHEMA_PARAMETERS)
+                items["required"] = ["name", "arguments"]
+                schema["required"] = ["calls"]
+            else:
+                schema["required"] = ["name", "arguments"]
+    if advisory:
         # Anthropic refuses a forced tool_choice while thinking is on, and on Claude 5
         # models at all. One optional tool would let the reply end the turn, so the
         # toolset stays whole and the triage is asked for, not forced.

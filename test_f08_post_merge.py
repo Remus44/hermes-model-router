@@ -12,11 +12,13 @@ from unittest.mock import patch
 
 from agent import relay_tools, tool_executor
 from agent.tool_call_batches import expand_local_tool_batches
+from jsonschema import Draft202012Validator
 import model_tools
 import model_router as router
 from model_router import execution_adapters, runtime_capabilities as runtime, triage, worker_admission
 from model_router.host_delegation_fixtures import delegate_task_request, host_delegation
-from tools.tool_search import bridge_tool_schemas
+import tools.tool_search as tool_search
+from tools.tool_search import bridge_tool_schemas, resolve_underlying_call
 from tools.tool_search_validation import normalize_tool_call_entries
 
 
@@ -81,30 +83,64 @@ class F08PostMergeTests(unittest.TestCase):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
     def _assert_p01_advertised_calls_envelope(self):
+        """Forced bridge payloads must only dispatch the triage tool through calls[]."""
         routed = triage.force(_openai_request(), self.cfg, anthropic=False)
         parameters = routed["tools"][0]["function"]["parameters"]
         calls = parameters["properties"].get("calls")
         self.assertIsInstance(calls, dict, "P01: triage replaced the advertised calls[] bridge envelope")
         self.assertEqual(parameters["required"], ["calls"],
                          "P01: triage replaced the advertised calls[] bridge envelope")
-        name_schema = calls["items"]["properties"]["name"]
+        self.assertEqual(calls.get("minItems"), 1,
+                         "P01: forced bridge must require one calls[] entry")
+        self.assertEqual(calls.get("maxItems"), 1,
+                         "P01: forced bridge must allow only one calls[] entry")
+        item_properties = calls["items"]["properties"]
+        name_schema = item_properties["name"]
         single_value_pin = (
-            "const" in name_schema
-            or (isinstance(name_schema.get("enum"), list) and len(name_schema["enum"]) == 1)
+            name_schema.get("const") == triage.TOOL_NAME
+            or (isinstance(name_schema.get("enum"), list) and name_schema["enum"] == [triage.TOOL_NAME])
         )
-        self.assertFalse(
-            single_value_pin,
-            "P01: calls[*].name is pinned to a single value",
-        )
+        self.assertTrue(single_value_pin,
+                        "P01: calls[*].name must be pinned to triage_task")
+        self.assertEqual(item_properties["arguments"], triage.SCHEMA_PARAMETERS,
+                         "P01: calls[*].arguments must be the triage schema")
 
-    @unittest.expectedFailure  # F08 P01: owner decision pending
+        canonical = {"calls": [{"name": triage.TOOL_NAME,
+                                 "arguments": {"decision": "solo", "rationale": "small task"}}]}
+        validator = Draft202012Validator(parameters)
+        self.assertIsNone(next(validator.iter_errors(canonical), None),
+                          "P01: canonical calls[] triage payload must validate")
+        entries, normalization_error = normalize_tool_call_entries(canonical)
+        self.assertIsNone(normalization_error)
+        self.assertEqual(entries, canonical["calls"])
+        with patch.object(tool_search, "is_deferrable_tool_name",
+                          side_effect=lambda name, *_args: name == triage.TOOL_NAME):
+            resolved_name, resolved_args, resolve_error = resolve_underlying_call(canonical)
+        self.assertIsNone(resolve_error)
+        self.assertEqual(resolved_name, triage.TOOL_NAME)
+        self.assertEqual(resolved_args, canonical["calls"][0]["arguments"])
+
+        non_triage_payloads = (
+            {"calls": [{"name": "delegate_task", "arguments": {"goal": "not triage"}}]},
+            {"name": triage.TOOL_NAME, "arguments": {"decision": "solo"},
+             "calls": [{"name": "delegate_task", "arguments": {"goal": "not triage"}}]},
+            {"name": "delegate_task", "arguments": {"goal": "not triage"}},
+        )
+        for payload in non_triage_payloads:
+            with self.subTest(payload=payload):
+                normalized, normalization_error = normalize_tool_call_entries(payload)
+                self.assertIsNone(normalization_error)
+                self.assertEqual(normalized[0]["name"], "delegate_task")
+                with patch.object(tool_search, "is_deferrable_tool_name", return_value=True):
+                    resolved_name, _resolved_args, resolve_error = resolve_underlying_call(payload)
+                self.assertIsNone(resolve_error)
+                self.assertEqual(resolved_name, "delegate_task")
+                self.assertIsNotNone(next(validator.iter_errors(payload), None),
+                                     "P01: forced bridge legalized a non-triage resolved call")
+
     def test_p01_advertised_calls_envelope_remains_pinned(self):
-        """The installed bridge must not pin each advertised calls[].name to one tool."""
+        """Forced calls[] accepts triage only and resolves to triage_task."""
         self._assert_p01_advertised_calls_envelope()
-
-    def test_p01_red_evidence_is_an_assertion(self):
-        with self.assertRaisesRegex(AssertionError, "P01: (triage replaced|calls\\[\\*\\].name is pinned)"):
-            self._assert_p01_advertised_calls_envelope()
 
     def test_p01_host_validation_distinguishes_conflicting_prefixed_and_malformed_calls(self):
         conflicting, conflicting_error = normalize_tool_call_entries({
@@ -414,6 +450,14 @@ class F08PostMergeTests(unittest.TestCase):
                 routed = triage.force(_anthropic_request(model, thinking=thinking), self.cfg, anthropic=True)
                 self.assertNotIn("tool_choice", routed)
                 self.assertEqual(len(routed["tools"]), 2)
+                bridge = next(tool for tool in routed["tools"] if tool["name"] == "mcp__tool_call")
+                parameters = bridge["input_schema"]
+                self.assertEqual(parameters["required"], ["name", "arguments"],
+                                 "P01 advisory bridge behavior must remain unchanged")
+                advisory_name = parameters["properties"]["calls"]["items"]["properties"]["name"]
+                self.assertNotIn("const", advisory_name)
+                self.assertFalse(isinstance(advisory_name.get("enum"), list)
+                                 and len(advisory_name["enum"]) == 1)
                 self.assertIn("[ROUTER TRIAGE]", routed["messages"][-1]["content"][-1]["text"])
         forced = triage.force(_anthropic_request("claude-haiku-4-5"), self.cfg, anthropic=True)
         self.assertEqual(forced["tool_choice"], {"type": "tool", "name": "mcp__tool_call"})
