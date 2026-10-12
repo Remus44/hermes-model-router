@@ -35,7 +35,8 @@ def _cfg(path, *, triage_enabled=True):
         "enabled": True,
         "models": {"terra": "gpt-5.6-terra", "sol": "gpt-6.1-sol"},
         "tier_providers": {"terra": "openai-codex", "sol": "openai-codex"},
-        "callable": {"terra": True, "sol": True},
+        "callable": {"terra": True, "sol": True,
+                     "haiku": True, "sonnet5": True, "opus5": True},
         "default_model": "terra",
         "triage": {
             "enabled": triage_enabled,
@@ -338,28 +339,74 @@ class F08PostMergeTests(unittest.TestCase):
                         entry["name"], entry["arguments"], session_id="p02-batch-root", turn_id="p02:batch"))
         self.assertEqual(triage._TURN_WORKERS, {"p02:batch": 2})
 
-    def test_p03_downstream_conductor_refusal_retains_the_admitted_worker_allowance(self):
+    def test_p03_router_refusals_do_not_consume_worker_admission(self):
         cfg = _cfg(self.directory.name)
+        cfg["callable"].update({"sol": False, "haiku": False, "sonnet5": False, "opus5": False})
         cfg["orchestration"] = {
             "enabled": True,
             "min_goal_chars": 20,
             "path": str(Path(self.directory.name) / "orchestration.jsonl"),
         }
         root = SimpleNamespace(session_id="p03-root", _delegate_depth=0)
-        args = {"tasks": [{
+        conductor = {"tasks": [{
             "goal": "tiny",
             "context": "You are the terra planning conductor.",
         }]}
         with patch.object(router, "_load_config", return_value=cfg), \
              patch.object(router, "_delegation_targets_detail", return_value={}), \
              patch.object(triage, "_caller", return_value=root):
-            refusal = router.on_pre_tool_call("delegate_task", args, session_id="p03-root", turn_id="p03:turn")
-        self.assertEqual(refusal["action"], "block")
-        self.assertIn("No conductor for this turn", refusal["message"])
-        events = self._events(cfg)
-        self.assertEqual(events[-1]["event"], "spawn_admitted")
-        self.assertEqual(triage._TURN_WORKERS, {"p03:turn": 1},
-                         "P03: downstream refusal unexpectedly restored the admitted allowance")
+            for _ in range(4):
+                refusal = router.on_pre_tool_call(
+                    "delegate_task", {"model": "sol", "goal": "switched off"},
+                    session_id="p03-root", turn_id="p03:turn")
+                self.assertEqual(refusal["action"], "block")
+                self.assertIn('"sol" is switched off', refusal["message"])
+            self.assertEqual(triage._TURN_WORKERS, {},
+                             "P03: router target refusals consumed worker admission")
+            self.assertIsNone(router.on_pre_tool_call(
+                "delegate_task", {"model": "terra", "goal": "valid"},
+                session_id="p03-root", turn_id="p03:turn"))
+            self.assertEqual(triage._TURN_WORKERS, {"p03:turn": 1})
+            before_conductor = dict(triage._TURN_WORKERS)
+            declined = router.on_pre_tool_call(
+                "delegate_task", conductor, session_id="p03-root", turn_id="p03:turn")
+            self.assertEqual(declined["action"], "block")
+            self.assertIn("No conductor for this turn", declined["message"])
+            self.assertEqual(triage._TURN_WORKERS, before_conductor,
+                             "P03: declined conductor consumed worker admission")
+            triage.reset_state()
+            claude = router.on_pre_tool_call(
+                "delegate_claude", {"tier": "sonnet", "goal": "switched off"},
+                session_id="p03-root", turn_id="p03:claude")
+        self.assertEqual(claude["action"], "block")
+        self.assertIn("Claude delegation is off", claude["message"])
+        self.assertEqual(triage._TURN_WORKERS, {},
+                         "P03: delegate_claude router refusal consumed worker admission")
+
+    def test_p03_host_later_refusal_retains_the_admitted_allowance(self):
+        """A host rejection after the real pre-tool hook has no refund seam (S13)."""
+        root = SimpleNamespace(session_id="p03-host", _delegate_depth=0)
+
+        def dispatch_router_pre_hook(name, args, **hook):
+            decision = router.on_pre_tool_call(name, args, **hook)
+            return (decision or {}).get("message"), None
+
+        host_refusal = json.dumps({"error": "host rejected after pre-tool admission"})
+        with patch.object(router, "_load_config", return_value=self.cfg), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(triage, "_caller", return_value=root), \
+             patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=dispatch_router_pre_hook), \
+             patch.object(model_tools, "_AGENT_LOOP_TOOLS", model_tools._AGENT_LOOP_TOOLS - {"delegate_task"}), \
+             patch.object(model_tools, "_execute_tool", return_value=host_refusal):
+            result = model_tools.handle_function_call(
+                "delegate_task", {"goal": "valid"}, session_id="p03-host", turn_id="p03:host",
+                skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+            )
+        self.assertEqual(result, host_refusal)
+        self.assertEqual(self._events()[-1]["event"], "spawn_admitted")
+        self.assertEqual(triage._TURN_WORKERS, {"p03:host": 1},
+                         "P03: host-later refusal unexpectedly restored the admitted allowance")
 
     def _assert_p04_advisory_is_not_forced(self):
         decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")

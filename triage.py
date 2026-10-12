@@ -404,9 +404,10 @@ def _child_origin_locked(child_session: str) -> Optional[str]:
 
 
 def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook: Dict[str, Any]) -> str:
-    """Refusal text when this spawn breaks the turn's worker budget; "" admits it.
+    """Refusal text when this spawn exceeds the turn's admitted-attempt budget; an empty string admits it.
 
-    Counts are charged on admission, so a refused call never consumes budget.
+    Counts are charged on admission, so a refusal made here never consumes budget.
+    Later host or handler refusals retain their admitted attempt: there is no refund seam.
     A depth-1 caller is charged to the root turn recorded for its own session at
     ``subagent_start``; a child with no (or an expired) record falls back to its parent
     session's latest root turn and the event says so (``origin_source``).
@@ -474,7 +475,7 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
         return (f"A worker may start at most {max_children(cfg)} sub-worker, and this call would exceed it. "
                 "Finish the remaining work yourself. Nothing was spawned.")
     if verdict == "turn_worker_limit":
-        return (f"Worker budget for this user turn: {used} of {cap} workers already started (sub-workers "
+        return (f"Worker budget for this user turn: {used} of {cap} admitted spawn attempts (sub-workers "
                 f"included); this call asks for {requested} more. Do the remaining work yourself or wait for "
                 "the running workers. Nothing was spawned.")
     return ""

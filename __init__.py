@@ -6574,6 +6574,58 @@ def _stated_delegation_label_block(args: Dict[str, Any], cfg: Dict[str, Any]) ->
     return ""
 
 
+def _delegation_target_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    """Router-owned target refusal text, determined before worker admission."""
+    if tool_name == claude_delegation.TOOL_NAME:
+        if claude_delegation.availability_block(cfg):
+            return ("Claude delegation is off: every Claude model is switched off in Settings. "
+                    "Use delegate_task, which runs on the Codex route. Nothing was spawned.")
+        settings = claude_delegation.delegation_config(cfg)
+        requested = str(args.get("tier") or settings.get("default_tier") or "sonnet").strip().casefold()
+        if requested not in claude_delegation.TIERS:
+            return (f"Unknown Claude tier {requested!r}; use one of: "
+                    f"{', '.join(claude_delegation.TIERS)}. Nothing was spawned.")
+        target = claude_delegation.TARGET_FOR_TIER[requested]
+        unavailable = claude_delegation._unavailable(target, cfg)
+        if unavailable:
+            return (f"Claude tier \"{requested}\" ({target}) is {unavailable}. "
+                    "Nothing was spawned.")
+        return ""
+
+    switched_on = cfg.get("callable") or {}
+    rescued = None
+    blocked = []
+    for name in _requested_delegation_targets(args, cfg):
+        if _is_callable_tier(name, cfg):
+            continue
+        if switched_on.get(name) is True:  # only cooling down
+            if rescued is None:
+                rescued = _hermes_worker_fallback_configured()
+            if rescued:
+                continue
+        blocked.append(name)
+    if not blocked:
+        return ""
+    claude_ok = claude_delegation.is_active()
+    parts = []
+    for name in blocked:
+        why = claude_delegation._unavailable(name, cfg) or "unavailable"
+        options = []
+        codex = claude_delegation.next_codex_route(name, cfg)
+        if codex:
+            options.append(f'model "{codex}"')
+        if claude_ok:
+            for peer in (name, *_peers_for(name, cfg)):
+                tier = claude_delegation.TIER_FOR_TARGET.get(peer)
+                if tier and _is_callable_tier(peer, cfg):
+                    options.append(f'delegate_claude with tier "{tier}"')
+                    break
+        hint = f" Use {' or '.join(options)} instead." if options else ""
+        parts.append(f'Delegation target "{name}" is {why}.{hint}')
+    _logger.warning("model_router blocked delegate_task to %s", ", ".join(blocked))
+    return " ".join(parts) + " Nothing was spawned."
+
+
 def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **_: Any) -> Optional[Dict[str, str]]:
     """Apply the worker budget and refuse unavailable delegation targets.
 
@@ -6602,6 +6654,12 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         stated_label_block = _stated_delegation_label_block(args, cfg) if tool_name == "delegate_task" else ""
         if stated_label_block:
             return {"action": "block", "message": stated_label_block}
+        declined = _declined_conductor_goal(args, cfg, str(_.get("turn_id") or ""))
+        if declined:
+            return {"action": "block", "message": declined}
+        unavailable_target = _delegation_target_block(tool_name, args, cfg)
+        if unavailable_target:
+            return {"action": "block", "message": unavailable_target}
         if triage.enabled(cfg):
             over_budget = triage.spawn_block(tool_name, args, cfg, _)
             if over_budget:
@@ -6610,46 +6668,7 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             bounded = _bounded_dispatch_block(args, cfg, str(_.get("turn_id") or ""))
             if bounded:
                 return {"action": "block", "message": bounded}
-        declined = _declined_conductor_goal(args, cfg, str(_.get("turn_id") or ""))
-        if declined:
-            return {"action": "block", "message": declined}
-        switched_on = cfg.get("callable") or {}
-        rescued = None
-        blocked = []
-        # Claude's tool resolves its own tier; availability is enforced by its
-        # implementation.  The generic target check is only meaningful for
-        # delegate_task's model argument.
-        if tool_name == claude_delegation.TOOL_NAME:
-            return None
-        for name in _requested_delegation_targets(args, cfg):
-            if _is_callable_tier(name, cfg):
-                continue
-            if switched_on.get(name) is True:  # only cooling down
-                if rescued is None:
-                    rescued = _hermes_worker_fallback_configured()
-                if rescued:
-                    continue
-            blocked.append(name)
-        if not blocked:
-            return None
-        claude_ok = claude_delegation.is_active()
-        parts = []
-        for name in blocked:
-            why = claude_delegation._unavailable(name, cfg) or "unavailable"
-            options = []
-            codex = claude_delegation.next_codex_route(name, cfg)
-            if codex:
-                options.append(f'model "{codex}"')
-            if claude_ok:
-                for peer in (name, *_peers_for(name, cfg)):
-                    tier = claude_delegation.TIER_FOR_TARGET.get(peer)
-                    if tier and _is_callable_tier(peer, cfg):
-                        options.append(f'delegate_claude with tier "{tier}"')
-                        break
-            hint = f" Use {' or '.join(options)} instead." if options else ""
-            parts.append(f'Delegation target "{name}" is {why}.{hint}')
-        _logger.warning("model_router blocked delegate_task to %s", ", ".join(blocked))
-        return {"action": "block", "message": " ".join(parts) + " Nothing was spawned."}
+        return None
     except Exception as exc:  # pragma: no cover - defensive
         _logger.debug("delegate_task gate skipped: %s", exc)
         return None

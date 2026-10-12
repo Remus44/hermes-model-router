@@ -718,7 +718,7 @@ class ExactEffortLabelTests(unittest.TestCase):
 
     def test_stated_label_block_applies_to_delegate_task_not_delegate_claude(self):
         cfg = shipped_config()
-        cfg["callable"]["sol"] = False
+        cfg["callable"].update({"sol": False, "sonnet5": True})
         cfg["triage"] = {"enabled": False}
         with patch.object(router, "_load_config", return_value=cfg), patch.object(router, "_requested_delegation_targets", return_value=()):
             task = router.on_pre_tool_call("delegate_task", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-task")

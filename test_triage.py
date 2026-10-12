@@ -39,7 +39,8 @@ def _cfg(temp_dir, triage_on=True):
     return {
         "enabled": True, "provider": "openai-codex",
         "models": MODELS, "tier_providers": PROVIDERS,
-        "callable": {tier: True for tier in MODELS},
+        "callable": {**{tier: True for tier in MODELS},
+                     "haiku": True, "sonnet5": True, "opus5": True},
         "default_model": "terra",
         "effort": {"terra": "medium", "sol": "medium", "luna": "low", "grok": "medium"},
         "session_policy": {"pin_root_parent": True},
@@ -277,7 +278,7 @@ class WorkerBudgetTests(_Patched):
         self.assertIsNone(self.spawn(self.root, tool="delegate_claude"))
         blocked = self.spawn(self.root)
         self.assertEqual(blocked["action"], "block")
-        self.assertIn("4 of 4", blocked["message"])
+        self.assertIn("4 of 4 admitted spawn attempts", blocked["message"])
 
     def test_a_batch_over_the_budget_is_refused_whole(self):
         self.assertIsNone(self.spawn(self.root, tasks=3))
