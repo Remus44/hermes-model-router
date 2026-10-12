@@ -216,6 +216,10 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+class RoutingRefusal(RuntimeError):
+    """A request middleware refusal that execution must return visibly."""
+
+
 @dataclass(frozen=True)
 class RouteDecision:
     tier: str
@@ -332,8 +336,10 @@ def _apply_preferences(decision: RouteDecision, cfg: Dict[str, Any]) -> RouteDec
         # carry only the delegation advice.
         return replace(decision, prefer_target=target) if target else decision
     try:
-        preferred = _decision(tier, f"preferred {decision.kind} route", cfg, kind=decision.kind)
-    except (KeyError, ValueError):
+        preferred = _decision_with_carried_stated_effort(
+            tier, f"preferred {decision.kind} route", cfg, decision, kind=decision.kind,
+        )
+    except (KeyError, ValueError, RuntimeError):
         return decision
     return replace(preferred, vetoed_by=decision.vetoed_by, prefer_target=target)
 
@@ -346,7 +352,7 @@ def _carried_stated_effort(
         return None
     if stated_effort in _codex_tier_efforts(cfg).get(target_tier, ()):
         return stated_effort
-    raise RuntimeError(
+    raise RoutingRefusal(
         f"Stated effort '{stated_effort}' for '{source_tier}' cannot run on substitute "
         f"tier '{target_tier}': {target_tier} does not support that effort."
     )
@@ -387,7 +393,7 @@ def _resolve_callable_fallback(
                 return _decision_with_carried_stated_effort(
                     tier, f"preferred {decision.kind} fallback from {chosen_tier}", cfg, decision,
                 )
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, RuntimeError):
                 continue
 
     # A policy route is not a preference. Design work reaches Sol because only
@@ -611,11 +617,12 @@ def _require_callable(decision: RouteDecision, cfg: Dict[str, Any]) -> RouteDeci
             unavailable = (
                 f"cooling down for another {int(cooling)}s" if cooling else "disabled"
             )
-            raise RuntimeError(
+            raise RoutingRefusal(
                 f"'{decision.tier}' is required for this request ({decision.reason}) but is "
                 f"{unavailable}; no fallback may take its place."
             )
-        raise RuntimeError(
+        error_type = RoutingRefusal if decision.stated_effort else RuntimeError
+        raise error_type(
             f"No enabled ModelRouter tier is available for requested '{decision.tier}'"
         )
     return resolved
@@ -651,7 +658,11 @@ def _usage_step_down(decision: RouteDecision, cfg: Dict[str, Any]) -> RouteDecis
             return replace(decision, reason=f"{decision.reason}; usage {label} limit: "
                                             f"{decision.tier}→{target} skipped ({target} unavailable)")
         if decision.stated_effort:
-            return decision
+            return replace(
+                decision,
+                reason=f"{decision.reason}; usage {label} limit: {decision.tier}→{target} "
+                       "step-down skipped, stated level",
+            )
         step_reason = f"usage {label} limit: {decision.tier}→{target} ({window_reason})"
         stepped = _decision(target, f"{decision.reason}; {step_reason}", cfg)
         return replace(stepped, kind=decision.kind)
@@ -2018,8 +2029,10 @@ def _classify_request(
     # [sol] leaf still faces the gate, and Sol still owns every [sol] leaf.
     design_label = _label_match(text, cfg)
     design_stated_effort = (
-        design_label.group("level").casefold()
-        if design_label and design_label.group("tier").casefold() == "sol" and design_label.group("level")
+        _carried_stated_effort(
+            design_label.group("level").casefold(), design_label.group("tier").casefold(), "sol", cfg,
+        )
+        if design_label and design_label.group("level")
         else None
     )
     if _is_design_request(user_text) and not (
@@ -2046,7 +2059,10 @@ def _classify_request(
         requested_effort = requested_effort.casefold() if requested_effort else None
         label = f"{tier}:{requested_effort}" if requested_effort else tier
         if tier == "spark" and has_image_attachment:
-            return _decision("terra", "image attachment requires a vision-capable route", cfg, mandatory=True)
+            return _decision(
+                "terra", "image attachment requires a vision-capable route", cfg, mandatory=True,
+                stated_effort=_carried_stated_effort(requested_effort, tier, "terra", cfg),
+            )
         # A delegated leaf carries a conductor's declaration, so the router
         # looks only for contradiction. A root [spark] is a label someone typed
         # with nothing behind it, and still has to show its read-only intent.
@@ -4178,7 +4194,28 @@ def route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
         _tool_names(kwargs.get("request"))
     )
     with claude_delegation.request_scope(active):
-        return _route_llm_request(**kwargs)
+        try:
+            return _route_llm_request(**kwargs)
+        except RoutingRefusal as error:
+            request = kwargs.get("request")
+            if not isinstance(request, dict):
+                raise
+            refusal = str(error)
+            routed = dict(request)
+            routed["_model_router_refusal"] = refusal
+            decision = RouteDecision(
+                "refused", str(kwargs.get("model") or request.get("model") or ""), refusal,
+            )
+            try:
+                _log_decision(decision, kwargs, _load_config())
+            except Exception:
+                pass
+            return {
+                "request": routed,
+                "source": "model-router",
+                "reason": refusal,
+                "metadata": {"tier": "refused", "model": decision.model, "effort": "", "refusal": refusal},
+            }
 
 
 def on_pre_gateway_dispatch(**kwargs: Any) -> None:
@@ -4316,10 +4353,8 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     # [spark] is an internal leaf label emitted by a Terra plan, not a public
     # root-route escape hatch. A user/root turn must still be assessed by Terra.
     if decision.tier == "spark" and not subagent_marker:
-        decision = _decision(
-            str(cfg.get("default_model", "terra")),
-            "root Spark label deferred to default orchestrator",
-            cfg,
+        decision = _decision_with_carried_stated_effort(
+            str(cfg.get("default_model", "terra")), "root Spark label deferred to default orchestrator", cfg, decision,
         )
     is_spark_subagent = (
         subagent_marker
@@ -4336,8 +4371,10 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # default must not silently promote every safe child.
         user_text, _ = _last_user_text_and_index(_request_items(request))
         user_text = _without_host_injected_context(_without_router_contract(user_text))
-        if decision.tier != "sol" and not _is_spark_read_only_request(user_text):
-            decision = _decision("terra", "Spark is restricted to non-design read-only subtasks", cfg)
+        if decision.tier != "sol" and not _is_spark_read_only_work(user_text):
+            decision = _decision_with_carried_stated_effort(
+                "terra", "Spark is restricted to non-design read-only subtasks", cfg, decision,
+            )
         explicit = decision.reason.startswith("explicit [")
         hard_sol_reasons = {
             "sensitive or consequential domain",
@@ -4388,11 +4425,15 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
                 (tier for tier, model in (cfg.get("models") or {}).items() if model == fallback_model),
                 "luna",
             )
-            decision = RouteDecision(
-                fallback_tier,
-                fallback_model,
-                "Spark quota already exhausted for this turn",
-                _quota_fallback_effort(cfg, fallback_tier),
+            decision = (
+                _decision_with_carried_stated_effort(
+                    fallback_tier, "Spark quota already exhausted for this turn", cfg, decision,
+                )
+                if decision.stated_effort
+                else RouteDecision(
+                    fallback_tier, fallback_model, "Spark quota already exhausted for this turn",
+                    _quota_fallback_effort(cfg, fallback_tier),
+                )
             )
     # Rules above may intentionally rewrite the tier (root labels, subagents,
     # quota). Re-validate the final destination immediately before dispatch.
@@ -4439,10 +4480,8 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
                 f"Active ModelRouter tier '{active_tier}' is disabled and cannot be "
                 f"moved to provider '{tier_providers.get(decision.tier)}' mid-session"
             )
-        decision = _decision(
-            active_tier,
-            "cross-provider route preserved for the active session",
-            cfg,
+        decision = _decision_with_carried_stated_effort(
+            active_tier, "cross-provider route preserved for the active session", cfg, decision,
         )
 
     # A delegated review leaf reaches Claude only through the CLI bridge. Explain
@@ -5721,8 +5760,6 @@ def _mandatory_exact_review_preselection(request: Dict[str, Any], cfg: Dict[str,
         except Exception:
             route_reason = "the Claude CLI review route could not be established"
         refuse("exact Claude CLI review route was refused before bridge selection: " + route_reason)
-    if not coding_cfg.get("enabled") and not policy.get("enabled"):
-        refuse("exact Claude CLI review route is disabled by both coding_agent and delegated_review policy")
     if str(kwargs.get("api_mode") or "") != "codex_responses":
         refuse("exact Claude CLI review route is unavailable outside the Codex responses execution path")
     provider = str(kwargs.get("provider") or "").casefold()
@@ -5872,27 +5909,6 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         policy = coding_cfg.get("delegated_review") or {}
         selection_mode = str(policy.get("selection_mode") or "profile_preferred")
         requested_model = str(policy.get("requested_model") or "").strip() or None
-        if delegated is None and selection_mode == "exact" and review_model_alias(routing_text) is not None:
-            try:
-                _route, route_reason = _delegated_claude_review_status(
-                    routing_text, cfg, request=source_request,
-                )
-            except Exception:
-                route_reason = "the Claude CLI review route could not be established"
-            from . import target_identity
-            try:
-                resolution = target_identity.resolve_target(
-                    requested_alias, transport="claude_cli", selection_mode=selection_mode,
-                    requested_model=requested_model, cfg=cfg,
-                )
-                identity = resolution.identity
-            except Exception:
-                # Exact mode is mandatory: an unresolvable identity still stops.
-                identity = None
-            refusal = "exact Claude CLI review route was refused before bridge selection: " + route_reason
-            audit_refusal(refusal)
-            from .claude_opus_bridge import ClaudeBridgeFailure
-            raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
         if delegated is not None:
             repo, _requested_alias = delegated
             from . import target_identity
@@ -6038,6 +6054,9 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     cfg = _load_config()
     provider = str(kwargs.get("provider", "")).casefold()
     configured_provider = str(cfg.get("provider", "openai-codex")).casefold()
+    refusal = str(request.get("_model_router_refusal") or "") if isinstance(request, dict) else ""
+    if refusal:
+        return worker_admission.stopped_response(refusal, str(request.get("model", "")))
     worker = (cfg.get("enabled", True) and isinstance(request, dict)
               and (str(kwargs.get("platform", "")).casefold() == "subagent"
                    or ":sa-" in str(kwargs.get("turn_id", ""))))
@@ -6241,7 +6260,10 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             stated_effort=stated_effort or "",
         )
         retry_response = retry_call(fallback_request)
-        _log_decision(fallback_decision, {**kwargs, "request": fallback_request}, cfg)
+        try:
+            _log_decision(fallback_decision, {**kwargs, "request": fallback_request}, cfg)
+        except Exception as log_error:
+            _logger.debug("retry route logging skipped: %s", log_error)
         return delivered(retry_response)
 
 
@@ -6577,7 +6599,7 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         unsupported = _unsupported_delegation_label(args, cfg)
         if unsupported:
             return {"action": "block", "message": _unsupported_label_message(unsupported)}
-        stated_label_block = _stated_delegation_label_block(args, cfg)
+        stated_label_block = _stated_delegation_label_block(args, cfg) if tool_name == "delegate_task" else ""
         if stated_label_block:
             return {"action": "block", "message": stated_label_block}
         if triage.enabled(cfg):

@@ -218,7 +218,7 @@ def _vehicle(request: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], bool]]:
 
 
 def instruction(cfg: Dict[str, Any], *, via_bridge: bool) -> str:
-    how = (f'Call it through tool_call with name "{TOOL_NAME}" and the triage as `arguments`. '
+    how = (f'Call it through tool_call in `calls` with name "{TOOL_NAME}" and the triage `arguments`. '
            if via_bridge else "")
     return (
         "\n\n[ROUTER TRIAGE] Before any other work, assess this request and call "

@@ -743,6 +743,22 @@ class AccountOfExecutionTests(unittest.TestCase):
                 stopped = self._assert_stopped_refusal(run)
                 self.assertIn('exact Claude CLI review route was refused', stopped.output_text)
 
+    def test_exact_enabled_review_refuses_non_codex_api_and_provider_before_any_launch(self):
+        cases = (
+            ('Anthropic API mode', 'anthropic', 'anthropic_messages',
+             'outside the Codex responses execution path'),
+            ('Qwen provider', 'qwen-token', 'codex_responses',
+             'unavailable on the routed provider'),
+        )
+        for name, provider, api_mode, reason in cases:
+            with self.subTest(provider=name), tempfile.TemporaryDirectory() as directory:
+                run = self._exact_preselection_run(
+                    directory, repo=Path(directory), coding_enabled=False,
+                    delegated_review_enabled=True, provider=provider, api_mode=api_mode,
+                )
+                stopped = self._assert_stopped_refusal(run)
+                self.assertIn(reason, stopped.output_text)
+
     def test_exact_preselection_resolve_target_raise_still_stops(self):
         with tempfile.TemporaryDirectory() as directory:
             run = self._exact_preselection_run(directory, repo=None, resolve_error=RuntimeError('boom'))

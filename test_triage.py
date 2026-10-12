@@ -163,6 +163,9 @@ class TriageIsForcedTests(_Patched):
         request = self.route(tier="grok")["request"]
         self.assertEqual(request["model"], "grok-4.7")
         self.assertEqual([t["name"] for t in request["tools"]], ["tool_call"])
+    def test_bridge_instruction_names_calls_not_the_legacy_singular_shape(self):
+        self.assertIn("`calls`", triage.instruction(self.cfg, via_bridge=True))
+        self.assertNotIn("with name \"triage_task\" and the triage as `arguments`", triage.instruction(self.cfg, via_bridge=True))
 
 
 class TriageIsSkippedTests(_Patched):
