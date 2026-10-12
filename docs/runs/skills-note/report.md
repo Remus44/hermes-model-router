@@ -2,7 +2,7 @@
 
 ## Commit
 
-Pending final commit on `fix/skills-note-injected-context`.
+Implementation SHA: `5153059` (`fix(routing): never read the host skills-change note when classifying (injected-context)`).
 
 ## Change
 
