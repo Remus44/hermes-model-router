@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import model_router
 from model_router import claude_delegation, route_llm_request, usage_guard
+from model_router.host_delegation_fixtures import host_delegation
 from model_router.test_claude_preflight import CODE, REVIEW, _anthropic_request, _openai_request
 from model_router.test_model_router import CALLABLE, MODELS
 from model_router.usage_guard import Reading
@@ -181,7 +182,8 @@ class ForcedCallTests(unittest.TestCase):
         readings = {"anthropic": claude, "openai-codex": codex}
         with tempfile.TemporaryDirectory() as d:
             cfg = _cfg(d)
-            with patch("model_router._load_config", return_value=cfg), \
+            with host_delegation(depth=2), \
+                 patch("model_router._load_config", return_value=cfg), \
                  patch("model_router._log_decision"), \
                  patch("model_router._hermes_delegation_target_names", return_value=("sonnet5", "opus5")), \
                  patch.object(usage_guard, "peek", side_effect=lambda account, _cfg: readings.get(account)), \

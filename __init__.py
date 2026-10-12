@@ -27,10 +27,26 @@ except ImportError:  # pragma: no cover - Hermes includes PyYAML
     yaml = None
 
 from . import claude_delegation
+from . import runtime_capabilities
+from . import target_identity
 from . import usage_guard
 from . import worker_admission
 from . import triage
 from .hermes_paths import hermes_path
+
+
+# Exact fallback per-label Codex vocabularies.  They deliberately mirror the
+# shipped model families so a missing/renamed host effort module cannot disable
+# all router hooks at import time.
+_FALLBACK_CODEX_TIER_EFFORTS = {
+    "luna": ("low", "medium", "high", "xhigh", "max"),
+    "spark": ("low", "medium", "high", "xhigh"),
+    "terra": ("low", "medium", "high", "xhigh", "max"),
+    "sol": ("low", "medium", "high", "xhigh", "max"),
+}
+_CODEX_TIER_EFFORTS_LOCK = threading.Lock()
+_CODEX_TIER_EFFORTS_CACHE: Dict[Tuple[Tuple[str, str], ...], Dict[str, Tuple[str, ...]]] = {}
+_CODEX_TIER_EFFORTS_WARNING_EMITTED = False
 
 _logger = logging.getLogger("model_router")
 
@@ -91,15 +107,12 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "luna_max_chars": 700,
         "sol_min_chars": 3500,
     },
-    # Keyed by tier, by ``explicit_<tier>`` for a labelled route, and by
-    # ``explicit_<tier>_xhigh`` for one that asked to be escalated. Unset keys
-    # degrade to the plain tier, so adding a tier here is optional.
+    # Plain per-tier configured effort. Explicit [tier:level] labels bypass this
+    # configuration and use the exact stated supported level; sol_long remains a
+    # separate automatic long-request setting.
     "effort": {
         "luna": "low", "spark": "low", "terra": "medium", "sol": "high", "qwen": "medium",
         "grok": "medium",
-        "explicit_sol": "xhigh",
-        "explicit_luna_xhigh": "high", "explicit_spark_xhigh": "high",
-        "explicit_terra_xhigh": "high", "explicit_sol_xhigh": "xhigh",
     },
     # Provider mapping per tier: which Hermes provider handles each tier.
     "tier_providers": {
@@ -753,8 +766,105 @@ _SPARK_CONSEQUENTIAL_WORK = re.compile(
 )
 
 
-_PLAN_LABEL = re.compile(r"^\s*\[(luna|spark|terra|sol)(?::xhigh)?\](?:\s|$)")
+def _codex_tier_efforts(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Tuple[str, ...]]:
+    """Return per-tier supported label levels without coupling plugin import to Hermes.
+
+    The cache is keyed by the configured model names, so a local ``models:``
+    overlay immediately changes the accepted vocabulary.  Importing the host is
+    deliberately outside the lock: an update/stale-install retry may touch the
+    filesystem and must not serialize unrelated label checks.
+    """
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    configured_models = config.get("models") if isinstance(config.get("models"), dict) else {}
+    model_key = tuple(
+        (tier, str(configured_models.get(tier) or _DEFAULT_CONFIG["models"][tier]))
+        for tier in _FALLBACK_CODEX_TIER_EFFORTS
+    )
+    with _CODEX_TIER_EFFORTS_LOCK:
+        cached = _CODEX_TIER_EFFORTS_CACHE.get(model_key)
+    if cached is not None:
+        return cached
+
+    levels: Dict[str, Tuple[str, ...]] = dict(_FALLBACK_CODEX_TIER_EFFORTS)
+    failure: Optional[Exception] = None
+    try:
+        import importlib
+
+        usage_guard._import_hermes("agent.reasoning_effort")
+        reasoning_effort = importlib.import_module("agent.reasoning_effort")
+        supported = getattr(reasoning_effort, "codex_supported_efforts", None)
+        if callable(supported):
+            derived = {
+                tier: tuple(level for level in supported(model) if level != "none")
+                for tier, model in model_key
+            }
+            if not all(derived.values()):
+                raise ValueError("host codex_supported_efforts returned an empty label vocabulary")
+            levels = derived
+        else:
+            gpt56 = getattr(reasoning_effort, "CODEX_GPT56_EFFORTS")
+            legacy = getattr(reasoning_effort, "CODEX_LEGACY_EFFORTS")
+            astra = getattr(reasoning_effort, "CODEX_ASTRA_EFFORTS")
+            levels = {
+                "luna": tuple(level for level in gpt56 if level != "none"),
+                "spark": tuple(level for level in legacy if level != "none"),
+                "terra": tuple(level for level in gpt56 if level != "none"),
+                "sol": tuple(level for level in astra if level != "none"),
+            }
+    except Exception as exc:  # host compatibility must not disable the router
+        failure = exc
+
+    global _CODEX_TIER_EFFORTS_WARNING_EMITTED
+    with _CODEX_TIER_EFFORTS_LOCK:
+        if failure is not None and not _CODEX_TIER_EFFORTS_WARNING_EMITTED:
+            _logger.warning("using literal Codex effort labels; host reasoning_effort unavailable: %s", failure)
+            _CODEX_TIER_EFFORTS_WARNING_EMITTED = True
+        return _CODEX_TIER_EFFORTS_CACHE.setdefault(model_key, levels)
+
+
+_CODEX_LABEL = re.compile(r"^\s*\[(?P<tier>luna|spark|terra|sol)(?::(?P<level>[a-z]+))?\](?:\s|$)", re.I)
+_MALFORMED_CODEX_LEVEL = re.compile(r"^\s*\[(?P<tier>luna|spark|terra|sol):(?P<level>[^\]]*)\]", re.I)
+# A valid router label only: an unsupported level is deliberately not a label on
+# a root turn, while dispatch admission recognises it separately and refuses it.
 _CLAUDE_REVIEW_LABEL = re.compile(r"^\s*\[(opus|sonnet)5?-review\](?:\s|$)")
+
+
+def _label_match(text: str, cfg: Optional[Dict[str, Any]] = None) -> Optional[re.Match[str]]:
+    match = _CODEX_LABEL.match(text or "")
+    if not match:
+        return None
+    level = match.group("level")
+    tier = match.group("tier").casefold()
+    if level is None or level.casefold() in _codex_tier_efforts(cfg)[tier]:
+        return match
+    return None
+
+
+def _unsupported_label(text: str, cfg: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+    match = _CODEX_LABEL.match(text or "")
+    if match and match.group("level") is not None:
+        tier = match.group("tier").casefold()
+        level = match.group("level").casefold()
+        levels = _codex_tier_efforts(cfg)[tier]
+        return None if level in levels else (tier, level, levels)
+    malformed = _MALFORMED_CODEX_LEVEL.match(text or "")
+    if not malformed:
+        return None
+    tier = malformed.group("tier").casefold()
+    levels = _codex_tier_efforts(cfg)[tier]
+    level = malformed.group("level").casefold()
+    # A supported level that is merely not followed by whitespace (``[sol:high]text``)
+    # never was a label and routed as plain text before; it is not an effort error.
+    # Compared exactly: ``[sol: high]`` carries a space inside the brackets and stays refused.
+    if level in levels:
+        return None
+    return tier, level, levels
+
+
+def _unsupported_label_message(unsupported: Tuple[str, str, Tuple[str, ...]]) -> str:
+    tier, level, levels = unsupported
+    return f"Unsupported {tier} effort '{level}'; supported levels: {', '.join(levels)}. Nothing was spawned."
+
 # A goal that names an external target the way a Sol or Spark goal names its
 # tier. It is not a route and never has been -- the override regex knows only
 # the four tiers of the default provider -- so the leaf runs on whatever the
@@ -791,7 +901,7 @@ def _misdispatched_external_label(text: str, active_model: str, cfg: Dict[str, A
     return name
 
 
-def _is_plan_labelled_worker(text: str) -> bool:
+def _is_plan_labelled_worker(text: str, cfg: Optional[Dict[str, Any]] = None) -> bool:
     """True when this text is a delegated worker goal labelled by this router.
 
     The keyword test predates the planner. It exists because the router once had
@@ -802,7 +912,7 @@ def _is_plan_labelled_worker(text: str) -> bool:
     -- and it cannot even tell the cases apart: `_is_design_request` is true both
     for "identify the layout branches" and for "implement a responsive CSS card".
     """
-    return bool(_PLAN_LABEL.match(text))
+    return _label_match(text, cfg) is not None
 
 
 def _is_design_request(text: str) -> bool:
@@ -1414,8 +1524,11 @@ def _kind_for_goal(goal: str, cfg: Dict[str, Any]) -> str:
     never associated with it.
     """
     # A route label describes the stopped worker, not the semantic work kind.
-    goal = re.sub(r"^\s*\[(?:luna|spark|terra|sol|opus5|sonnet5|haiku|qwen|grok)(?::xhigh)?\]\s*",
-                  "", goal, flags=re.I)
+    label = _label_match(goal, cfg)
+    if label:
+        goal = goal[label.end():]
+    else:
+        goal = re.sub(r"^\s*\[(?:opus5|sonnet5|haiku|qwen|grok)\]\s*", "", goal, flags=re.I)
     if not goal.strip():
         return "default"
     try:
@@ -1655,33 +1768,19 @@ def _decision(
     *,
     explicit: bool = False,
     effort_key: Optional[str] = None,
+    stated_effort: Optional[str] = None,
     mandatory: bool = False,
     kind: str = "",
 ) -> RouteDecision:
     efforts = cfg.get("effort") or {}
-    if effort_key is None:
-        # The explicit-label bump used to be Sol's alone, so ``explicit_<tier>``
-        # was unreadable config for every other tier. It is consulted for all of
-        # them now, but only where the operator actually wrote the key: an absent
-        # one must leave that tier exactly as it routed before.
-        #
-        # Sol keeps its unconditional form. There the missing key deliberately
-        # falls through to the built-in tier default rather than the configured
-        # ``sol`` value -- an explicit Sol label is an escalation, and the tests
-        # pin that behaviour.
-        explicit_key = f"explicit_{tier}"
-        use_explicit = explicit and (tier == "sol" or explicit_key in efforts)
-        effort_key = explicit_key if use_explicit else tier
-    # An escalation degrades to the tier's explicit key, never to its floor: a
-    # missing ``explicit_<tier>_xhigh`` means "no escalation configured", and
-    # answering that with the plain tier value would silently cap [sol:xhigh].
-    candidates = [effort_key]
-    if effort_key.endswith("_xhigh"):
-        candidates.append(effort_key[: -len("_xhigh")])
-    effort = next(
-        (str(efforts[key]).casefold() for key in candidates if efforts.get(key)),
-        _DEFAULT_EFFORT.get(tier, "medium"),
-    )
+    # A bare label shares the dashboard's tier setting. A stated level has
+    # already been validated against this tier's host vocabulary and must reach
+    # the wire exactly; retired explicit_* keys are intentionally invisible.
+    if stated_effort is not None:
+        effort = stated_effort
+    else:
+        key = effort_key or tier
+        effort = str(efforts.get(key) or _DEFAULT_EFFORT.get(tier, "medium")).casefold()
     return RouteDecision(
         tier=tier, model=cfg["models"][tier], reason=reason, effort=effort,
         mandatory=mandatory, kind=kind,
@@ -1849,7 +1948,7 @@ def _classify_request(
     # decisions on one turn. Only the conductor label is exempt; a [spark] or
     # [sol] leaf still faces the gate, and Sol still owns every [sol] leaf.
     if _is_design_request(user_text) and not (
-        allow_plan_label_over_design and _is_plan_labelled_worker(text)
+        allow_plan_label_over_design and _is_plan_labelled_worker(text, cfg)
     ):
         return _decision("sol", "design analysis or implementation is Sol-only", cfg, mandatory=True, kind="design")
 
@@ -1862,9 +1961,9 @@ def _classify_request(
                 return _decision("terra", "Spark is restricted to non-design read-only subtasks", cfg)
         return _decision(benchmark_force, "benchmark environment force override", cfg, explicit=True)
 
-    override = re.match(r"^\s*\[(luna|spark|terra|sol)(?::(xhigh))?\](?:\s|$)", text)
+    override = _label_match(text, cfg)
     if override:
-        tier = override.group(1)
+        tier = override.group("tier").casefold()
         if tier == "spark" and has_image_attachment:
             return _decision("terra", "image attachment requires a vision-capable route", cfg, mandatory=True)
         # A delegated leaf carries a conductor's declaration, so the router
@@ -1886,13 +1985,10 @@ def _classify_request(
             if _is_design_request(user_text):
                 return _decision("sol", "design analysis or implementation is Sol-only", cfg, mandatory=True, kind="design")
             return _decision("terra", f"{tier.capitalize()} is restricted to non-design read-only subtasks", cfg)
-        requested_effort = override.group(2)
-        # Escalation is not Sol's alone. The ``:xhigh`` suffix parsed for every
-        # tier and was then discarded for all but Sol, so [luna:xhigh] silently
-        # ran at Luna's floor effort with no way to say otherwise.
-        effort_key = f"explicit_{tier}_xhigh" if requested_effort == "xhigh" else None
+        requested_effort = override.group("level")
+        requested_effort = requested_effort.casefold() if requested_effort else None
         label = f"{tier}:{requested_effort}" if requested_effort else tier
-        return _decision(tier, f"explicit [{label}] override", cfg, explicit=True, effort_key=effort_key)
+        return _decision(tier, f"explicit [{label}] override", cfg, explicit=True, stated_effort=requested_effort)
 
     # The durable completion of a [terra] orchestrator includes the complete
     # reviewed evidence and can be much longer than the normal Sol threshold.
@@ -3436,6 +3532,47 @@ def _host_delegation_limits() -> Dict[str, Any]:
         return {"conductor_available": False}
 
 
+def runtime_diagnostic(
+    request: Any = None, cfg: Optional[Dict[str, Any]] = None,
+    topology: str = runtime_capabilities.DEFAULT_TOPOLOGY, transport: str = "hermes_codex",
+) -> Dict[str, Any]:
+    """Read-only S01 view: configured feature vs runtime capability vs topology.
+
+    Not called from the routing hot path; it never dispatches, probes a model,
+    writes config, or raises the host spawn depth. Fresh admission is still
+    required before any execution.
+    """
+    cfg = _load_config() if cfg is None else cfg
+    snap = runtime_capabilities.snapshot(request, cfg)
+    return runtime_capabilities.diagnostic(snap, topology, transport)
+
+
+def _read_host_config() -> Dict[str, Any]:
+    """The host's config.yaml as a dict, read-only; ``{}`` when absent or unreadable."""
+    if yaml is None:
+        return {}
+    try:
+        raw = yaml.safe_load(_HERMES_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def identity_diagnostic(
+    cfg: Optional[Dict[str, Any]] = None,
+    observed: Optional[Dict[str, Any]] = None,
+    request: Any = None,
+) -> Dict[str, Any]:
+    """Read-only S02 view: which config owner names which Claude model, per tier.
+
+    Reads router config and the host config file; no network, subprocess, model
+    call or write, and it is not on the routing hot path.
+    """
+    cfg = _load_config() if cfg is None else cfg
+    snap = runtime_capabilities.snapshot(request, cfg)
+    return target_identity.drift_diagnostic(cfg, _read_host_config(), observed, snap)
+
+
 def _orchestration_skip_reason(
     kwargs: Dict[str, Any], cfg: Dict[str, Any], decision: RouteDecision
 ) -> Optional[str]:
@@ -3905,6 +4042,7 @@ def _routing_note(request: Dict[str, Any], kwargs: Dict[str, Any], cfg: Dict[str
                      f"(soft {limits['soft_percent']:.0f}%, hard {limits['hard_percent']:.0f}%)")
     if usage:
         lines.append("Usage: " + "; ".join(usage) + ".")
+    lines.append("When the user states a model effort, write [tier:level]; otherwise use a bare [tier] label.")
     lines.append(_DEFERRED_DELEGATION_HINT.rstrip())
     lines.append("Advisory: if you route differently, say why in one line.")
     return "\n\n" + "\n".join(lines) + "\n"
@@ -4070,9 +4208,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     session_policy = cfg.get("session_policy") or {}
     latest_user_text, _ = _last_user_text_and_index(_request_items(request))
     latest_user_text = _without_host_injected_context(_without_router_contract(latest_user_text))
-    explicit_root_override = bool(
-        re.match(r"^\s*\[(?:luna|spark|terra|sol)(?::xhigh)?\](?:\s|$)", _normalise(latest_user_text))
-    )
+    explicit_root_override = _label_match(_normalise(latest_user_text), cfg) is not None
     if (
         not subagent_marker
         and bool(session_policy.get("pin_root_parent", False))
@@ -4145,7 +4281,7 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # A rejected leaf fared worse -- "consequential Spark task requires Sol"
         # was demoted to Terra, turning a deliberate escalation into the exact
         # tier the escalation existed to avoid.
-        and not _PLAN_LABEL.match(_normalise(latest_user_text))
+        and _label_match(_normalise(latest_user_text), cfg) is None
     ):
         # The delegation default is Terra so the forced first child is a real
         # planner. Unlabelled child work remains with the default_model rather
@@ -4864,8 +5000,16 @@ def _verified_delegated_claude_review(text: str, cfg: Dict[str, Any], *, request
 
 def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False, cfg: Dict[str, Any],
                       model: Optional[str] = None, requested_alias: Optional[str] = None,
-                      adjustment: str = "", **context: Any) -> Dict[str, Any]:
-    """Lazy bridge import keeps the standalone CLI and package imports independent."""
+                      adjustment: str = "", identity: Any = None, **context: Any) -> Dict[str, Any]:
+    """Middleware CLI entry; keep admission at the existing policy call site.
+
+    Maps router config onto the public ``claude_opus_bridge.dispatch``, which
+    owns the one normalised CLI boundary (shared with the standalone ``main()``
+    and direct Python callers) and calls only its private raw subprocess
+    operation. Not wrapped again here, so each run yields one receipt. No
+    concurrency cap: the pre-S05 bridge had none. A typed ClaudeBridgeFailure is
+    a terminal outcome and is recorded as such, never held as unknown.
+    """
     from .claude_opus_bridge import dispatch
 
     coding_cfg = cfg.get("coding_agent") or {}
@@ -4877,6 +5021,7 @@ def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False
         model=model,
         requested_alias=requested_alias,
         adjustment=adjustment,
+        identity=identity,
         timeout=int(coding_cfg.get("timeout_seconds", 300)),
         max_turns=(coding_cfg.get("delegated_review") or {}).get("max_turns") if review else coding_cfg.get("max_turns"),
         max_budget_usd=coding_cfg.get("max_budget_usd", 5.0),
@@ -4885,6 +5030,337 @@ def _run_opus5_bridge(*, repo: str, task: str, write: bool, review: bool = False
         parent_turn_id=str(context.get("parent_turn_id") or context.get("turn_id") or ""),
         lifecycle_path=hermes_path(coding_cfg["lifecycle_path"]) if coding_cfg.get("lifecycle_path") else None,
     )
+
+
+_SUBSTITUTION_PROVENANCE_PREFIX = "[ROUTER SUBSTITUTION PROVENANCE v1] "
+# The host's lowest dynamic summary budget retains only a 500-character tail.
+# Keep one complete parent-visible marker below this hard cap so it survives that
+# tail after `_trim_summary_with_footer` even when no spill file can be written.
+_PARENT_VISIBLE_PROVENANCE_MAX_CHARS = 400
+_PARENT_PROVENANCE_VALUE_MAX_CHARS = 24
+_PARENT_PROVENANCE_REFERENCE_CHARS = 16
+_PARENT_PROVENANCE_SAFE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/@+-")
+_PARENT_PROVENANCE_POLICY_CODES = {"legacy_ordinary_provider_route": "legacy_ordinary_route"}
+
+
+def _provenance_text(value: Any, fallback: str = "unknown") -> str:
+    return value[:128] if isinstance(value, str) and value else fallback
+
+
+def _provenance_fact(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    return {
+        "value": _provenance_text(value.get("value")),
+        "source": _provenance_text(value.get("source"), "not_observed"),
+        "canonical": bool(value.get("canonical", True)),
+    }
+
+
+def _provenance_identity(value: Any) -> Dict[str, Any]:
+    if hasattr(value, "as_dict"):
+        value = value.as_dict()
+    value = value if isinstance(value, dict) else {}
+    effort = value.get("effort") if isinstance(value.get("effort"), dict) else {}
+    return {
+        "provider": _provenance_text(value.get("provider")),
+        "account": _provenance_text(value.get("account")),
+        "transport": _provenance_text(value.get("transport")),
+        "alias": _provenance_text(value.get("alias")),
+        "selection_mode": _provenance_text(value.get("selection_mode"), "unknown"),
+        "requested": _provenance_fact(value.get("requested")),
+        "resolved": _provenance_fact(value.get("resolved")),
+        "observed": _provenance_fact(value.get("observed")),
+        "effort": {
+            "requested": _provenance_text(effort.get("requested"), "unknown"),
+            "applied": _provenance_text(effort.get("applied"), "unknown"),
+            "source": _provenance_text(effort.get("source"), "not_observed"),
+        },
+    }
+
+
+def _provenance_mapping(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key)[:64]: _provenance_text(item) for key, item in sorted(value.items())[:16]
+            if isinstance(key, str) and isinstance(item, str)}
+
+
+def _substitution_provenance(kind: str, *, identity: Any, substitution: Any,
+                             replacement: Any = None, executed: Any = None, reference: Any = None,
+                             carrier: str = "middleware") -> Dict[str, Any]:
+    marker = {
+        "kind": kind,
+        "carrier": carrier,
+        "identity": _provenance_identity(identity),
+        "substitution": _provenance_mapping(substitution),
+        # A replacement or a same-provider step-down is not an independent,
+        # cross-provider review merely because its output contains this evidence.
+        "satisfies_cross_provider_review": False,
+    }
+    if reference:
+        marker["reference"] = str(reference)
+    if isinstance(replacement, dict):
+        marker.update({
+            "policy": _provenance_text(replacement.get("policy")),
+            "reason": _provenance_text(replacement.get("reason")),
+            "failure_kind": _provenance_text(replacement.get("failure_kind")),
+            "requested_review": _provenance_mapping(replacement.get("requested_review")),
+            "planned": _provenance_mapping(replacement.get("planned")),
+            "reference": _provenance_text(replacement.get("provenance_ref"), ""),
+        })
+    if isinstance(executed, dict):
+        marker["executed"] = _provenance_mapping(executed)
+    return marker
+
+
+def _parent_provenance_value(value: Any, fallback: str = "unknown", *, limit: int = _PARENT_PROVENANCE_VALUE_MAX_CHARS) -> str:
+    original = value if isinstance(value, str) and value else fallback
+    safe = "".join(char if char in _PARENT_PROVENANCE_SAFE_CHARS else "_" for char in original)
+    altered = safe != original or len(safe) > limit
+    if altered:
+        suffix = "~" + hashlib.sha256(original.encode("utf-8")).hexdigest()[:6]
+        safe = safe[:max(0, limit - len(suffix))] + suffix
+    return safe[:limit] or fallback
+
+
+def _parent_provenance_reference(marker: Dict[str, Any]) -> str:
+    supplied = marker.get("reference")
+    if isinstance(supplied, str) and supplied:
+        return _parent_provenance_value(supplied, limit=_PARENT_PROVENANCE_REFERENCE_CHARS)
+    encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:_PARENT_PROVENANCE_REFERENCE_CHARS]
+
+
+def _parent_visible_provenance(marker: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact, ASCII-safe marker retained in the host's 500-character tail."""
+    identity = marker.get("identity") if isinstance(marker.get("identity"), dict) else {}
+    requested = identity.get("requested") if isinstance(identity.get("requested"), dict) else {}
+    resolved = identity.get("resolved") if isinstance(identity.get("resolved"), dict) else {}
+    observed = identity.get("observed") if isinstance(identity.get("observed"), dict) else {}
+    replacement = marker.get("requested_review") if isinstance(marker.get("requested_review"), dict) else {}
+    executed = marker.get("executed") if isinstance(marker.get("executed"), dict) else {}
+    step_down = marker.get("kind") == "claude_cli_step_down"
+    observed_is_real = bool(observed.get("canonical")) and observed.get("source") == "claude_cli.result.modelUsage"
+    requested_value = requested.get("value")
+    requested_parent = requested_value if requested_value not in (None, "", "unknown") else (
+        "alias:" + str(replacement.get("tier") or "unknown"))
+    policy = marker.get("policy") or (marker.get("substitution") or {}).get("policy")
+    reason = marker.get("failure_kind") or marker.get("reason") or (marker.get("substitution") or {}).get("reason")
+    return {
+        "v": 1,
+        "kind": _parent_provenance_value(marker.get("kind")),
+        "carrier": _parent_provenance_value(marker.get("carrier")),
+        "ref": _parent_provenance_reference(marker),
+        "requested": _parent_provenance_value(requested_parent, limit=20),
+        "resolved": _parent_provenance_value(resolved.get("value"), limit=20),
+        "actual": {
+            "provider": _parent_provenance_value(identity.get("provider") if step_down else executed.get("provider"), limit=20),
+            "model": _parent_provenance_value(observed.get("value") if step_down and observed_is_real else executed.get("model"), limit=20),
+        },
+        "policy": _parent_provenance_value(_PARENT_PROVENANCE_POLICY_CODES.get(str(policy), policy)),
+        "reason": _parent_provenance_value(reason, limit=20),
+        "satisfies_cross_provider_review": False,
+    }
+
+
+def _provenance_annotation(marker: Dict[str, Any]) -> str:
+    encoded = json.dumps(_parent_visible_provenance(marker), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=True)
+    line = _SUBSTITUTION_PROVENANCE_PREFIX + encoded
+    if len(line) <= _PARENT_VISIBLE_PROVENANCE_MAX_CHARS:
+        return line
+    fallback = {"v": 1, "kind": "unknown", "carrier": "unknown", "ref": "0" * 16,
+                "detail": "overflow", "satisfies_cross_provider_review": False}
+    return _SUBSTITUTION_PROVENANCE_PREFIX + json.dumps(fallback, sort_keys=True, separators=(",", ":"))
+
+
+class _AnnotatedResponseOverlay:
+    """Read-through view of a response that cannot take the provenance carrier.
+
+    ``output`` and ``output_text`` are the overlay's own values; every other
+    attribute (usage, status, incomplete details, error, id, ...) is read from
+    the untouched original, so nothing the host reads is dropped.
+    """
+
+    def __init__(self, original: Any, output: list, output_text: str) -> None:
+        self._original = original
+        self.output = output
+        self.output_text = output_text
+
+    def __getattr__(self, name: str) -> Any:
+        original = self.__dict__.get("_original")
+        if original is None:
+            raise AttributeError(name)
+        if isinstance(original, dict):
+            try:
+                return original[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+        return getattr(original, name)
+
+
+_PROVENANCE_TOOL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call"})
+_PROVENANCE_COMMENTARY_PHASES = frozenset({"commentary", "analysis"})
+_PROVENANCE_FINAL_PHASES = frozenset({"final_answer", "final"})
+# Mirrors the host normalizer (agent/codex_responses_adapter.py): these statuses
+# make it continue the turn, except on server-side tool items, which xAI leaves
+# ``in_progress`` inside completed responses.
+_PROVENANCE_INCOMPLETE_STATUSES = frozenset({"queued", "in_progress", "incomplete"})
+_PROVENANCE_SERVER_TOOL_ITEM_TYPES = frozenset({
+    "web_search_call", "file_search_call", "code_interpreter_call",
+    "image_generation_call", "computer_call", "local_shell_call", "mcp_call",
+})
+
+
+def _provenance_field(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _provenance_item_text(item: Any) -> str:
+    """Assistant text of one Responses message item, as the host reads it.
+
+    A ``refusal`` part carries its text in ``refusal``; the host treats it as
+    final assistant text, so it counts as final text here too.
+    """
+    if _provenance_field(item, "type") != "message":
+        return ""
+    content = _provenance_field(item, "content")
+    chunks = []
+    for part in (content if isinstance(content, list) else ()):
+        kind = _provenance_field(part, "type")
+        text = (_provenance_field(part, "refusal") if kind == "refusal"
+                else _provenance_field(part, "text") if kind in ("output_text", "text") else None)
+        if isinstance(text, str):
+            chunks.append(text)
+    return "".join(chunks)
+
+
+def _provenance_shape(result: Any) -> Optional[Dict[str, Any]]:
+    """What the host normalizer will make of a Responses result, or None."""
+    output = _provenance_field(result, "output")
+    if not isinstance(output, list):
+        return None
+    aggregate = _provenance_field(result, "output_text")
+    if not isinstance(aggregate, str):
+        aggregate = "\n".join(text for text in map(_provenance_item_text, output) if text)
+    phases = [str(_provenance_field(item, "phase") or "").casefold() for item in output
+              if _provenance_field(item, "type") == "message"]
+    commentary = any(phase in _PROVENANCE_COMMENTARY_PHASES for phase in phases)
+    final_phase = any(phase in _PROVENANCE_FINAL_PHASES for phase in phases)
+    has_tool_call = any(_provenance_field(item, "type") in _PROVENANCE_TOOL_ITEM_TYPES for item in output)
+    has_item_text = any(_provenance_item_text(item).strip()
+                        and str(_provenance_field(item, "phase") or "").casefold()
+                        not in _PROVENANCE_COMMENTARY_PHASES
+                        for item in output)
+    # The host falls back to the aggregate when no item carries final text
+    # (stream-delivered answers), unless the text is commentary-only.
+    aggregate_only = (not has_item_text and bool(aggregate.strip())
+                      and (final_phase or not commentary))
+    # Same precedence as the host's ``_normalize_codex_response``: a queued or
+    # in-progress response, or an incomplete non-server item, always continues;
+    # a top-level ``incomplete`` (e.g. max_output_tokens) or commentary
+    # continues only without a final-phase message; an ``incomplete`` response
+    # whose reason is ``content_filter`` is a refusal, never a final ``stop``.
+    # The final-output hook (``on_transform_llm_output``) is the backstop when
+    # this mirror and the host ever disagree.
+    status = str(_provenance_field(result, "status") or "").casefold()
+    details = _provenance_field(result, "incomplete_details")
+    reason = str(_provenance_field(details, "reason") or "").strip().casefold() if details is not None else ""
+    item_incomplete = any(
+        str(_provenance_field(item, "status") or "").casefold() in _PROVENANCE_INCOMPLETE_STATUSES
+        and _provenance_field(item, "type") not in _PROVENANCE_SERVER_TOOL_ITEM_TYPES
+        for item in output)
+    incomplete = (
+        (status == "incomplete" and reason == "content_filter")
+        or status in ("queued", "in_progress")
+        or item_incomplete
+        or ((status == "incomplete" or commentary) and not final_phase)
+    )
+    return {
+        "output": output, "aggregate": aggregate, "phases": phases,
+        "has_tool_call": has_tool_call, "has_final_text": has_item_text or aggregate_only,
+        "aggregate_only": aggregate_only,
+        # A reply the host ends the turn with: final text, no tool call, nothing
+        # that makes the normalizer report ``incomplete``.
+        "terminal": (has_item_text or aggregate_only) and not has_tool_call and not incomplete,
+    }
+
+
+def _annotated_response(result: Any, marker: Dict[str, Any]) -> Any:
+    """Add one parent-visible provenance carrier without changing execution semantics.
+
+    The carrier is a separate assistant message appended after every original
+    output item, holding only the marker line. The host normalizer joins message
+    texts with a newline, so the marker lands on its own line after all useful
+    final text (multipart text cannot run into the JSON), and a final-phase
+    carrier stays in the projected final answer when an earlier commentary
+    message is routed to reasoning. No original item is mutated, removed or
+    reordered: tool calls, reasoning, statuses and usage survive, and the
+    finish reason the host derives is unchanged.
+
+    Never partially applied: an SDK model (computed read-only ``output_text``)
+    gets a copy with the extra item; a mutable response gets the aggregate
+    written first (the only step that can fail) and then the item appended; any
+    other response gets a read-through overlay. A response with neither final
+    text nor a tool call (reasoning- or commentary-only, which the host
+    continues) is returned unannotated: marker-only text would turn it into a
+    final ``stop``.
+    """
+    annotation = _provenance_annotation(marker)
+
+    shape = _provenance_shape(result)
+    if shape is None:
+        # A scalar/non-Responses legacy value has no host-supported content
+        # carrier. Preserve its byte-for-byte contract rather than replacing it.
+        return result
+    output, aggregate, phases = shape["output"], shape["aggregate"], shape["phases"]
+    if not (shape["has_final_text"] or shape["has_tool_call"]):
+        return result
+    if any(_SUBSTITUTION_PROVENANCE_PREFIX in _provenance_item_text(item) for item in output):
+        return result  # already carries one; never add a second marker
+    # Stream-delivered answers can arrive as ``output_text`` with no item final
+    # text; the host reads that aggregate, so carry it as an item too (once an
+    # item carries text the host stops reading the aggregate).
+    leading = [("text", aggregate.strip())] if shape["aggregate_only"] else []
+    # Mirror the response's own phase convention: final_answer only when the
+    # response already declares a final phase. Adding one to a phase-less or
+    # commentary-only response would change the host's finish reason.
+    phase = "final_answer" if any(p in _PROVENANCE_FINAL_PHASES for p in phases) else None
+    annotated_text = aggregate.rstrip() + ("\n\n" if aggregate.strip() else "") + annotation
+    # The leading newlines keep a computed SDK ``output_text`` (parts joined with
+    # no separator) parseable too; the normalizer strips them from content.
+    carrier_text = "\n\n" + annotation
+
+    model_copy = getattr(result, "model_copy", None)
+    if callable(model_copy) and not isinstance(result, dict):
+        try:
+            from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+
+            def sdk_message(text: str, item_phase: Optional[str]) -> Any:
+                return ResponseOutputMessage.model_construct(
+                    id="", type="message", role="assistant", status="completed", phase=item_phase,
+                    content=[ResponseOutputText.model_construct(type="output_text", text=text,
+                                                                annotations=[])])
+            extra = [sdk_message(text, None) for _, text in leading]
+            copied = model_copy(update={"output": [*output, *extra, sdk_message(carrier_text, phase)]})
+            if isinstance(getattr(copied, "output", None), list):
+                return copied
+        except Exception:
+            pass  # fall through to the overlay; the original is untouched
+
+    def message(text: str, item_phase: Optional[str]) -> Any:
+        return SimpleNamespace(type="message", role="assistant", status="completed", phase=item_phase,
+                               content=[SimpleNamespace(type="output_text", text=text)])
+    added = [message(text, None) for _, text in leading] + [message(carrier_text, phase)]
+    try:
+        if isinstance(result, dict):
+            result["output_text"] = annotated_text
+        else:
+            setattr(result, "output_text", annotated_text)
+    except Exception:
+        return _AnnotatedResponseOverlay(result, [*output, *added], annotated_text)
+    output.extend(added)
+    return result
 
 
 def _opus5_response(result: Dict[str, Any]) -> Any:
@@ -4898,7 +5374,7 @@ def _opus5_response(result: Dict[str, Any]) -> Any:
     raw_usage = result.get("usage") or result.get("model_usage") or {}
     input_tokens = int(raw_usage.get("input_tokens", raw_usage.get("inputTokens", 0)) or 0)
     output_tokens = int(raw_usage.get("output_tokens", raw_usage.get("outputTokens", 0)) or 0)
-    return SimpleNamespace(
+    response = SimpleNamespace(
         output=[SimpleNamespace(
             type="message",
             status="completed",
@@ -4913,6 +5389,191 @@ def _opus5_response(result: Dict[str, Any]) -> Any:
         status="completed",
         model=model,
     )
+    substitution = result.get("substitution")
+    if isinstance(substitution, dict):
+        return _annotated_response(response, _substitution_provenance(
+            "claude_cli_step_down", identity=result.get("identity"), substitution=substitution,
+            reference=result.get("bridge_run_id"),
+        ))
+    return response
+
+
+def _record_ordinary_replacement_result(result: Any, replacement: Dict[str, Any]) -> Any:
+    """Carry final ordinary-provider evidence in normalizer-surviving content."""
+    def field(name: str) -> Any:
+        return result.get(name) if isinstance(result, dict) else getattr(result, name, None)
+
+    model = str(field("model") or "").strip()
+    provider = str(field("provider") or "").strip()
+    executed = {
+        "model": model or "unknown",
+        "model_source": "ordinary_provider.response.model" if model else "not_observed",
+        "provider": provider or "unknown",
+        "provider_source": "ordinary_provider.response.provider" if provider else "not_observed",
+        "status": "observed" if model or provider else "unknown",
+    }
+    provenance = {"policy": replacement["policy"], "requested_review": replacement["requested_review"],
+                  "failure_kind": replacement["failure_kind"], "planned": replacement["planned"],
+                  "executed": executed}
+    route_reason = (
+        "Claude CLI review did not complete; actual replacement executed on "
+        f"{executed['model']} via {executed['provider']} "
+        f"(model evidence: {executed['model_source']}; provider evidence: {executed['provider_source']})."
+    )
+    annotated = _annotated_response(result, _substitution_provenance(
+        "ordinary_replacement", identity=replacement.get("identity"), substitution={},
+        replacement=replacement, executed=executed,
+    ))
+    if isinstance(annotated, dict):
+        annotated["replacement_provenance"] = provenance
+        annotated["route_reason"] = route_reason
+    else:
+        try:
+            setattr(annotated, "replacement_provenance", provenance)
+            setattr(annotated, "route_reason", route_reason)
+        except Exception:
+            pass
+    return annotated
+
+
+# Replacement provenance retained across the API calls of one child turn (N1).
+# A failed review's ordinary replacement can end its first call on reasoning,
+# commentary or a tool call; the host then continues the same turn, and only the
+# eventual final reply reaches the parent. The entry is keyed on the turn id
+# the host passes to every middleware call of that turn (and to post_llm_call),
+# kept while the host may still continue the turn, removed when the turn ends
+# (post_llm_call), and bounded by a TTL and a size cap so an abandoned turn
+# cannot leak.
+# Each entry is (monotonic stamp, replacement, marker lines the middleware has
+# already put on this turn's replies); the final-output hook uses the last one
+# to avoid marking a reply twice.
+_PENDING_REPLACEMENTS: "OrderedDict[str, Tuple[float, Dict[str, Any], set]]" = OrderedDict()
+_PENDING_REPLACEMENT_LOCK = threading.Lock()
+_PENDING_REPLACEMENT_MAX = 256
+_PENDING_REPLACEMENT_TTL_SECONDS = 6 * 3600.0
+_PENDING_REPLACEMENT_MARKERS_MAX = 8
+_pending_replacement_clock = time.monotonic
+
+
+def _pending_replacement_key(context: Dict[str, Any]) -> Optional[str]:
+    # The host mints one turn id per turn (``<session>:<task>:<uuid>``, kept for
+    # every call of the turn) and passes it to the middleware, to
+    # transform_llm_output and to post_llm_call. The session id is not part of
+    # the key: compression can rotate it in the middle of a turn, which would
+    # orphan the entry.
+    turn_id = str(context.get("turn_id") or "")
+    return turn_id or None  # without a turn identity the state could not be scoped
+
+
+def _pending_replacement_prune(now: float) -> None:
+    """Drop expired entries, then the oldest beyond the cap. Caller holds the lock."""
+    for key in [key for key, entry in _PENDING_REPLACEMENTS.items()
+                if now - entry[0] > _PENDING_REPLACEMENT_TTL_SECONDS]:
+        del _PENDING_REPLACEMENTS[key]
+    while len(_PENDING_REPLACEMENTS) > max(0, int(_PENDING_REPLACEMENT_MAX)):
+        _PENDING_REPLACEMENTS.popitem(last=False)
+
+
+def _pending_replacement_get(key: Optional[str]) -> Optional[Dict[str, Any]]:
+    entry = _pending_replacement_entry(key)
+    return entry[0] if entry else None
+
+
+def _pending_replacement_entry(key: Optional[str]) -> Optional[Tuple[Dict[str, Any], Tuple[str, ...]]]:
+    """(replacement, marker lines already delivered on this turn's replies), or None."""
+    if key is None:
+        return None
+    with _PENDING_REPLACEMENT_LOCK:
+        _pending_replacement_prune(_pending_replacement_clock())
+        entry = _PENDING_REPLACEMENTS.get(key)
+        return (entry[1], tuple(entry[2])) if entry else None
+
+
+def _pending_replacement_put(key: Optional[str], replacement: Dict[str, Any],
+                             marker_lines: Tuple[str, ...] = ()) -> None:
+    if key is None:
+        return
+    with _PENDING_REPLACEMENT_LOCK:
+        now = _pending_replacement_clock()
+        previous = _PENDING_REPLACEMENTS.pop(key, None)
+        delivered = [*(previous[2] if previous else ()), *marker_lines]
+        _PENDING_REPLACEMENTS[key] = (now, replacement,
+                                      tuple(delivered[-max(1, int(_PENDING_REPLACEMENT_MARKERS_MAX)):]))
+        _pending_replacement_prune(now)
+
+
+def _pending_replacement_discard(key: Optional[str]) -> None:
+    if key is None:
+        return
+    with _PENDING_REPLACEMENT_LOCK:
+        _PENDING_REPLACEMENTS.pop(key, None)
+
+
+def _deliver_replacement_result(result: Any, replacement: Dict[str, Any],
+                                key: Optional[str], *, first_call: bool) -> Any:
+    """Annotate a replacement reply and keep its provenance for the rest of the turn.
+
+    The reply that failed over keeps the round-1 behaviour (a final or tool-call
+    reply carries the marker). A later reply of the same turn is annotated only
+    when it would end the turn, so interim reasoning, commentary and tool calls
+    stay exactly as the provider sent them; a reasoning- or commentary-only
+    reply is never turned into a marker-only answer. The entry is kept even
+    after a terminal reply, because the host can still continue the turn (ack,
+    stall or degenerate-final nudges) and only its last reply reaches the
+    parent; it is removed when the turn ends (``on_post_llm_call``) or by the
+    TTL/size bounds.
+    """
+    shape = _provenance_shape(result)
+    _pending_replacement_put(key, replacement)
+    if shape is None:
+        return _record_ordinary_replacement_result(result, replacement) if first_call else result
+    if first_call or shape["terminal"]:
+        annotated = _record_ordinary_replacement_result(result, replacement)
+        _pending_replacement_put(key, replacement, _provenance_marker_lines(annotated))
+        return annotated
+    _pending_replacement_put(key, replacement)
+    return result
+
+
+def _provenance_marker_lines(result: Any) -> Tuple[str, ...]:
+    """Marker lines carried by a Responses result's message items."""
+    output = _provenance_field(result, "output")
+    lines = []
+    for item in (output if isinstance(output, list) else ()):
+        lines += [line.strip() for line in _provenance_item_text(item).splitlines()
+                  if line.strip().startswith(_SUBSTITUTION_PROVENANCE_PREFIX.strip())]
+    return tuple(lines)
+
+
+def on_transform_llm_output(response_text: Any = None, turn_id: Any = None, **_: Any) -> Optional[str]:
+    """Final-delivery backstop for a turn whose review was substituted (N3/N4).
+
+    The host fires ``transform_llm_output`` once per turn with the text that
+    becomes the turn's final response (and so a child's ``summary`` for its
+    parent), including text the execution middleware never saw: the
+    iteration-limit summary is a direct provider call, and a reply whose shape
+    the middleware's terminal mirror misjudged is passed through unmarked. When
+    this turn has retained replacement provenance and the final text does not
+    already carry a marker line this router delivered on the turn, one marker
+    line is appended. A turn with no retained entry gets ``None`` (text
+    unchanged). The executed provider/model of the final text is not observed
+    here, so it is reported ``unknown``/``not_observed``.
+    """
+    key = _pending_replacement_key({"turn_id": turn_id})
+    entry = _pending_replacement_entry(key)
+    if entry is None or not isinstance(response_text, str) or not response_text.strip():
+        return None
+    replacement, delivered = entry
+    present = {line.strip() for line in response_text.splitlines()}
+    if any(line in present for line in delivered):
+        return None  # the middleware already marked the reply that ends the turn
+    unobserved = {"model": "unknown", "model_source": "not_observed",
+                  "provider": "unknown", "provider_source": "not_observed", "status": "unknown"}
+    marker = _substitution_provenance(
+        "ordinary_replacement", identity=replacement.get("identity"), substitution={}, replacement=replacement,
+        executed=unobserved, carrier="final_output",
+    )
+    return response_text.rstrip() + "\n\n" + _provenance_annotation(marker)
 
 
 def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any) -> Optional[Any]:
@@ -4934,6 +5595,46 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
     from .claude_opus_bridge import review_model_alias
     requested_alias = review_model_alias(routing_text) or "opus"
     adjustment = ""
+    admission_refusal = ""
+
+    def bridge_failure_kind(error: BaseException) -> str:
+        message = str(error).casefold()
+        return str(getattr(error, "failure_kind", "")) or (
+            "max-turn" if "max turn" in message else "budget" if "budget" in message
+            else "timeout" if "timed out" in message else "malformed-json" if "json" in message
+            else "nonzero-exit" if "exit " in message else "execution-error"
+        )
+
+    def ordinary_replacement(error: BaseException, identity: Any = None) -> Dict[str, Any]:
+        failure_kind = bridge_failure_kind(error)
+        model = str(request.get("model") or "")
+        tier = next((name for name, candidate in (cfg.get("models") or {}).items()
+                     if str(candidate) == model), "ordinary")
+        planned = {
+            "tier": tier,
+            "model": model or "unknown",
+            "provider": str(kwargs.get("provider") or cfg.get("provider") or "unknown"),
+            "source": "ordinary_provider.request_configuration",
+        }
+        identity_data = identity.as_dict() if hasattr(identity, "as_dict") else identity
+        reference_data = {
+            "policy": "legacy_ordinary_provider_route",
+            "requested_review": {"tier": requested_alias, "transport": "claude_cli"},
+            "failure_kind": failure_kind, "planned": planned, "identity": identity_data,
+        }
+        provenance_ref = hashlib.sha256(json.dumps(
+            reference_data, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str,
+        ).encode("utf-8")).hexdigest()[:_PARENT_PROVENANCE_REFERENCE_CHARS]
+        return {
+            "policy": "legacy_ordinary_provider_route",
+            "requested_review": {"tier": requested_alias, "transport": "claude_cli"},
+            "tier": planned["tier"], "model": planned["model"], "provider": planned["provider"],
+            "planned": planned,
+            "reason": "attempted Claude CLI review failed; an ordinary provider replacement is planned, not observed",
+            "failure_kind": failure_kind,
+            "provenance_ref": provenance_ref,
+            **({"identity": identity_data} if isinstance(identity_data, dict) else {}),
+        }
 
     def audit_refusal(message: str) -> None:
         turn_id = str(kwargs.get("parent_turn_id") or kwargs.get("turn_id") or "")
@@ -4941,25 +5642,28 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                          or turn_id.split(":", 1)[0])
         claude_delegation._log(cfg, {
             "event": "bridge_claude", "tier_requested": requested_alias,
-            "tier_used": requested_alias, "outcome": "refused", "message": message,
+            "tier_used": "none", "outcome": "refused", "message": message,
             "session_id": session_id, "turn_id": turn_id,
         })
 
     def admitted_alias() -> Optional[str]:
         """Check Claude only after a real bridge route has been established."""
-        nonlocal adjustment
+        nonlocal adjustment, admission_refusal
         target = {"opus": "opus5", "sonnet": "sonnet5"}[requested_alias]
         if not _is_callable_tier(target, cfg):
-            audit_refusal(f"Claude CLI tier {requested_alias} is disabled or cooling.")
+            admission_refusal = f"Claude CLI tier {requested_alias} is disabled or cooling."
+            audit_refusal(admission_refusal)
             return None
         if not usage_guard.guarded("anthropic", cfg):
             return requested_alias
         outcome = usage_guard.apply("anthropic", target, cfg, usage_guard.read("anthropic", cfg))
         if outcome.refused:
-            audit_refusal(outcome.refused)
+            admission_refusal = outcome.refused
+            audit_refusal(admission_refusal)
             return None
         if not _is_callable_tier(outcome.tier, cfg):
-            audit_refusal(f"Claude CLI substitution {outcome.tier} is disabled or cooling.")
+            admission_refusal = f"Claude CLI substitution {outcome.tier} is disabled or cooling."
+            audit_refusal(admission_refusal)
             return None
         adjustment = outcome.adjusted
         return {"opus5": "opus", "sonnet5": "sonnet"}.get(outcome.tier)
@@ -4971,12 +5675,33 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         except Exception as error:
             if review:
                 message = str(error).strip()[:300] or type(error).__name__
-                claude_delegation._log(cfg, {
+                identity = bridge_kwargs.get("identity")
+                selection_mode = str(getattr(identity, "selection_mode", ""))
+                failure_kind = bridge_failure_kind(error)
+                failure = {"message": message, "failure_kind": failure_kind,
+                           "identity": getattr(error, "identity", None),
+                           "selection_mode": selection_mode}
+                # The bridge can fail before it attaches an identity (for example
+                # process start, invalid repository or malformed response). Carry
+                # the selection decision made before the attempt, not an optional
+                # exception attribute, across the middleware boundary.
+                setattr(error, "_bridge_selection_mode", selection_mode)
+                setattr(error, "_bridge_review_failure", failure)
+                audit_event = {
                     "event": "bridge_claude", "outcome": "error", "message": message,
+                    "failure_kind": failure_kind,
+                    "failure_class": str(getattr(error, "failure_class", "execution-error")),
                     "tier_requested": requested_alias, "tier_used": requested_alias,
                     "session_id": str(kwargs.get("session_id") or ""),
                     "turn_id": str(kwargs.get("turn_id") or ""),
-                })
+                }
+                if selection_mode != "exact":
+                    replacement = ordinary_replacement(
+                        error, getattr(error, "identity", None) or bridge_kwargs.get("identity"),
+                    )
+                    failure["replacement"] = replacement
+                    audit_event["substitution"] = replacement
+                claude_delegation._log(cfg, audit_event)
             raise
 
     # A delegated review leaf runs on Claude and returns its verdict as the
@@ -4988,14 +5713,68 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
         or ":sa-" in str(kwargs.get("turn_id", ""))
     ):
         delegated = _verified_delegated_claude_review(routing_text, cfg, request=source_request)
+        policy = coding_cfg.get("delegated_review") or {}
+        selection_mode = str(policy.get("selection_mode") or "profile_preferred")
+        requested_model = str(policy.get("requested_model") or "").strip() or None
+        if delegated is None and selection_mode == "exact" and review_model_alias(routing_text) is not None:
+            try:
+                _route, route_reason = _delegated_claude_review_status(
+                    routing_text, cfg, request=source_request,
+                )
+            except Exception:
+                route_reason = "the Claude CLI review route could not be established"
+            from . import target_identity
+            try:
+                resolution = target_identity.resolve_target(
+                    requested_alias, transport="claude_cli", selection_mode=selection_mode,
+                    requested_model=requested_model, cfg=cfg,
+                )
+                identity = resolution.identity
+            except Exception:
+                # Exact mode is mandatory: an unresolvable identity still stops.
+                identity = None
+            refusal = "exact Claude CLI review route was refused before bridge selection: " + route_reason
+            audit_refusal(refusal)
+            from .claude_opus_bridge import ClaudeBridgeFailure
+            raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
         if delegated is not None:
             repo, _requested_alias = delegated
+            from . import target_identity
+            resolution = target_identity.resolve_target(
+                requested_alias, transport="claude_cli", selection_mode=selection_mode,
+                requested_model=requested_model, cfg=cfg,
+            )
+            if resolution.status != target_identity.RESOLVED:
+                refusal = "Claude CLI review route is unsupported: " + "; ".join(resolution.reasons)
+                audit_refusal(refusal)
+                from .claude_opus_bridge import ClaudeBridgeFailure
+                raise ClaudeBridgeFailure(refusal, "capability", identity=resolution.identity, refused=True)
+            identity = resolution.identity
             alias = admitted_alias()
             if alias is None:
+                if identity.selection_mode == "exact":
+                    refusal = admission_refusal or "exact Claude CLI review admission was refused"
+                    from .claude_opus_bridge import ClaudeBridgeFailure
+                    raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
                 return None
+            if identity.selection_mode == "exact" and alias != requested_alias:
+                refusal = "exact Claude CLI review cannot substitute the requested tier"
+                audit_refusal(refusal)
+                from .claude_opus_bridge import ClaudeBridgeFailure
+                raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
             allowed = (coding_cfg.get("delegated_review") or {}).get("models")
             if isinstance(allowed, list) and alias not in allowed:
+                if identity.selection_mode == "exact":
+                    refusal = f"exact Claude CLI review tier {alias} is not enabled by delegated_review.models"
+                    audit_refusal(refusal)
+                    from .claude_opus_bridge import ClaudeBridgeFailure
+                    raise ClaudeBridgeFailure(refusal, "capability", identity=identity, refused=True)
                 return None
+            # From here on, ``resolved`` names the alias admission actually put on
+            # argv (requested stays the original ask), so success, pre-launch
+            # failure and replacement provenance all describe the real invocation.
+            from .claude_opus_bridge import admitted_invocation_identity
+            identity = admitted_invocation_identity(identity, alias)
             return bridge_response(
                 review=True,
                 repo=str(repo),
@@ -5004,6 +5783,7 @@ def _maybe_run_opus5(request: Dict[str, Any], cfg: Dict[str, Any], **kwargs: Any
                 model=alias,
                 requested_alias=requested_alias,
                 adjustment=adjustment,
+                identity=identity,
                 cfg=cfg,
                 turn_id=str(kwargs.get("turn_id") or ""),
                 parent_session_id=kwargs.get("parent_session_id") or kwargs.get("session_id"),
@@ -5096,10 +5876,9 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     """
     request = kwargs.get("request")
     next_call = kwargs.get("next_call")
-    # Current Hermes exposes an LLM-only retry callback so providers can be
-    # retried without violating the single-use downstream ``next_call`` contract.
-    # Keep the direct callable fallback for unit-level and older-host compatibility.
-    retry_call = kwargs.get("retry_call") or next_call
+    # A plugin-owned alternate request is permitted only through the host's
+    # explicit retry seam. ``next_call`` is single-use in the installed host.
+    retry_call = kwargs.get("retry_call")
     cfg = _load_config()
     provider = str(kwargs.get("provider", "")).casefold()
     configured_provider = str(cfg.get("provider", "openai-codex")).casefold()
@@ -5125,7 +5904,7 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
         # none of that, and skipping it here is why a Qwen weekly-quota 429 left
         # no cooldown -- the conductor was still being told that account was idle.
         try:
-            return next_call(request)
+            response = next_call(request)
         except Exception as error:
             if _is_quota_exhaustion(error) or _is_transient_provider_failure(error):
                 failing_model = str(request.get("model", ""))
@@ -5140,24 +5919,74 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
                     error=error,
                 )
             raise
+        # A turn whose review failed on the configured provider can end on the
+        # host's own fallback provider (e.g. after a reasoning-only stall); its
+        # final reply still carries the retained provenance.
+        pending_key = _pending_replacement_key(kwargs)
+        pending = _pending_replacement_get(pending_key)
+        if pending:
+            return _deliver_replacement_result(response, pending, pending_key, first_call=False)
+        return response
+
+    def stopped_exact_response(error: BaseException) -> Optional[Any]:
+        """Translate mandatory-exact bridge failures at the host callback boundary."""
+        identity = getattr(error, "identity", None)
+        selection_mode = str(getattr(error, "_bridge_selection_mode", "")
+                             or getattr(identity, "selection_mode", ""))
+        if getattr(error, "refused", False) or selection_mode == "exact":
+            message = str(getattr(error, "route_reason", "") or error).strip() or "exact Claude CLI review was refused"
+            return worker_admission.stopped_response(
+                "Exact Claude CLI review was not completed: " + message,
+                str(request.get("model", "")),
+            )
+        return None
 
     opus_context = {key: value for key, value in kwargs.items() if key not in {"request", "next_call", "retry_call"}}
+    replacement_provenance = None
+    pending_key = _pending_replacement_key(kwargs)
+    first_replacement_call = False
     try:
         opus_response = _maybe_run_opus5(request, cfg, **opus_context)
-    except Exception:
+    except Exception as error:
+        stopped = stopped_exact_response(error)
+        if stopped is not None:
+            return stopped
         # Failures before an attempt are not attributed to the CLI; attempted
         # reviews write a separate audit with the concrete reason.
         _logger.warning("Claude bridge did not complete; falling back to the normal route", exc_info=True)
         opus_response = None
+        review_failure = getattr(error, "_bridge_review_failure", None)
+        if review_failure:
+            replacement_provenance = review_failure["replacement"]
+            first_replacement_call = True
+            request = deepcopy(request)
+            _append_user_instruction(
+                request,
+                "Claude CLI review did not complete "
+                f"({review_failure['failure_kind']}: {review_failure['message']}). "
+                f"This response is an explicit legacy substitution attempt planned for {replacement_provenance['tier']} "
+                f"({replacement_provenance['model']}); it is not the requested Claude review. "
+                "Its actual provider/model, if observed in the response, is recorded as replacement provenance.",
+            )
     if opus_response is not None:
         return opus_response
+    if replacement_provenance is None:
+        # A later call of a turn whose review failed earlier: the provenance
+        # retained for this turn goes onto its final reply.
+        replacement_provenance = _pending_replacement_get(pending_key)
+
+    def delivered(response: Any) -> Any:
+        if not replacement_provenance:
+            return response
+        return _deliver_replacement_result(response, replacement_provenance, pending_key,
+                                           first_call=first_replacement_call)
 
     stopped = stop_if_closed()
     if stopped is not None:
         return stopped
 
     try:
-        return next_call(request)
+        return delivered(next_call(request))
     except Exception as error:
         active_model = str(request.get("model", ""))
         quota_exhausted = _is_quota_exhaustion(error)
@@ -5191,6 +6020,10 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             quota_exhausted or unavailable or _is_transient_provider_failure(error)
         ):
             raise
+        # Without a compatible host retry callback, the plugin must leave the
+        # original downstream failure untouched: ``next_call`` is not reusable.
+        if not callable(retry_call):
+            raise
         if quota_exhausted:
             _remember_spark_quota_exhaustion(str(kwargs.get("turn_id") or ""))
 
@@ -5222,11 +6055,14 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             {**kwargs, "request": fallback_request},
             cfg,
         )
-        return retry_call(fallback_request)
+        retry_response = retry_call(fallback_request)
+        return delivered(retry_response)
 
 
 def on_post_llm_call(**kwargs: Any) -> None:
     """Persist supervisor checkpoints and the legacy disabled benchmark lifecycle."""
+    # The turn has ended: provenance retained for it can no longer reach a reply.
+    _pending_replacement_discard(_pending_replacement_key(kwargs))
     cfg = _load_config()
     turn_id = str(kwargs.get("turn_id") or "")
     orchestrated = _orchestration_forced_event(cfg, turn_id)
@@ -5488,6 +6324,18 @@ def _declined_conductor_goal(args: Dict[str, Any], cfg: Dict[str, Any], turn_id:
     )
 
 
+def _unsupported_delegation_label(args: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+    """The first invalid effort label in a single or batched delegation payload."""
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else [args]
+    for task in tasks:
+        entry = task if isinstance(task, dict) else {}
+        goal = str(entry.get("goal") or args.get("goal") or "")
+        unsupported = _unsupported_label(goal, cfg)
+        if unsupported:
+            return unsupported
+    return None
+
+
 def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **_: Any) -> Optional[Dict[str, str]]:
     """Apply the worker budget and refuse unavailable delegation targets.
 
@@ -5510,6 +6358,9 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         return None
     try:
         cfg = _load_config()
+        unsupported = _unsupported_delegation_label(args, cfg)
+        if unsupported:
+            return {"action": "block", "message": _unsupported_label_message(unsupported)}
         if triage.enabled(cfg):
             over_budget = triage.spawn_block(tool_name, args, cfg, _)
             if over_budget:
@@ -5567,8 +6418,10 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_middleware("llm_request", route_llm_request)
     ctx.register_middleware("llm_execution", run_llm_with_transient_failover)
-    ctx.register_middleware("tool_execution", worker_admission.guard_tool_execution)
+    from .execution_adapters import guard_legacy_tool_execution
+    ctx.register_middleware("tool_execution", guard_legacy_tool_execution)
     ctx.register_hook("post_llm_call", on_post_llm_call)
+    ctx.register_hook("transform_llm_output", on_transform_llm_output)
     ctx.register_hook("subagent_start", on_subagent_start)
     ctx.register_hook("subagent_stop", on_subagent_stop)
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)

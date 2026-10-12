@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from model_router.host_delegation_fixtures import host_delegation
 from model_router import (
     RouteDecision,
     _is_callable_tier,
@@ -114,8 +115,11 @@ class ModelRouterTests(unittest.TestCase):
         self._route_log_patch.start()
         self._config_patch = patch("model_router._load_config", side_effect=default_test_config)
         self._config_patch.start()
+        self._host_delegation = host_delegation(depth=2)
+        self._host_delegation.__enter__()
 
     def tearDown(self):
+        self._host_delegation.__exit__(None, None, None)
         self._config_patch.stop()
         self._route_log_patch.stop()
 
@@ -469,15 +473,15 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(decision.tier, "terra")
         self.assertEqual(decision.effort, "medium")
 
-    def test_explicit_sol_override_is_limited_to_medium_effort(self):
+    def test_bare_sol_override_uses_plain_sol_effort(self):
         decision = classify_request(chat_request("[sol] Oldd meg ezt a kritikus production hibát"), 1)
         self.assertEqual(decision.tier, "sol")
-        self.assertEqual(decision.effort, "high")
+        self.assertEqual(decision.effort, "medium")
 
-    def test_xhigh_override_is_still_capped_at_medium(self):
+    def test_stated_sol_xhigh_reaches_the_decision_unchanged(self):
         decision = classify_request(chat_request("[sol:xhigh] Készíts részletes implementációs tervet."), 1)
         self.assertEqual(decision.tier, "sol")
-        self.assertEqual(decision.effort, "high")
+        self.assertEqual(decision.effort, "xhigh")
 
     def test_completed_terra_supervisor_review_stays_with_terra_despite_long_result(self):
         result = "[ASYNC DELEGATION BATCH COMPLETE — deleg_test] Role: orchestrator [terra] " + ("reviewed evidence " * 500)
@@ -1430,14 +1434,17 @@ class ModelRouterTests(unittest.TestCase):
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 429: weekly quota exhausted for gpt-5.3-codex-spark")
+            raise RuntimeError("HTTP 429: weekly quota exhausted for gpt-5.3-codex-spark")
+
+        def retry_call(request):
+            calls.append(request["model"])
             self.assertEqual(request["reasoning"]["effort"], "medium")
             return "recovered by Luna"
 
         result = run_llm_with_transient_failover(
             request={**chat_request("[spark] Bounded read-only source inspection."), "model": MODELS["spark"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
 
@@ -1474,32 +1481,42 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_generic_429_rate_limit_does_not_change_transient_failover_behavior(self):
         calls = []
+        retry_calls = []
 
         def next_call(request):
             calls.append(request["model"])
             raise RuntimeError("HTTP 429: rate limit exceeded; retry after 30 seconds")
 
+        def retry_call(request):
+            retry_calls.append(request["model"])
+            return "retry must not run"
+
         with self.assertRaisesRegex(RuntimeError, "rate limit"):
             run_llm_with_transient_failover(
                 request={**chat_request("[spark] Bounded read-only source inspection."), "model": MODELS["spark"]},
                 next_call=next_call,
+                retry_call=retry_call,
                 provider="openai-codex",
             )
         self.assertEqual(calls, [MODELS["spark"]])
+        self.assertEqual(retry_calls, [])
 
     def test_spark_weekly_quota_429_fails_over_once_to_luna(self):
         calls = []
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 429: weekly limit reached for this account")
+            raise RuntimeError("HTTP 429: weekly limit reached for this account")
+
+        def retry_call(request):
+            calls.append(request["model"])
             self.assertEqual(request["reasoning"]["effort"], "medium")
             return "luna-recovered"
 
         result = run_llm_with_transient_failover(
             request={**chat_request("[spark] Bounded read-only source inspection."), "model": MODELS["spark"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
 
@@ -1508,31 +1525,41 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_non_spark_quota_429_does_not_trigger_luna_failover(self):
         calls = []
+        retry_calls = []
 
         def next_call(request):
             calls.append(request["model"])
             raise RuntimeError("HTTP 429: weekly quota exhausted")
 
+        def retry_call(request):
+            retry_calls.append(request["model"])
+            return "retry must not run"
+
         with self.assertRaisesRegex(RuntimeError, "weekly quota"):
             run_llm_with_transient_failover(
                 request={**chat_request("[terra] Continue."), "model": MODELS["terra"]},
                 next_call=next_call,
+                retry_call=retry_call,
                 provider="openai-codex",
             )
         self.assertEqual(calls, [MODELS["terra"]])
+        self.assertEqual(retry_calls, [])
 
     def test_transient_fallback_from_sol_with_an_image_skips_spark(self):
         calls = []
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 503: upstream connect error")
+            raise RuntimeError("HTTP 503: upstream connect error")
+
+        def retry_call(request):
+            calls.append(request["model"])
             return "recovered"
 
         result = run_llm_with_transient_failover(
             request={**chat_request_with_image("Inspect this screenshot."), "model": MODELS["sol"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
         self.assertEqual(result, "recovered")
@@ -1558,13 +1585,16 @@ class ModelRouterTests(unittest.TestCase):
 
         def next_call(request):
             calls.append(request["model"])
-            if len(calls) == 1:
-                raise RuntimeError("HTTP 503: upstream connect error or disconnect/reset before headers")
+            raise RuntimeError("HTTP 503: upstream connect error or disconnect/reset before headers")
+
+        def retry_call(request):
+            calls.append(request["model"])
             return "recovered"
 
         result = run_llm_with_transient_failover(
             request={**chat_request("[sol] Folytasd a fejlesztést."), "model": MODELS["sol"]},
             next_call=next_call,
+            retry_call=retry_call,
             provider="openai-codex",
         )
 
@@ -1573,34 +1603,48 @@ class ModelRouterTests(unittest.TestCase):
 
     def test_sol_design_transient_failure_never_falls_back_to_another_tier(self):
         calls = []
+        retry_calls = []
 
         def next_call(request):
             calls.append(request["model"])
             raise RuntimeError("HTTP 503: upstream connect error")
 
+        def retry_call(request):
+            retry_calls.append(request["model"])
+            return "retry must not run"
+
         with self.assertRaisesRegex(RuntimeError, "503"):
             run_llm_with_transient_failover(
                 request={**chat_request("Implement the responsive CSS card design."), "model": MODELS["sol"]},
                 next_call=next_call,
+                retry_call=retry_call,
                 provider="openai-codex",
             )
         self.assertEqual(calls, [MODELS["sol"]])
+        self.assertEqual(retry_calls, [])
 
 
     def test_non_transient_error_does_not_retry_with_another_model(self):
         calls = []
+        retry_calls = []
 
         def next_call(request):
             calls.append(request["model"])
             raise RuntimeError("HTTP 401: invalid authentication")
 
+        def retry_call(request):
+            retry_calls.append(request["model"])
+            return "retry must not run"
+
         with self.assertRaisesRegex(RuntimeError, "401"):
             run_llm_with_transient_failover(
                 request={**chat_request("[sol] Folytasd a fejlesztést."), "model": MODELS["sol"]},
                 next_call=next_call,
+                retry_call=retry_call,
                 provider="openai-codex",
             )
         self.assertEqual(calls, [MODELS["sol"]])
+        self.assertEqual(retry_calls, [])
 
     def test_credential_and_password_actions_route_to_sol_in_hungarian_inflections(self):
         prompts = (

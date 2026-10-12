@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,26 @@ DEFAULT_CODING_MAX_TURNS = 8
 # wall time bounded but allow the configured 16-turn/$5 contract to finish.
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 600
 DEFAULT_CODING_TIMEOUT_SECONDS = 300
+
+
+class ClaudeBridgeFailure(RuntimeError):
+    """A terminal CLI outcome with typed failure evidence for the caller."""
+
+    def __init__(self, message: str, failure_kind: str, *, identity: Any = None,
+                 mismatch: Any = None, refused: bool = False) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.failure_class = (
+            "exact-route-mismatch" if failure_kind == "model-mismatch" else
+            "capability" if failure_kind == "capability" else
+            "timeout" if failure_kind == "timeout" else "execution-error"
+        )
+        self.identity = identity
+        self.mismatch = mismatch
+        self.refused = refused
+        self.route_reason = message
+
+
 CODING_SIGNAL = re.compile(
     r"\b(implement|debug|fix|refactor|patch|test|code|repository|repo|"
     r"backend|api|parser|router|middleware|python|javascript|typescript|"
@@ -107,7 +128,7 @@ def classify_review_dispatch(task: str) -> tuple[bool, str]:
 
 
 def _effective_model(payload: dict[str, Any], expected: str = CANONICAL_OPUS_MODEL) -> str:
-    """Return Claude Code's actual served model, never the requested alias."""
+    """Return Claude Code's served model from per-model usage evidence only."""
     usage = payload.get("modelUsage") or {}
     if isinstance(usage, dict):
         # Claude Code can report small internal/helper usage alongside the main
@@ -164,11 +185,160 @@ def _terminal_state(payload: dict[str, Any] | None, *, timeout: bool = False, ma
     return "success" if subtype in {"success", ""} and not payload.get("is_error") else "error"
 
 
+@dataclass(frozen=True)
+class _CliPlan:
+    """One validated CLI run, built before the transport boundary is entered."""
+    command: tuple
+    prompt: str
+    repo: Path
+    timeout: int
+    review: bool
+    write: bool
+    alias: str
+    requested_alias: str
+    expected_model: str
+    adjustment: str
+    reason: str
+    identity: Any
+    parent_session_id: str
+    parent_turn_id: str
+    lifecycle_path: Path | None
+
+
+def _legacy_identity(requested_alias: str, alias: str) -> Any:
+    """Truthful facts for a caller that supplied no identity.
+
+    Requested comes from the explicit tier's alias map and resolved from the
+    actual ``--model`` argument (an alias, not served-model proof). Provider is
+    pinned by the transport; account and the observed model stay unknown until
+    validated CLI evidence attaches an observation. CLI effort has no observed
+    evidence, so its applied value remains unknown rather than not applicable.
+    """
+    if __package__:
+        from .execution_contracts import SELECTION_PREFERRED, UNKNOWN, EffortFact, ModelFact, TargetIdentity
+    else:
+        from model_router.execution_contracts import SELECTION_PREFERRED, UNKNOWN, EffortFact, ModelFact, TargetIdentity
+    return TargetIdentity(
+        "anthropic", UNKNOWN, "claude_cli", requested_alias, SELECTION_PREFERRED,
+        requested=ModelFact(CLAUDE_REVIEW_MODELS[requested_alias],
+                            f"cli_alias_map:claude_opus_bridge.CLAUDE_REVIEW_MODELS.{requested_alias}"),
+        resolved=ModelFact(alias, "cli_alias_argument", canonical=False),
+        effort=EffortFact(applied=UNKNOWN),
+    )
+
+
+def _transport_owner(alias: str) -> str:
+    """Resolve the execution provider through the shared transport-owner rule."""
+    if __package__:
+        from . import target_identity
+    else:
+        from model_router import target_identity
+    provider, _ = target_identity._provider(alias, _load_config(), "", "claude_cli")
+    return provider
+
+
+def admitted_invocation_identity(identity: Any, alias: str) -> Any:
+    """Identity facts for the CLI invocation admission actually chose.
+
+    ``requested`` keeps the caller's original intent (an Opus review stays an
+    Opus request). For a preferred selection ``resolved`` is the alias that goes
+    into ``claude --model``, so a usage step-down to Sonnet cannot be reported as
+    an Opus invocation on success, failure or replacement. Exact selection never
+    substitutes and passes its canonical model on argv, so its resolver facts
+    stay. The CLI reports no reasoning-effort evidence: applied effort is
+    unknown, never ``not_applicable`` (that claim belongs to Haiku-style tiers).
+    """
+    from dataclasses import is_dataclass, replace
+    if identity is None or not is_dataclass(identity) or not hasattr(identity, "effort"):
+        return identity
+    if __package__:
+        from .execution_contracts import NOT_APPLICABLE, SOURCE_NOT_OBSERVED, UNKNOWN, ModelFact
+    else:
+        from model_router.execution_contracts import NOT_APPLICABLE, SOURCE_NOT_OBSERVED, UNKNOWN, ModelFact
+    changes: dict[str, Any] = {}
+    if identity.selection_mode != "exact":
+        changes["resolved"] = ModelFact(alias, "cli_alias_argument", canonical=False)
+    effort = identity.effort
+    if effort.applied == NOT_APPLICABLE:
+        changes["effort"] = replace(effort, applied=UNKNOWN, source=SOURCE_NOT_OBSERVED)
+    return replace(identity, **changes) if changes else identity
+
+
+def _execution_identity(identity: Any, alias: str) -> Any:
+    """Pin execution facts to the transport owner and the admitted invocation."""
+    owner = _transport_owner(alias)
+    if (getattr(identity, "selection_mode", "") == "exact"
+            and getattr(identity, "provider", "") != owner):
+        raise ClaudeBridgeFailure(
+            f"exact Claude CLI invocation refused before launch: identity names provider "
+            f"{getattr(identity, 'provider', '')!r}, but claude_cli executes on {owner!r}",
+            "capability", identity=identity, refused=True,
+        )
+    from dataclasses import replace
+    if getattr(identity, "provider", "") != owner:
+        identity = replace(identity, provider=owner)
+    return admitted_invocation_identity(identity, alias)
+
+
+def _enforce_exact(identity: Any, alias: str, requested_alias: str) -> None:
+    """A direct exact invocation gets the same capability/policy refusal as the
+    middleware path, before anything is launched or recorded."""
+    if getattr(identity, "selection_mode", "") != "exact":
+        return
+    if __package__:
+        from . import target_identity
+    else:
+        from model_router import target_identity
+
+    def refuse(why: str) -> None:
+        raise ClaudeBridgeFailure("exact Claude CLI invocation refused before launch: " + why,
+                                  "capability", identity=identity, refused=True)
+    if getattr(identity, "transport", "") != "claude_cli":
+        refuse(f"identity names transport {getattr(identity, 'transport', '')!r}, not 'claude_cli'")
+    if not getattr(getattr(identity, "requested", None), "known", False):
+        refuse("exact selection has no known requested model identity")
+    if alias != requested_alias:
+        refuse("exact Claude CLI selection cannot substitute the requested tier")
+    status, why = target_identity._cli_exact_capability(None, _load_config())
+    if status != "supported":
+        refuse(f"exact canonical CLI selection needs exact_model evidence; status {status}"
+               + (f" ({why})" if why else ""))
+
+
 def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False, timeout: int | None = None,
              max_turns: int | None = None, model: str | None = None, max_budget_usd: float = 5.0,
              requested_alias: str | None = None, adjustment: str = "",
-             parent_session_id: str | None = None, parent_turn_id: str | None = None,
+             identity: Any = None, parent_session_id: str | None = None, parent_turn_id: str | None = None,
              lifecycle_path: Path | None = None) -> dict[str, Any]:
+    """Public CLI entrypoint: validate, then cross the normalised boundary once.
+
+    The standalone ``main()`` and the middleware bridge both come through here.
+    Invalid input and exact refusals raise before the boundary (never launched,
+    no receipt). The boundary calls only the private raw ``_run_cli``, never a
+    public entrypoint, so nothing is wrapped twice or intercepted recursively.
+    """
+    plan = _prepare(task, repo, write=write, review=review, timeout=timeout, max_turns=max_turns,
+                    model=model, max_budget_usd=max_budget_usd, requested_alias=requested_alias,
+                    adjustment=adjustment, identity=identity, parent_session_id=parent_session_id,
+                    parent_turn_id=parent_turn_id, lifecycle_path=lifecycle_path)
+    if __package__:
+        from .execution_adapters import dispatch_legacy
+    else:
+        from model_router.execution_adapters import dispatch_legacy
+    # No attempt key: a legacy CLI call gets an observation-only identity and is
+    # never deduplicated against a later new call. No capacity check (pre-S05).
+    return dispatch_legacy(
+        lambda: _run_cli(plan), transport="claude_cli", scope="claude_cli:local_credentials",
+        evidence={"claude_tier": plan.alias, "tier_adjusted": plan.adjustment},
+        terminal_exceptions=(ClaudeBridgeFailure,),
+    )
+
+
+def _prepare(task: str, repo: Path, *, write: bool = False, review: bool = False, timeout: int | None = None,
+             max_turns: int | None = None, model: str | None = None, max_budget_usd: float = 5.0,
+             requested_alias: str | None = None, adjustment: str = "",
+             identity: Any = None, parent_session_id: str | None = None, parent_turn_id: str | None = None,
+             lifecycle_path: Path | None = None) -> _CliPlan:
     if review and write:
         raise ValueError("a Claude review is always read-only")
     # Not defaulted at the signature: a caller that names no lifecycle log does
@@ -188,7 +358,18 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     requested_alias = (requested_alias or alias).casefold()
     if requested_alias not in CLAUDE_REVIEW_MODELS:
         raise ValueError(f"unknown requested Claude tier {requested_alias!r}")
+    if identity is None:
+        identity = _legacy_identity(requested_alias, alias)
+    identity = _execution_identity(identity, alias)
     expected_model = CLAUDE_REVIEW_MODELS[alias]
+    # A preferred admission may step Opus down to Sonnet. Validate the model the
+    # admitted tier was asked to serve, while ``identity`` still records the
+    # original requested tier for substitution provenance. Exact mode is the one
+    # that must enforce its canonical requested identity on the wire.
+    if (getattr(identity, "selection_mode", "") == "exact"
+            and getattr(getattr(identity, "requested", None), "known", False)):
+        expected_model = str(identity.requested.value)
+    model_argument = expected_model if getattr(identity, "selection_mode", "") == "exact" else alias
     if not repo.is_dir():
         raise ValueError(f"repository directory does not exist: {repo}")
     resolved_max_turns = max_turns if max_turns is not None else (DEFAULT_REVIEW_MAX_TURNS if review else DEFAULT_CODING_MAX_TURNS)
@@ -215,7 +396,7 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     # E2BIG/"Argument list too long". Claude Code's print mode accepts text on
     # stdin when no positional prompt is supplied.
     command = [
-        "claude", "-p", "--model", alias,
+        "claude", "-p", "--model", model_argument,
         "--max-turns", str(resolved_max_turns), "--max-budget-usd", f"{budget:.2f}", "--output-format", "json",
     ]
     # Results are accepted only when Claude reports the requested canonical tier.
@@ -228,6 +409,22 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         command += ["--allowedTools", "Read,Edit,Write,Bash"]
     else:
         command += ["--tools", "Read", "--disallowedTools", "Edit,Write,Bash,Agent,WebSearch,WebFetch"]
+    _enforce_exact(identity, alias, requested_alias)
+    return _CliPlan(tuple(command), prompt, repo, resolved_timeout, review, write, alias, requested_alias,
+                    expected_model, adjustment, reason, identity, parent_session_id or "",
+                    parent_turn_id or "", lifecycle_path)
+
+
+def _run_cli(plan: _CliPlan) -> dict[str, Any]:
+    """PRIVATE raw operation: one subprocess and one terminal lifecycle record.
+
+    Called only from inside the normalised boundary in ``dispatch``. It never
+    calls a public entrypoint or the boundary itself.
+    """
+    command, prompt, repo, review, write = list(plan.command), plan.prompt, plan.repo, plan.review, plan.write
+    alias, requested_alias, expected_model = plan.alias, plan.requested_alias, plan.expected_model
+    adjustment, reason, identity, lifecycle_path = plan.adjustment, plan.reason, plan.identity, plan.lifecycle_path
+    resolved_timeout, parent_session_id, parent_turn_id = plan.timeout, plan.parent_session_id, plan.parent_turn_id
     bridge_run_id = str(uuid.uuid4())
     started_at = time.time()
     base_event = {
@@ -245,7 +442,7 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
     except subprocess.TimeoutExpired as exc:
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "timeout",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at})
-        raise RuntimeError("Claude Code timed out") from exc
+        raise ClaudeBridgeFailure("Claude Code timed out", "timeout", identity=identity) from exc
     except OSError:
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "error",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at})
@@ -256,12 +453,12 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "error",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at,
                                           "malformed": True, "returncode": completed.returncode})
-        raise RuntimeError("Claude Code did not return JSON output") from exc
+        raise ClaudeBridgeFailure("Claude Code did not return JSON output", "malformed-json", identity=identity) from exc
     if not isinstance(payload, dict):
         _append_lifecycle(lifecycle_path, {**base_event, "event": "terminal", "state": "error",
                                           "timestamp": time.time(), "duration_seconds": time.time() - started_at,
                                           "malformed": True, "returncode": completed.returncode})
-        raise RuntimeError("Claude Code did not return a JSON result object")
+        raise ClaudeBridgeFailure("Claude Code did not return a JSON result object", "malformed-json", identity=identity)
     effective_model = _effective_model(payload, expected_model)
     state = _terminal_state(payload, returncode=completed.returncode, expected_model=expected_model)
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
@@ -274,16 +471,34 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
         "total_cost_usd": payload.get("total_cost_usd"),
     })
+    observed_identity, mismatch, substitution = identity, None, None
+    if identity is not None:
+        if __package__:
+            from .target_identity import verify_observed
+        else:
+            from model_router.target_identity import verify_observed
+        observed_identity, mismatch, substitution = verify_observed(
+            identity, effective_model, "claude_cli.result.modelUsage",
+        )
     if state == "max-turn":
-        raise RuntimeError("Claude Code reached max turns")
+        raise ClaudeBridgeFailure("Claude Code reached max turns", "max-turn", identity=observed_identity)
     if state == "budget":
-        raise RuntimeError("Claude Code exhausted its budget")
+        raise ClaudeBridgeFailure("Claude Code exhausted its budget", "budget", identity=observed_identity)
     if completed.returncode:
-        raise RuntimeError(f"Claude Code failed with exit {completed.returncode}: {completed.stderr.strip()[:500]}")
-    if effective_model != expected_model:
-        raise RuntimeError(f"Claude Code did not serve {expected_model}; effective model was {effective_model or 'missing'}")
+        raise ClaudeBridgeFailure(
+            f"Claude Code failed with exit {completed.returncode}: {completed.stderr.strip()[:500]}",
+            "nonzero-exit", identity=observed_identity,
+        )
+    if effective_model != expected_model or mismatch:
+        raise ClaudeBridgeFailure(
+            f"Claude Code did not serve {expected_model}; effective model was {effective_model or 'missing'}",
+            "model-mismatch", identity=observed_identity, mismatch=mismatch,
+        )
     if state != "success":
-        raise RuntimeError(f"Claude Code failed with subtype {payload.get('subtype') or 'unknown'}")
+        raise ClaudeBridgeFailure(
+            f"Claude Code failed with subtype {payload.get('subtype') or 'unknown'}",
+            "execution-error", identity=observed_identity,
+        )
     cfg = _load_config()
     _log_decision(
         RouteDecision("sonnet5" if alias == "sonnet" else "opus5", effective_model,
@@ -291,7 +506,11 @@ def dispatch(task: str, repo: Path, *, write: bool = False, review: bool = False
         {"turn_id": f"{bridge_run_id}:{payload.get('num_turns', 1)}", "api_call_count": payload.get("num_turns", 1), "request": {}},
         cfg,
     )
-    return {"bridge_run_id": bridge_run_id, "effective_model": effective_model, "reason": reason, "result": payload.get("result", ""), "num_turns": payload.get("num_turns"), "total_cost_usd": payload.get("total_cost_usd")}
+    return {"bridge_run_id": bridge_run_id, "effective_model": effective_model, "reason": reason,
+            "result": payload.get("result", ""), "num_turns": payload.get("num_turns"),
+            "total_cost_usd": payload.get("total_cost_usd"),
+            "identity": observed_identity.as_dict() if observed_identity is not None else None,
+            "substitution": substitution}
 
 
 def main() -> int:

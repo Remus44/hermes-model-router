@@ -2,12 +2,20 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from claude_opus_bridge import CANONICAL_OPUS_MODEL, classify_coding_dispatch, classify_review_dispatch, dispatch
+from claude_opus_bridge import (CANONICAL_OPUS_MODEL, ClaudeBridgeFailure, classify_coding_dispatch,
+                                classify_review_dispatch, dispatch)
 
 
 class ClaudeOpusBridgeTests(unittest.TestCase):
+    def setUp(self):
+        from model_router import execution_adapters
+        owner = patch.object(execution_adapters, "RESERVATIONS", execution_adapters.ReservationBook())
+        owner.start()
+        self.addCleanup(owner.stop)
+
     @patch("claude_opus_bridge.subprocess.run")
     def test_invalid_limits_never_launch_a_process(self, run):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,8 +114,9 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
     def test_timeout_is_terminal_and_has_highest_precedence(self, run, log):
         with tempfile.TemporaryDirectory() as directory:
             lifecycle = Path(directory) / "bridge.jsonl"
-            with self.assertRaisesRegex(RuntimeError, "timed out"):
+            with self.assertRaises(ClaudeBridgeFailure) as raised:
                 dispatch("[opus-review] Review only", Path(directory), review=True, timeout=1, lifecycle_path=lifecycle)
+            self.assertEqual(raised.exception.failure_kind, "timeout")
             events = lifecycle.read_text().splitlines()
             terminal = json.loads(events[-1])
         self.assertEqual(terminal["state"], "timeout")
@@ -122,13 +131,40 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
                 run.return_value.stderr = "CLI error"
                 run.return_value.stdout = stdout
                 lifecycle = Path(directory) / "bridge.jsonl"
-                with self.assertRaisesRegex(RuntimeError, "result object"):
+                with self.assertRaises(ClaudeBridgeFailure) as raised:
                     dispatch("[opus-review] Review parser", Path(directory), review=True, lifecycle_path=lifecycle)
+                self.assertEqual(raised.exception.failure_kind, "malformed-json")
                 events = [json.loads(line) for line in lifecycle.read_text().splitlines()]
             self.assertEqual([event["event"] for event in events], ["started", "terminal"])
             self.assertEqual(events[-1]["state"], "error")
             self.assertTrue(events[-1]["malformed"])
             self.assertEqual(events[-1]["returncode"], 1)
+        log.assert_not_called()
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
+    def test_cli_failures_are_typed_and_keep_one_terminal_lifecycle_record(self, run, log):
+        cases = (
+            ("max-turn", {"subtype": "error_max_turns", "is_error": True,
+                           "modelUsage": {CANONICAL_OPUS_MODEL: {}}}, 0),
+            ("budget", {"subtype": "error_budget", "is_error": True,
+                        "modelUsage": {CANONICAL_OPUS_MODEL: {}}}, 0),
+            ("nonzero-exit", {"modelUsage": {CANONICAL_OPUS_MODEL: {}}}, 2),
+            ("model-mismatch", {"modelUsage": {"claude-sonnet-5": {}}, "result": "no"}, 0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for expected, payload, returncode in cases:
+                with self.subTest(expected=expected):
+                    lifecycle = Path(directory) / f"{expected}.jsonl"
+                    run.return_value.returncode = returncode
+                    run.return_value.stderr = "CLI error"
+                    run.return_value.stdout = json.dumps(payload)
+                    with self.assertRaises(ClaudeBridgeFailure) as raised:
+                        dispatch("[opus-review] Review parser", Path(directory), review=True,
+                                 lifecycle_path=lifecycle)
+                    self.assertEqual(raised.exception.failure_kind, expected)
+                    events = [json.loads(line) for line in lifecycle.read_text().splitlines()]
+                    self.assertEqual([event["event"] for event in events], ["started", "terminal"])
         log.assert_not_called()
 
     @patch("claude_opus_bridge._log_decision")
@@ -213,6 +249,68 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
 
     @patch("claude_opus_bridge._log_decision")
     @patch("claude_opus_bridge.subprocess.run")
+    def test_preferred_step_down_validates_the_admitted_tier_and_keeps_requested_identity(self, run, log):
+        from model_router.target_identity import resolve_target
+
+        cfg = {"models": {"opus5": "claude-opus-5-5", "sonnet5": "claude-sonnet-5-5"}}
+        identity = resolve_target("opus", transport="claude_cli", cfg=cfg).identity
+        run.return_value.returncode = 0
+        run.return_value.stderr = ""
+        run.return_value.stdout = json.dumps({"modelUsage": {"claude-sonnet-5-5": {}}, "result": "ok"})
+        with tempfile.TemporaryDirectory() as directory:
+            result = dispatch("[opus-review] Review parser", Path(directory), review=True,
+                              model="sonnet", requested_alias="opus", identity=identity)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], "sonnet")
+        self.assertEqual(result["effective_model"], "claude-sonnet-5-5")
+        self.assertEqual(result["identity"]["requested"]["value"], "claude-opus-5-5")
+        self.assertEqual(result["substitution"]["observed"], "claude-sonnet-5-5")
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
+    def test_conflicting_top_level_model_cannot_override_model_usage_evidence(self, run, log):
+        run.return_value.returncode = 0
+        run.return_value.stderr = ""
+        run.return_value.stdout = json.dumps({
+            "model": CANONICAL_OPUS_MODEL,
+            "modelUsage": {"claude-sonnet-5-5": {}},
+            "result": "wrong tier",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ClaudeBridgeFailure) as raised:
+                dispatch("[opus-review] Review parser", Path(directory), review=True)
+        self.assertEqual(raised.exception.failure_kind, "model-mismatch")
+        log.assert_not_called()
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
+    def test_exact_canonical_review_requests_and_accepts_the_canonical_model(self, run, log):
+        from model_router.target_identity import resolve_target
+        from model_router import runtime_capabilities as runtime
+
+        caps = (runtime.Capability("exact_model", "supported", reason="fixture capability evidence"),)
+        snapshot = runtime.RuntimeSnapshot(
+            1, "fixture", runtime.Fact("unknown"), runtime.Fact("unknown"),
+            runtime.Fact("unknown"), (), (runtime.AdapterCapabilities("claude_cli", caps),), (),
+        )
+        cfg = {"models": {"opus5": CANONICAL_OPUS_MODEL}}
+        identity = resolve_target("opus", transport="claude_cli", selection_mode="exact",
+                                  requested_model=CANONICAL_OPUS_MODEL, cfg=cfg, snapshot=snapshot).identity
+        run.return_value.returncode = 0
+        run.return_value.stderr = ""
+        run.return_value.stdout = json.dumps({"modelUsage": {CANONICAL_OPUS_MODEL: {}}, "result": "ok"})
+        # F03: the bridge re-checks exact capability itself; the fixture evidence
+        # is injected at that seam too (the installed CLI reports it unknown).
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("model_router.target_identity._cli_exact_capability",
+                      return_value=("supported", "fixture capability evidence")):
+            result = dispatch("[opus-review] Review parser", Path(directory), review=True, identity=identity)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], CANONICAL_OPUS_MODEL)
+        self.assertEqual(result["effective_model"], CANONICAL_OPUS_MODEL)
+
+    @patch("claude_opus_bridge._log_decision")
+    @patch("claude_opus_bridge.subprocess.run")
     def test_the_review_label_selects_the_claude_tier(self, run, log):
         """Two tiers exist so routine review can spend the cheaper one; a single
         tier would burn the separate quota that is the reason to reach Claude."""
@@ -272,12 +370,310 @@ class ClaudeOpusBridgeTests(unittest.TestCase):
                 dispatch("[opus] Implement a parser test", Path(directory))
         log.assert_not_called()
 
+    def test_a05_public_cli_dispatch_crosses_adapter_boundary(self):
+        from model_router import claude_opus_bridge as cli
+        from model_router import execution_adapters as adapters
+
+        book = adapters.ReservationBook()
+        payload = {'subtype': 'success', 'result': 'verdict',
+                   'modelUsage': {'claude-sonnet-5-5': {}}, 'num_turns': 1}
+        with patch.object(adapters, 'RESERVATIONS', book), \
+             patch.object(cli, '_load_config', return_value={}), \
+             patch.object(cli, '_log_decision'), \
+             patch.object(cli.subprocess, 'run', return_value=SimpleNamespace(
+                 stdout=json.dumps(payload), stderr='', returncode=0)):
+            cli.dispatch('[sonnet-review] Review parser', Path('/tmp'), review=True, model='sonnet')
+        self.assertEqual(len(book.records()), 1, 'public CLI dispatch bypassed adapter journal')
+
+
+_SONNET_SUCCESS = {"subtype": "success", "result": "verdict", "modelUsage": {"claude-sonnet-5-5": {}},
+                   "num_turns": 1}
+_SONNET_MISMATCH = {"subtype": "success", "result": "verdict", "modelUsage": {"claude-opus-5-5": {}},
+                    "num_turns": 1}
+
+
+class CliEntrypointBoundaryTests(unittest.TestCase):
+    """F03 (A05): the standalone ``main()`` (package and script copy), the public
+    Python ``dispatch`` and the middleware bridge each cross one normalised CLI
+    boundary exactly once: one raw execution, one receipt, one lifecycle pair and
+    at most one routed-call record. Never a live CLI: ``subprocess.run`` is mocked."""
+
+    ENTRIES = ("public", "standalone", "script", "middleware")
+    TASK = "[sonnet-review] Review parser"
+
+    def setUp(self):
+        from model_router import execution_adapters
+        self.book = execution_adapters.ReservationBook()
+        owner = patch.object(execution_adapters, "RESERVATIONS", self.book)
+        owner.start()
+        self.addCleanup(owner.stop)
+
+    def _module(self, entry):
+        if entry == "script":
+            import claude_opus_bridge as script  # the harness's script-mode copy
+            return script
+        from model_router import claude_opus_bridge as package
+        return package
+
+    def _invoke(self, entry, module, repo, lifecycle, *, task=None, identity=None):
+        import io
+        import sys
+        from contextlib import redirect_stdout
+        task = task or self.TASK
+        if entry == "public":
+            return module.dispatch(task, Path(repo), review=True, model="sonnet", identity=identity,
+                                   lifecycle_path=lifecycle)
+        if entry in ("standalone", "script"):
+            argv = ["claude_opus_bridge.py", "--repo", str(repo), "--task", task, "--review",
+                    "--lifecycle-path", str(lifecycle)]
+            out = io.StringIO()
+            with patch.object(sys, "argv", argv), redirect_stdout(out):
+                self.assertEqual(module.main(), 0)
+            return json.loads(out.getvalue())
+        import model_router as router
+        return router._run_opus5_bridge(repo=str(repo), task=task, write=False, review=True, model="sonnet",
+                                        identity=identity,
+                                        cfg={"coding_agent": {"lifecycle_path": str(lifecycle)}})
+
+    def _run(self, entry, *, outcome="success", repo_name="", task=None, identity=None, patches=()):
+        from contextlib import ExitStack
+        module = self._module(entry)
+        if outcome == "timeout":
+            effect = {"side_effect": __import__("subprocess").TimeoutExpired("claude", 1)}
+        elif outcome == "start-failure":
+            effect = {"side_effect": FileNotFoundError("claude")}
+        else:
+            stdout = {"success": json.dumps(_SONNET_SUCCESS), "model-mismatch": json.dumps(_SONNET_MISMATCH),
+                      "malformed": "not json"}[outcome]
+            effect = {"return_value": SimpleNamespace(stdout=stdout, stderr="", returncode=0)}
+        with tempfile.TemporaryDirectory() as directory:
+            routes = Path(directory) / "routes.jsonl"
+            lifecycle = Path(directory) / "bridge.jsonl"
+            repo = Path(directory) / repo_name if repo_name else Path(directory)
+            cfg = {"logging": {"enabled": True, "path": str(routes)}}
+            result = error = None
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(module, "_load_config", return_value=cfg))
+                run = stack.enter_context(patch.object(module.subprocess, "run", **effect))
+                for item in patches:
+                    stack.enter_context(item)
+                try:
+                    result = self._invoke(entry, module, repo, lifecycle, task=task, identity=identity)
+                except Exception as exc:  # the assertions below name the expected kind
+                    error = exc
+            # Counted inside the scratch directory, before cleanup removes it.
+            events = [json.loads(line) for line in lifecycle.read_text().splitlines()] if lifecycle.exists() else []
+            route_lines = ([line for line in routes.read_text().splitlines() if line.strip()]
+                           if routes.exists() else [])
+        return SimpleNamespace(result=result, error=error, run=run, events=events, routes=route_lines,
+                               receipts=self.book.records())
+
+    def _assert_one_attempt(self, out, *, status, state, routes):
+        self.assertEqual(out.run.call_count, 1, "exactly one raw CLI execution")
+        self.assertEqual(len(out.receipts), 1, "exactly one normalised receipt")
+        receipt = out.receipts[0]
+        self.assertEqual((receipt.transport, receipt.scope), ("claude_cli", "claude_cli:local_credentials"))
+        self.assertEqual(receipt.status, status)
+        self.assertEqual([e["event"] for e in out.events], ["started", "terminal"], "one lifecycle pair")
+        self.assertEqual(out.events[-1]["state"], state)
+        self.assertEqual(len(out.routes), routes, "routed-call records")
+        return receipt
+
+    def test_success_crosses_the_boundary_once_with_truthful_legacy_identity(self):
+        for entry in self.ENTRIES:
+            with self.subTest(entry=entry):
+                self.book._claims.clear()
+                out = self._run(entry)
+                self.assertIsNone(out.error)
+                receipt = self._assert_one_attempt(out, status="succeeded", state="success", routes=1)
+                self.assertEqual(receipt.observed_model, "claude-sonnet-5-5")
+                self.assertEqual(receipt.resolved_tier, "sonnet")
+                self.assertEqual(receipt.handle, out.result["bridge_run_id"])
+                self.assertEqual(receipt.handle, out.events[0]["bridge_run_id"])
+                identity = out.result["identity"]
+                self.assertIsNotNone(identity, "a legacy caller gets truthful legacy identity facts")
+                # Legacy facts come from the explicit tier and actual command; the
+                # served model is observed only from validated CLI evidence.
+                self.assertEqual(identity["transport"], "claude_cli")
+                self.assertEqual(identity["selection_mode"], "profile_preferred")
+                self.assertEqual(identity["requested"]["value"], "claude-sonnet-5-5")
+                self.assertEqual((identity["resolved"]["value"], identity["resolved"]["canonical"]),
+                                 ("sonnet", False))
+                self.assertEqual(identity["observed"],
+                                 {"value": "claude-sonnet-5-5", "source": "claude_cli.result.modelUsage",
+                                  "canonical": True})
+                self.assertEqual(identity["account"], "unknown")
+                self.assertEqual(identity["effort"]["applied"], "unknown")
+
+    def test_attempted_failures_record_one_terminal_receipt_and_no_route(self):
+        cases = (("model-mismatch", "model-mismatch", "failed", "error"),
+                 ("timeout", "timeout", "timed_out", "timeout"),
+                 ("malformed", "malformed-json", "failed", "error"))
+        for entry in self.ENTRIES:
+            for outcome, kind, status, state in cases:
+                with self.subTest(entry=entry, outcome=outcome):
+                    self.book._claims.clear()
+                    out = self._run(entry, outcome=outcome)
+                    self.assertEqual(type(out.error).__name__, "ClaudeBridgeFailure")
+                    self.assertEqual(out.error.failure_kind, kind)
+                    self.assertFalse(out.error.refused, "an attempted failure is not a refusal")
+                    self._assert_one_attempt(out, status=status, state=state, routes=0)
+
+    def test_process_start_failure_stays_unknown_with_one_terminal_record(self):
+        for entry in self.ENTRIES:
+            with self.subTest(entry=entry):
+                self.book._claims.clear()
+                out = self._run(entry, outcome="start-failure")
+                self.assertIsInstance(out.error, FileNotFoundError)
+                self._assert_one_attempt(out, status="unknown", state="error", routes=0)
+
+    def test_invalid_input_never_launches_and_writes_no_receipt(self):
+        for entry in self.ENTRIES:
+            for name, options in (("missing repository", {"repo_name": "missing"}),
+                                  ("unlabelled review", {"task": "Review parser"})):
+                with self.subTest(entry=entry, invalid=name):
+                    self.book._claims.clear()
+                    out = self._run(entry, **options)
+                    self.assertIsInstance(out.error, ValueError)
+                    out.run.assert_not_called()
+                    self.assertEqual(out.receipts, ())
+                    self.assertEqual((out.events, out.routes), ([], []))
+
+    def _exact_identity(self):
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        return TargetIdentity("anthropic", "unknown", "claude_cli", "sonnet", "exact",
+                              requested=ModelFact("claude-sonnet-5-5", "operator_request"))
+
+    def test_direct_exact_invocation_without_capability_is_refused_before_launch(self):
+        for entry in ("public", "middleware"):
+            with self.subTest(entry=entry):
+                self.book._claims.clear()
+                out = self._run(entry, identity=self._exact_identity(), patches=(
+                    patch("model_router.target_identity._cli_exact_capability",
+                          return_value=("unknown", "fixture: no exact_model evidence")),))
+                self.assertEqual(type(out.error).__name__, "ClaudeBridgeFailure")
+                self.assertTrue(out.error.refused, "never-launched refusal")
+                self.assertEqual(out.error.failure_kind, "capability")
+                self.assertIn("exact_model", str(out.error))
+                out.run.assert_not_called()
+                self.assertEqual(out.receipts, ())
+                self.assertEqual((out.events, out.routes), ([], []))
+
+    def test_direct_exact_invocation_with_capability_launches_once_and_validates(self):
+        for entry in ("public", "middleware"):
+            for outcome, status in (("success", "succeeded"), ("model-mismatch", "failed")):
+                with self.subTest(entry=entry, outcome=outcome):
+                    self.book._claims.clear()
+                    out = self._run(entry, outcome=outcome, identity=self._exact_identity(), patches=(
+                        patch("model_router.target_identity._cli_exact_capability",
+                              return_value=("supported", "fixture capability evidence")),))
+                    command = out.run.call_args.args[0]
+                    self.assertEqual(command[command.index("--model") + 1], "claude-sonnet-5-5")
+                    self._assert_one_attempt(out, status=status, state="success" if status == "succeeded"
+                                             else "error", routes=1 if status == "succeeded" else 0)
+                    if outcome == "model-mismatch":
+                        self.assertEqual(out.error.failure_kind, "model-mismatch")
+                        self.assertFalse(out.error.refused)
+
+    def test_explicit_caller_identity_stays_authoritative(self):
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        caller = TargetIdentity("anthropic", "unknown", "claude_cli", "sonnet", "profile_preferred",
+                                requested=ModelFact("claude-sonnet-5-5", "caller_fixture"),
+                                resolved=ModelFact("sonnet", "caller_fixture_alias", canonical=False))
+        out = self._run("public", identity=caller)
+        self.assertIsNone(out.error)
+        self.assertEqual(out.result["identity"]["requested"]["source"], "caller_fixture")
+        self.assertEqual(out.result["identity"]["resolved"], {
+            "value": "sonnet", "source": "cli_alias_argument", "canonical": False,
+        })
+        self.assertEqual(len(out.receipts), 1)
+
+    def test_preferred_identity_reports_anthropic_transport_owner(self):
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        caller = TargetIdentity("openai-codex", "unknown", "claude_cli", "sonnet", "profile_preferred",
+                                requested=ModelFact("claude-sonnet-5-5", "caller_fixture"),
+                                resolved=ModelFact("sonnet", "caller_fixture_alias", canonical=False))
+        out = self._run("public", identity=caller)
+        self.assertIsNone(out.error)
+        out.run.assert_called_once()
+        self.assertEqual(len(out.receipts), 1)
+        self.assertEqual(out.result["identity"]["provider"], "anthropic")
+        self.assertEqual(out.result["identity"]["requested"]["source"], "caller_fixture")
+        self.assertEqual(out.result["identity"]["observed"]["value"], "claude-sonnet-5-5")
+
+    def test_exact_identity_with_wrong_provider_is_refused_before_launch(self):
+        identity = self._exact_identity()
+        from dataclasses import replace
+        wrong_provider = replace(identity, provider="openai-codex")
+        out = self._run("public", identity=wrong_provider, patches=(
+            patch("model_router.target_identity._cli_exact_capability",
+                  return_value=("supported", "fixture capability evidence")),))
+        self.assertEqual(type(out.error).__name__, "ClaudeBridgeFailure")
+        self.assertTrue(out.error.refused)
+        self.assertEqual(out.error.failure_class, "capability")
+        out.run.assert_not_called()
+        self.assertEqual(out.receipts, ())
+        self.assertEqual((out.events, out.routes), ([], []))
+
+    def test_step_down_keeps_requested_admitted_and_observed_distinct(self):
+        from model_router import claude_opus_bridge as cli
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(cli, "_load_config", return_value={}), \
+                patch.object(cli.subprocess, "run", return_value=SimpleNamespace(
+                    stdout=json.dumps(_SONNET_SUCCESS), stderr="", returncode=0)):
+            result = cli.dispatch("[opus-review] Review parser", Path(directory), review=True, model="sonnet",
+                                  requested_alias="opus", adjustment="opus5→sonnet5 (weekly usage 75%)")
+        identity = result["identity"]
+        self.assertIsNotNone(identity, "a legacy step-down keeps requested/admitted/observed facts")
+        self.assertEqual(identity["alias"], "opus")
+        self.assertEqual(identity["requested"]["value"], "claude-opus-5-5")
+        self.assertEqual((identity["resolved"]["value"], identity["resolved"]["canonical"]), ("sonnet", False))
+        self.assertEqual(identity["observed"]["value"], "claude-sonnet-5-5")
+        self.assertEqual(result["substitution"]["observed"], "claude-sonnet-5-5")
+        receipt, = self.book.records()
+        self.assertEqual(receipt.resolved_tier, "sonnet")
+        self.assertIn("weekly usage 75%", receipt.adjustment)
+
+    def test_missing_invocation_ids_do_not_deduplicate_later_calls(self):
+        first = self._run("public")
+        second = self._run("public")
+        self.assertIsNone(second.error)
+        self.assertEqual(len(second.receipts), 2, "two new calls, two observation-only receipts")
+        self.assertNotEqual(first.result["bridge_run_id"], second.result["bridge_run_id"])
+        self.assertEqual(len({r.attempt_key for r in second.receipts}), 2)
+
+    def test_script_mode_shares_the_package_boundary_without_duplicates(self):
+        import sys
+        out = self._run("script")
+        self.assertEqual(len(out.receipts), 1, "script-mode receipt reached the package journal")
+        self.assertNotIn("execution_adapters", sys.modules, "a second top-level adapter module was imported")
+
+    def test_private_raw_operation_never_enters_the_boundary(self):
+        from model_router import claude_opus_bridge as cli
+        from model_router import execution_adapters as adapters
+        self.assertTrue(hasattr(cli, "_run_cli"))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(cli, "_load_config", return_value={}), \
+                patch.object(adapters, "dispatch_legacy", side_effect=AssertionError("re-entered")), \
+                patch.object(cli.subprocess, "run", return_value=SimpleNamespace(
+                    stdout=json.dumps(_SONNET_SUCCESS), stderr="", returncode=0)) as run:
+            plan = cli._prepare(self.TASK, Path(directory), review=True, model="sonnet")
+            cli._run_cli(plan)
+        run.assert_called_once()
+        self.assertEqual(self.book.records(), ())
+
 
 if __name__ == "__main__":
     unittest.main()
 
 
 class AdjustmentEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        from model_router import execution_adapters
+        owner = patch.object(execution_adapters, "RESERVATIONS", execution_adapters.ReservationBook())
+        owner.start()
+        self.addCleanup(owner.stop)
+
     @patch("claude_opus_bridge._log_decision")
     @patch("claude_opus_bridge.subprocess.run")
     def test_requested_and_effective_tiers_reach_lifecycle_and_route_log(self, run, logged):

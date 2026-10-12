@@ -56,7 +56,8 @@ def delegate_task_route():
 
 
 def guard_tool_execution(**kwargs):
-    from . import _delegated_claude_review_status, _load_config, _delegation_targets_detail
+    from . import (_delegated_claude_review_status, _load_config, _delegation_targets_detail,
+                   _unsupported_label, _unsupported_label_message)
     from .claude_delegation import TIER_FOR_TARGET
     from .claude_opus_bridge import CLAUDE_REVIEW_MODELS
 
@@ -86,6 +87,9 @@ def guard_tool_execution(**kwargs):
     for task in tasks if isinstance(tasks, list) else [args]:
         task = task if isinstance(task, dict) else {}
         goal = str(task.get("goal") or args.get("goal") or "")
+        unsupported = _unsupported_label(goal, cfg)
+        if unsupported:
+            return json.dumps({"error": _unsupported_label_message(unsupported)})
         requested_model = str(task.get("model") or args.get("model") or "").strip()
         # The review lookup reads paths out of the goal text. Raising from here
         # would make Hermes skip this whole guard (execution middleware fails
@@ -122,7 +126,7 @@ def stopped_response(message, model):
     Returning a final message instead stops the worker without contacting the
     provider or inventing task results.
     """
-    text = "[ROUTER WORKER STOPPED] " + message + " Re-dispatch this task on an available account. No work was performed by this call."
+    text = "[ROUTER WORKER STOPPED] No work was performed by this call. " + message + " Re-dispatch this task on an available account."
     usage = SimpleNamespace(input_tokens=0, output_tokens=0, total_tokens=0,
                             prompt_tokens=0, completion_tokens=0)
     return SimpleNamespace(

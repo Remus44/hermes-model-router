@@ -1455,7 +1455,7 @@ class AccountsApiTests(unittest.TestCase):
             anthropic_fetcher.assert_not_called()
             codex_fetcher.assert_not_called()
 
-    def test_save_usage_limits_updates_and_validates(self):
+    def test_save_usage_limits_updates_and_rejects_invalid_values_without_changing_config(self):
         with tempfile.TemporaryDirectory() as directory:
             config, _, _ = self._build_config(directory)
 
@@ -1466,14 +1466,85 @@ class AccountsApiTests(unittest.TestCase):
             self.assertEqual(config["usage_guard"]["accounts"]["anthropic"]["soft_percent"], 60)
             self.assertEqual(config["usage_guard"]["accounts"]["anthropic"]["hard_percent"], 85)
 
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"anthropic": {"soft_percent": 90, "hard_percent": 85}}, config))
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"anthropic": {"soft_percent": 10, "hard_percent": 150}}, config))
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"anthropic": {"soft_percent": 0, "hard_percent": 90}}, config))
-            self.assertIsNotNone(web_viewer._save_usage_limits(
-                {"nope": {"soft_percent": 10, "hard_percent": 90}}, config))
+            before = json.loads(json.dumps(config))
+            invalid_payloads = (
+                ({"anthropic": {"soft_percent": 90, "hard_percent": 85}},
+                 "Limits for 'anthropic' must satisfy 0 < soft <= hard <= 100"),
+                ({"anthropic": {"soft_percent": 10, "hard_percent": 150}}, None),
+                ({"anthropic": {"soft_percent": 0, "hard_percent": 90}}, None),
+                ({"anthropic": {"soft_percent": "nope", "hard_percent": 90}}, None),
+                ({"nope": {"soft_percent": 10, "hard_percent": 90}}, None),
+            )
+            for payload, expected_error in invalid_payloads:
+                with self.subTest(payload=payload):
+                    error = web_viewer._save_usage_limits(payload, config)
+                    self.assertIsNotNone(error)
+                    if expected_error:
+                        self.assertEqual(error, expected_error)
+                    self.assertEqual(config, before)
+
+    def test_save_usage_limits_accepts_equal_thresholds_as_integers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, _ = self._build_config(directory)
+            error = web_viewer._save_usage_limits({
+                "anthropic": {"soft_percent": 98, "hard_percent": 98},
+                "openai-codex": {"soft_percent": 100, "hard_percent": 100},
+            }, config)
+
+        self.assertIsNone(error)
+        accounts = config["usage_guard"]["accounts"]
+        self.assertEqual((accounts["anthropic"]["soft_percent"], accounts["anthropic"]["hard_percent"]), (98, 98))
+        self.assertEqual((accounts["openai-codex"]["soft_percent"], accounts["openai-codex"]["hard_percent"]), (100, 100))
+        self.assertIsInstance(accounts["anthropic"]["soft_percent"], int)
+        self.assertIsInstance(accounts["openai-codex"]["hard_percent"], int)
+
+    def test_save_usage_limits_rejects_mixed_payload_without_writing_any_account(self):
+        mixed_payloads = (
+            {
+                "anthropic": {"soft_percent": 98, "hard_percent": 98},
+                "openai-codex": {"soft_percent": 100, "hard_percent": 99},
+            },
+            {
+                "anthropic": {"soft_percent": 60, "hard_percent": 85},
+                "openai-codex": {"soft_percent": 95, "hard_percent": 90},
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for payload in mixed_payloads:
+                with self.subTest(payload=payload):
+                    config, _, _ = self._build_config(directory)
+                    before = json.loads(json.dumps(config))
+                    error = web_viewer._save_usage_limits(payload, config)
+                    self.assertEqual(error, "Limits for 'openai-codex' must satisfy 0 < soft <= hard <= 100")
+                    self.assertEqual(config, before)
+
+    def test_full_page_usage_limits_payload_accepts_equal_limits_and_preserves_step_down(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, _, _ = self._build_config(directory)
+            config_path = root / "router_config.yaml"
+            hermes_path = root / "config.yaml"
+            config_path.write_text(web_viewer.yaml.safe_dump(config), encoding="utf-8")
+            hermes_path.write_text("{}\n", encoding="utf-8")
+            payload = {
+                "callable": {**config["callable"], "terra": False},
+                "usage_limits": {
+                    "anthropic": {"soft_percent": 98, "hard_percent": 98},
+                    "openai-codex": {"soft_percent": 100, "hard_percent": 100},
+                },
+            }
+            with patch.object(web_viewer, "CONFIG_PATH", config_path), \
+                 patch.object(web_viewer, "HERMES_CONFIG_PATH", hermes_path):
+                payload["revision"] = web_viewer._config_revision()
+                status, body = web_viewer._save_config_payload(payload)
+            local = web_viewer._load_yaml_mapping(config_path.with_name("router_config.local.yaml"))
+            effective = web_viewer._effective_router_config(web_viewer._load_yaml_mapping(config_path), local)
+
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["success"])
+        self.assertFalse(local["callable"]["terra"])
+        self.assertEqual(effective["usage_guard"]["accounts"]["anthropic"]["step_down"], {"opus5": "sonnet5"})
+        self.assertEqual(effective["usage_guard"]["accounts"]["openai-codex"]["step_down"], {"sol": "terra"})
 
     def test_whole_percentages_are_saved_as_integers(self):
         config = {"usage_guard": {"accounts": {"anthropic": {"soft_percent": 70, "hard_percent": 90}}}}
@@ -1954,6 +2025,26 @@ class AccountCardTests(DashboardProbeMixin, unittest.TestCase):
         self.assertIn("account.delegation.always", codex_card)
         self.assertNotIn("data-account-toggle", codex_card)
 
+    def test_limit_inputs_allow_equal_soft_and_hard_values(self):
+        from html.parser import HTMLParser
+
+        class LimitInputs(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.bounds = {}
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "input":
+                    attrs = dict(attrs)
+                    limit = attrs.get("data-limit")
+                    if limit in {"soft", "hard"}:
+                        self.bounds[limit] = (attrs.get("min"), attrs.get("max"))
+
+        parser = LimitInputs()
+        parser.feed(self._card("anthropic", self.CLAUDE_INFO))
+        self.assertEqual(parser.bounds["soft"], ("1", "100"))
+        self.assertEqual(parser.bounds["hard"], ("1", "100"))
+
     def test_an_account_without_a_usage_source_shows_the_none_message_and_disabled_limits(self):
         card = self._card("qwen-token", self.NO_USAGE_SOURCE_INFO)
         self.assertIn("account.usage.none", card)
@@ -2256,7 +2347,7 @@ class DelegationChipTests(DashboardProbeMixin, unittest.TestCase):
         out = self._run(self.ACCOUNTS_STATE,
                         'const box=delegationChips({scope:{nodes:[]}},' + json.dumps(audits)
                         + ');console.log(JSON.stringify(box.children.map(c=>({text:c.textContent,title:c.title}))));')
-        self.assertEqual(json.loads(out), [{'text':'Claude: sonnet ✕',
+        self.assertEqual(json.loads(out), [{'text':'Claude: none ✕',
                                             'title': audits[0]['message']}])
 
     def test_router_jsonl_and_bridge_lifecycle_render_both_step_downs(self):
@@ -2952,9 +3043,7 @@ class ReasoningEffortSettingsTests(DashboardProbeMixin, unittest.TestCase):
         "tier_providers": {"luna": "openai-codex", "spark": "openai-codex", "terra": "openai-codex", "sol": "openai-codex", "grok": "xai-oauth"},
         "effort": {
             "luna": "low", "spark": "medium", "terra": "medium", "sol": "medium", "grok": "medium",
-            "opus5": "external", "sol_long": "medium", "explicit_sol": "medium",
-            "explicit_sol_xhigh": "medium", "explicit_luna_xhigh": "high",
-            "explicit_spark_xhigh": "high", "explicit_terra_xhigh": "high",
+            "opus5": "external", "sol_long": "medium",
         },
     }
 
@@ -2996,6 +3085,78 @@ class ReasoningEffortSettingsTests(DashboardProbeMixin, unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["effort"], {"luna": "low", "spark": "medium", "terra": "medium", "sol": "medium", "grok": "medium"})
         self.assertNotIn("opus5", payload["effort"])
+
+    def test_legacy_effort_keys_are_not_written_until_owner_removes_them(self):
+        shipped = json.loads(json.dumps(self.CONFIG))
+        for key in tuple(shipped["effort"]):
+            if key.startswith("explicit_"):
+                shipped["effort"].pop(key)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "router_config.yaml"
+            config_path.write_text(web_viewer.yaml.safe_dump(shipped), encoding="utf-8")
+            local = config_path.with_name("router_config.local.yaml")
+            original = "effort:\n  terra: high\n  explicit_sol: low\n  explicit_terra_xhigh: high\n"
+            local.write_text(original, encoding="utf-8")
+            status, payload = self._request(config_path, "GET")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["legacy_effort_keys"], ["explicit_sol", "explicit_terra_xhigh"])
+            self.assertEqual(local.read_text(encoding="utf-8"), original)
+            status, body = self._request(config_path, "POST", {
+                "revision": payload["revision"], "remove_legacy_effort_keys": True,
+            })
+            self.assertEqual(status, 200, body)
+            self.assertTrue(body["success"])
+            self.assertEqual(web_viewer.yaml.safe_load(local.read_text(encoding="utf-8")), {"effort": {"terra": "high"}})
+        for key in ("settings.effort.legacy.notice", "settings.effort.legacy.remove"):
+            self.i18n(key)
+        self.assertIn("function renderLegacyEffortNotice()", HTML)
+        self.assertIn("remove_legacy_effort_keys:true", HTML)
+
+    def test_get_ignores_a_broken_local_overlay_when_listing_legacy_effort_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = self._write_config(directory)
+            config_path.with_name("router_config.local.yaml").write_text("effort: [broken\n", encoding="utf-8")
+            status, payload = self._request(config_path, "GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["legacy_effort_keys"], [])
+
+    def test_invalid_effort_with_legacy_removal_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = self._write_config(directory)
+            local = config_path.with_name("router_config.local.yaml")
+            original = "effort:\n  explicit_sol: low\n  terra: high\n"
+            local.write_text(original, encoding="utf-8")
+            status, page = self._request(config_path, "GET")
+            self.assertEqual(status, 200, page)
+            status, body = self._request(config_path, "POST", {
+                "revision": page["revision"], "effort": {"terra": "max"},
+                "remove_legacy_effort_keys": True,
+            })
+            after = local.read_text(encoding="utf-8")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(after, original)
+
+    def test_false_or_non_boolean_legacy_removal_is_rejected_without_writing(self):
+        for flag in (False, "true", 1):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as directory:
+                config_path = self._write_config(directory)
+                local = config_path.with_name("router_config.local.yaml")
+                original = "effort:\n  explicit_sol: low\n"
+                local.write_text(original, encoding="utf-8")
+                status, body = self._request(config_path, "POST", {"remove_legacy_effort_keys": flag})
+                self.assertEqual(status, 400, body)
+                self.assertEqual(local.read_text(encoding="utf-8"), original)
+
+    def test_an_ordinary_save_preserves_explicit_keys_until_owner_requests_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = self._write_config(directory)
+            local = config_path.with_name("router_config.local.yaml")
+            local.write_text("effort:\n  explicit_sol: low\n  terra: low\n", encoding="utf-8")
+            status, body = self._request(config_path, "POST", {"effort": {"terra": "high"}})
+            written = web_viewer.yaml.safe_load(local.read_text(encoding="utf-8"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(written["effort"]["explicit_sol"], "low")
+        self.assertEqual(written["effort"]["terra"], "high")
 
     def test_a_valid_effort_save_writes_only_the_local_delta_and_preserves_the_shipped_file(self):
         with tempfile.TemporaryDirectory() as directory:
