@@ -5,6 +5,7 @@ Defects reproduced here remain expected failures pending an owner-scoped repair.
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,15 +229,14 @@ class F08PostMergeTests(unittest.TestCase):
                  patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
                  patch.object(triage, "_caller", return_value=root), \
                  patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=dispatch_router_pre_hook), \
-                 patch.object(model_tools, "_AGENT_LOOP_TOOLS", model_tools._AGENT_LOOP_TOOLS - {"delegate_task"}), \
                  patch.object(model_tools, "_execute_tool", side_effect=guarded_registry_execute):
                 first = model_tools.handle_function_call(
-                    "delegate_task", {"goal": "registry"}, tool_call_id="same",
+                    "delegate_claude", {"goal": "registry", "tier": "haiku"}, tool_call_id="same",
                     session_id="p02-registry", turn_id="p02:registry",
                     skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
                 )
                 replay = model_tools.handle_function_call(
-                    "delegate_task", {"goal": "registry"}, tool_call_id="same",
+                    "delegate_claude", {"goal": "registry", "tier": "haiku"}, tool_call_id="same",
                     session_id="p02-registry", turn_id="p02:registry",
                     skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
                 )
@@ -253,7 +253,111 @@ class F08PostMergeTests(unittest.TestCase):
         self.assertEqual(len(normal[2]), 1, "P02 normal executor replay reached raw dispatch twice")
         self.assertEqual(len(registry[2]), 1, "P02 registry replay reached raw dispatch twice")
         self.assertEqual(normal_delta, 1, "P02 normal executor charged a sealed replay")
-        self.assertEqual(registry_delta, 2, "P02 registry path did not charge before sealed replay")
+        self.assertEqual(registry_delta, 1, "R12-6 supported Claude registry replay charged a sealed response")
+
+    def test_r12_6_supported_claude_registry_replay_is_retained_across_exhaustion(self):
+        root = SimpleNamespace(session_id="r12-root", _delegate_depth=0)
+        book, raw_calls = execution_adapters.ReservationBook(), []
+        raw_result = json.dumps({"delegation_id": "r12-child"})
+
+        def dispatch_router_pre_hook(name, args, **hook):
+            decision = router.on_pre_tool_call(name, args, **hook)
+            return (decision or {}).get("message"), None
+
+        def guarded_registry_execute(function_name, function_args, _original_args, ids, **_kwargs):
+            return execution_adapters.guard_legacy_tool_execution(
+                tool_name=function_name, args=function_args,
+                next_call=lambda final: raw_calls.append(final) or raw_result,
+                session_id=ids.session_id, turn_id=ids.turn_id, tool_call_id=ids.tool_call_id,
+            )
+
+        def deliver(call_id, args=None):
+            return model_tools.handle_function_call(
+                "delegate_claude", args or {"goal": "registry", "tier": "haiku"}, tool_call_id=call_id,
+                session_id="r12-registry", turn_id="r12:turn",
+                skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+            )
+
+        with patch.object(execution_adapters, "RESERVATIONS", book), \
+             patch.object(router, "_load_config", return_value=self.cfg), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(triage, "_caller", return_value=root), \
+             patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=dispatch_router_pre_hook), \
+             patch.object(model_tools, "_execute_tool", side_effect=guarded_registry_execute):
+            replies = [deliver("same") for _ in range(5)]
+            changed = deliver("same", {"goal": "changed", "tier": "haiku"})
+            fresh = deliver("fresh")
+            self.assertEqual(deliver("third"), raw_result)
+            self.assertEqual(deliver("fourth"), raw_result)
+            exhausted_replay = deliver("same")
+            blocked = deliver("fifth")
+            changed_transport = router.on_pre_tool_call(
+                "delegate_task", {"goal": "registry"}, session_id="r12-registry", turn_id="r12:turn",
+                tool_call_id="same",
+            )
+
+        self.assertEqual(replies, [raw_result] * 5)
+        self.assertEqual(fresh, raw_result, "a distinct valid call must fit after retained replays")
+        self.assertEqual(exhausted_replay, raw_result)
+        self.assertIn("error", json.loads(changed))
+        self.assertIn("error", json.loads(blocked))
+        self.assertEqual(changed_transport["action"], "block")
+        self.assertIn("identity", changed_transport["message"])
+        self.assertEqual(len(raw_calls), 4)
+        self.assertEqual(triage._TURN_WORKERS.get("r12:turn"), 4)
+
+    def test_r12_6_registry_concurrency_reserves_one_admitted_attempt(self):
+        root = SimpleNamespace(session_id="r12-concurrent-root", _delegate_depth=0)
+        book, raw_calls, results = execution_adapters.ReservationBook(), [], []
+        started, release = threading.Event(), threading.Event()
+        raw_result = json.dumps({"delegation_id": "r12-concurrent-child"})
+
+        def dispatch_router_pre_hook(name, args, **hook):
+            decision = router.on_pre_tool_call(name, args, **hook)
+            return (decision or {}).get("message"), None
+
+        def guarded_registry_execute(function_name, function_args, _original_args, ids, **_kwargs):
+            def raw(final):
+                raw_calls.append(final)
+                started.set()
+                self.assertTrue(release.wait(5))
+                return raw_result
+            return execution_adapters.guard_legacy_tool_execution(
+                tool_name=function_name, args=function_args, next_call=raw,
+                session_id=ids.session_id, turn_id=ids.turn_id, tool_call_id=ids.tool_call_id,
+            )
+
+        def deliver():
+            return model_tools.handle_function_call(
+                "delegate_claude", {"goal": "registry", "tier": "haiku"}, tool_call_id="same",
+                session_id="r12-concurrent", turn_id="r12:concurrent",
+                skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+            )
+
+        with patch.object(execution_adapters, "RESERVATIONS", book), \
+             patch.object(router, "_load_config", return_value=self.cfg), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(worker_admission, "delegate_task_route", return_value=("openai-codex", "gpt-5.6-terra")), \
+             patch.object(triage, "_caller", return_value=root), \
+             patch("hermes_cli.plugins._dispatch_pre_tool_call_hooks", side_effect=dispatch_router_pre_hook), \
+             patch.object(model_tools, "_execute_tool", side_effect=guarded_registry_execute):
+            thread = threading.Thread(target=lambda: results.append(deliver()))
+            thread.start()
+            self.assertTrue(started.wait(5))
+            try:
+                with patch.object(execution_adapters, "_RECORD_TTL_SECONDS", 0):
+                    duplicate = deliver()
+            finally:
+                release.set()
+                thread.join(5)
+            replay = deliver()
+
+        self.assertEqual(results, [raw_result])
+        self.assertIn("error", json.loads(duplicate))
+        self.assertEqual(replay, raw_result)
+        self.assertEqual(len(raw_calls), 1)
+        self.assertEqual(triage._TURN_WORKERS.get("r12:concurrent"), 1)
 
     def test_f08_triage_switch_replaces_preflight_shadow_and_budget_but_keeps_the_note(self):
         decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")

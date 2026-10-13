@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import model_router as router
-from model_router import on_pre_tool_call, route_llm_request, triage
+from model_router import execution_adapters, on_pre_tool_call, route_llm_request, triage
 
 MODELS = {"luna": "gpt-6-luna", "terra": "gpt-5.6-terra", "sol": "gpt-6-sol", "grok": "grok-4.7"}
 PROVIDERS = {"luna": "openai-codex", "terra": "openai-codex", "sol": "openai-codex", "grok": "xai-oauth"}
@@ -348,6 +348,78 @@ class WorkerBudgetTests(_Patched):
         self.spawn(self.root)
         events = [e["event"] for e in self.events()]
         self.assertEqual(events, ["spawn_admitted", "spawn_blocked"])
+
+
+class RetainedAdmissionTests(_Patched):
+    root = SimpleNamespace(session_id="retained-root", _delegate_depth=0)
+
+    def spawn(self, tool, args, *, tool_call_id=None):
+        with patch.object(triage, "_caller", return_value=self.root):
+            return on_pre_tool_call(tool_name=tool, args=args, session_id="retained-root",
+                                    turn_id="retained:turn", tool_call_id=tool_call_id)
+
+    def test_stable_ids_are_one_admitted_attempt_but_missing_ids_are_distinct(self):
+        args = {"goal": "g", "tier": "haiku"}
+        self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="same"))
+        self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="same"))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 1})
+        changed = self.spawn("delegate_claude", {"goal": "changed", "tier": "haiku"}, tool_call_id="same")
+        transport = self.spawn("delegate_task", {"goal": "g"}, tool_call_id="same")
+        self.assertEqual(changed["action"], "block")
+        self.assertEqual(transport["action"], "block")
+        self.assertIn("identity", changed["message"])
+        self.assertIn("identity", transport["message"])
+
+        triage.reset_state()
+        self.assertIsNone(self.spawn("delegate_claude", args))
+        self.assertIsNone(self.spawn("delegate_claude", args))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 2})
+
+    def test_replay_exemption_expires_with_its_f05_generation(self):
+        args = {"goal": "g", "tier": "haiku"}
+        book = execution_adapters.ReservationBook()
+        invocation = execution_adapters.stable_legacy_invocation(
+            "delegate_claude", args, session_id="retained-root", turn_id="retained:turn", tool_call_id="expiry",
+        )
+        with patch.object(execution_adapters, "RESERVATIONS", book):
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="expiry"))
+            fresh, claim = book._begin(invocation.scope, invocation.key, None, 1, invocation.transport,
+                                       invocation.fingerprint, protect=True)
+            self.assertTrue(fresh)
+            self.assertTrue(book._seal_tool_response(invocation.key, claim, json.dumps({"delegation_id": "one"})))
+            book._release(invocation.key, claim)
+            self.assertTrue(triage.bind_retained_admission(invocation, claim.generation))
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="expiry"))
+            self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 1})
+            with patch.object(execution_adapters, "_RECORD_TTL_SECONDS", 0):
+                self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="expiry"))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 2})
+
+    def test_replay_exemption_is_removed_when_f05_lru_evicts_it(self):
+        args = {"goal": "g", "tier": "haiku"}
+        book = execution_adapters.ReservationBook()
+        invocation = execution_adapters.stable_legacy_invocation(
+            "delegate_claude", args, session_id="retained-root", turn_id="retained:turn", tool_call_id="lru",
+        )
+        other = execution_adapters.stable_legacy_invocation(
+            "delegate_claude", args, session_id="other-session", turn_id="other:turn", tool_call_id="other",
+        )
+        with patch.object(execution_adapters, "RESERVATIONS", book), \
+             patch.object(execution_adapters, "_MAX_RECORDS", 1):
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="lru"))
+            fresh, claim = book._begin(invocation.scope, invocation.key, None, 1, invocation.transport,
+                                       invocation.fingerprint, protect=True)
+            self.assertTrue(fresh)
+            self.assertTrue(book._seal_tool_response(invocation.key, claim, json.dumps({"delegation_id": "one"})))
+            book._release(invocation.key, claim)
+            self.assertTrue(triage.bind_retained_admission(invocation, claim.generation))
+            fresh, replacement = book._begin(other.scope, other.key, None, 1, other.transport,
+                                             other.fingerprint, protect=True)
+            self.assertTrue(fresh)
+            self.assertTrue(book._seal_tool_response(other.key, replacement, json.dumps({"delegation_id": "two"})))
+            book._release(other.key, replacement)
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="lru"))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 2})
 
 
 class WorkerBudgetOffTests(_Patched):

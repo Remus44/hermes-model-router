@@ -23,7 +23,9 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -48,6 +50,23 @@ _ORIGIN_MAX = 512
 _ORIGIN_TTL_SECONDS = 6 * 60 * 60
 _ORIGIN_AMBIGUOUS = "\x00ambiguous"
 _monotonic = time.monotonic
+
+
+@dataclass
+class _RetainedAdmission:
+    fingerprint: str
+    transport: str
+    scope: str
+    root_turn: str
+    requested: int
+    recorded_at: float
+    generation: str = ""
+
+
+# This mirrors only F05's retained stable-ID window. It is not a second capacity
+# owner: a pending entry prevents concurrent re-admission until F05 seals/unwinds.
+_RETAINED_ADMISSIONS: "OrderedDict[Any, _RetainedAdmission]" = OrderedDict()
+
 
 SCHEMA_PARAMETERS: Dict[str, Any] = {
     "type": "object",
@@ -403,6 +422,90 @@ def _child_origin_locked(child_session: str) -> Optional[str]:
     return entry[0]
 
 
+def _stable_invocation(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> Any:
+    from .execution_adapters import stable_legacy_invocation
+    return stable_legacy_invocation(tool_name, args, session_id=hook.get("session_id"),
+                                    turn_id=hook.get("turn_id"), tool_call_id=hook.get("tool_call_id"))
+
+
+def _purge_retained_admissions_locked() -> Tuple[int, float]:
+    from .execution_adapters import (StableLegacyInvocation, retained_admission_limits,
+                                     retained_invocation_generation)
+    maximum, ttl = retained_admission_limits()
+    now = _monotonic()
+    for key, entry in list(_RETAINED_ADMISSIONS.items()):
+        if now - entry.recorded_at <= ttl:
+            continue
+        if entry.generation:
+            invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
+            if retained_invocation_generation(invocation) == entry.generation:
+                entry.recorded_at = now  # protected/in-flight F05 record outlives its finished-record TTL.
+                continue
+        del _RETAINED_ADMISSIONS[key]
+    return maximum, ttl
+
+
+def _bound_retained_admissions_locked(maximum: int) -> None:
+    """Discard only mirrors whose exact F05 record has already gone away.
+
+    Matching finished, protected, and pending records are never evicted here:
+    F05 owns their LRU/TTL lifecycle, and in-flight records may temporarily
+    exceed its finished-record target as well.
+    """
+    if maximum < 1:
+        return
+    from .execution_adapters import StableLegacyInvocation, retained_invocation_generation
+    for key, entry in list(_RETAINED_ADMISSIONS.items()):
+        if len(_RETAINED_ADMISSIONS) <= maximum:
+            return
+        if not entry.generation:
+            continue
+        invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
+        if retained_invocation_generation(invocation) != entry.generation:
+            del _RETAINED_ADMISSIONS[key]
+
+
+def _retained_replay_locked(invocation: Any) -> Optional[_RetainedAdmission]:
+    entry = _RETAINED_ADMISSIONS.get(invocation.key)
+    if entry is None:
+        return None
+    if (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
+            or entry.scope != invocation.scope):
+        return _RetainedAdmission("", "", "", "", 0, 0.0, "changed")
+    if entry.generation:
+        from .execution_adapters import retained_invocation_generation
+        if retained_invocation_generation(invocation) != entry.generation:
+            del _RETAINED_ADMISSIONS[invocation.key]
+            return None
+    _RETAINED_ADMISSIONS.move_to_end(invocation.key)
+    return entry
+
+
+def bind_retained_admission(invocation: Any, generation: str, *, create: bool = True) -> bool:
+    """Bind triage's already-admitted stable invocation to its exact F05 generation."""
+    if invocation is None or not generation:
+        return False
+    with _LOCK:
+        maximum, _ttl = _purge_retained_admissions_locked()
+        entry = _RETAINED_ADMISSIONS.get(invocation.key)
+        if entry is None:
+            if not create:
+                return False
+            entry = _RetainedAdmission(invocation.fingerprint, invocation.transport, invocation.scope,
+                                       "", 1, _monotonic())
+            _RETAINED_ADMISSIONS[invocation.key] = entry
+        elif (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
+              or entry.scope != invocation.scope):
+            return False
+        elif not create and entry.generation and entry.generation != generation:
+            return False
+        entry.generation = generation
+        entry.recorded_at = _monotonic()
+        _RETAINED_ADMISSIONS.move_to_end(invocation.key)
+        _bound_retained_admissions_locked(maximum)
+    return True
+
+
 def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook: Dict[str, Any]) -> str:
     """Refusal text when this spawn exceeds the turn's admitted-attempt budget; an empty string admits it.
 
@@ -426,10 +529,19 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
         depth = 1 if ":sa-" in turn_id else 0
     requested = _requested_count(name, args)
     cap = max_workers(cfg)
+    stable = _stable_invocation(name, args, hook)
     root: Optional[str] = None
     origin_source: Optional[str] = None
+    replayed = False
     with _LOCK:
-        if depth >= 2:
+        maximum, _ttl = _purge_retained_admissions_locked()
+        retained = _retained_replay_locked(stable) if stable is not None else None
+        if retained is not None and retained.generation == "changed":
+            verdict, used = "retained_invocation_identity_changed", None
+        elif retained is not None:
+            verdict, used, replayed = "", _TURN_WORKERS.get(retained.root_turn, 0), True
+            root, origin_source = retained.root_turn, "retained_replay"
+        elif depth >= 2:
             verdict, used = "sub_worker_cannot_delegate", None
         elif depth == 1:
             linked = _child_origin_locked(session)
@@ -462,10 +574,17 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
             else:
                 verdict = ""
                 _TURN_WORKERS[root] = used + requested
-    _log(cfg, {"event": "spawn_blocked" if verdict else "spawn_admitted", "reason": verdict or None,
-               "tool": name, "depth": depth, "requested": requested, "used_before": used,
-               "root_turn": root, "origin_source": origin_source,
+        if not verdict and not replayed and stable is not None:
+            _RETAINED_ADMISSIONS[stable.key] = _RetainedAdmission(
+                stable.fingerprint, stable.transport, stable.scope, root or "", requested, _monotonic())
+        _bound_retained_admissions_locked(maximum)
+    _log(cfg, {"event": "spawn_replayed" if replayed else "spawn_blocked" if verdict else "spawn_admitted",
+               "reason": verdict or None, "tool": name, "depth": depth, "requested": requested,
+               "used_before": used, "root_turn": root, "origin_source": origin_source,
                "turn_id": turn_id, "session_id": session})
+    if verdict == "retained_invocation_identity_changed":
+        return ("Retained invocation identity changed (payload, transport, or authority) for this stable tool call. "
+                "Nothing was spawned.")
     if verdict == "turn_origin_ambiguous":
         return ("The user turn this worker started from is ambiguous (conflicting origin records), so its "
                 "budget cannot be charged to a turn. Finish the remaining work yourself. Nothing was spawned.")
@@ -488,3 +607,4 @@ def reset_state() -> None:
         _WORKER_CHILDREN.clear()
         _ROOT_TURN_BY_SESSION.clear()
         _ORIGIN_BY_CHILD.clear()
+        _RETAINED_ADMISSIONS.clear()
