@@ -2027,17 +2027,17 @@ def _classify_request(
     # conducting and the [sol] leaf it was meant to delegate -- 15 of 16 routing
     # decisions on one turn. Only the conductor label is exempt; a [spark] or
     # [sol] leaf still faces the gate, and Sol still owns every [sol] leaf.
-    design_label = _label_match(text, cfg)
-    design_stated_effort = (
-        _carried_stated_effort(
-            design_label.group("level").casefold(), design_label.group("tier").casefold(), "sol", cfg,
-        )
-        if design_label and design_label.group("level")
-        else None
-    )
     if _is_design_request(user_text) and not (
         allow_plan_label_over_design and _is_plan_labelled_worker(text, cfg)
     ):
+        design_label = _label_match(text, cfg)
+        design_stated_effort = (
+            _carried_stated_effort(
+                design_label.group("level").casefold(), design_label.group("tier").casefold(), "sol", cfg,
+            )
+            if design_label and design_label.group("level")
+            else None
+        )
         return _decision(
             "sol", "design analysis or implementation is Sol-only", cfg,
             stated_effort=design_stated_effort, mandatory=True, kind="design",
@@ -4392,9 +4392,19 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
                     config=cfg,
                 )
                 if affirmative_decision.reason not in hard_sol_reasons:
-                    decision = _decision("spark", "eligible delegated Spark subtask", cfg)
+                    decision = (
+                        _decision_with_carried_stated_effort(
+                            "spark", "eligible delegated Spark subtask", cfg, decision,
+                        )
+                        if decision.stated_effort else _decision("spark", "eligible delegated Spark subtask", cfg)
+                    )
         elif not explicit:
-            decision = _decision("spark", "eligible delegated Spark subtask", cfg)
+            decision = (
+                _decision_with_carried_stated_effort(
+                    "spark", "eligible delegated Spark subtask", cfg, decision,
+                )
+                if decision.stated_effort else _decision("spark", "eligible delegated Spark subtask", cfg)
+            )
     elif (
         subagent_marker
         and active_model == str((cfg.get("models") or {}).get("terra", ""))
@@ -6585,10 +6595,12 @@ def _delegation_target_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str
         if requested not in claude_delegation.TIERS:
             return (f"Unknown Claude tier {requested!r}; use one of: "
                     f"{', '.join(claude_delegation.TIERS)}. Nothing was spawned.")
-        target = claude_delegation.TARGET_FOR_TIER[requested]
-        unavailable = claude_delegation._unavailable(target, cfg)
+        outcome, unavailable = claude_delegation.effective_tier_viability(requested, cfg)
+        if outcome.refused:
+            return f"{outcome.refused} Nothing was spawned."
+        target = claude_delegation.TARGET_FOR_TIER[outcome.tier]
         if unavailable:
-            return (f"Claude tier \"{requested}\" ({target}) is {unavailable}. "
+            return (f"Claude tier \"{outcome.tier}\" ({target}) is {unavailable}. "
                     "Nothing was spawned.")
         return ""
 
@@ -6648,6 +6660,9 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         return None
     try:
         cfg = _load_config()
+        action = str(args.get("action") or "").strip().casefold()
+        if tool_name == "delegate_task" and action in {"list", "steer", "stop"}:
+            return None
         unsupported = _unsupported_delegation_label(args, cfg)
         if unsupported:
             return {"action": "block", "message": _unsupported_label_message(unsupported)}

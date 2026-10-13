@@ -688,6 +688,25 @@ def _strip_hidden(tasks: Any) -> Any:
 ACCOUNT = "anthropic"
 
 
+def effective_tier_outcome(requested: str, cfg: Dict[str, Any], reading: Optional[usage_guard.Reading]) -> usage_guard.GuardOutcome:
+    """Apply the handler's account step-down to a known requested Claude tier."""
+    guarded = usage_guard.apply(ACCOUNT, TARGET_FOR_TIER[requested], cfg, reading)
+    tier = TIER_FOR_TARGET.get(guarded.tier, requested)
+    return replace(
+        guarded,
+        tier=tier,
+        adjusted=f"{requested}→{tier} (weekly usage {guarded.usage})" if guarded.adjusted else "",
+    )
+
+
+def effective_tier_viability(requested: str, cfg: Dict[str, Any]) -> Tuple[usage_guard.GuardOutcome, str]:
+    """Return the current handler-effective tier and its live target availability."""
+    outcome = effective_tier_outcome(requested, cfg, usage_guard.read(ACCOUNT, cfg))
+    if outcome.refused:
+        return outcome, ""
+    return outcome, _unavailable(TARGET_FOR_TIER[outcome.tier], cfg)
+
+
 def _log(cfg: Dict[str, Any], entry: Dict[str, Any]) -> None:
     configured = str(delegation_config(cfg).get("log_path") or "").strip()
     if not configured:
@@ -791,10 +810,8 @@ def _dispatch(args: Dict[str, Any]) -> str:
     if parent is None:
         return _error("delegate_claude must be called from an agent turn; no active Hermes parent was found.")
 
-    guarded = usage_guard.apply(ACCOUNT, TARGET_FOR_TIER[requested], cfg, usage_guard.read(ACCOUNT, cfg))
-    tier = TIER_FOR_TARGET.get(guarded.tier, requested)
-    outcome = replace(guarded, tier=tier,
-                      adjusted=f"{requested}→{tier} (weekly usage {guarded.usage})" if guarded.adjusted else "")
+    outcome = effective_tier_outcome(requested, cfg, usage_guard.read(ACCOUNT, cfg))
+    tier = outcome.tier
     if outcome.refused:
         message = f"{outcome.refused} {_pointer(TARGET_FOR_TIER[requested], cfg, claude_ok=False)}"
         _audit(cfg, parent, requested, requested, outcome, "refused", message)

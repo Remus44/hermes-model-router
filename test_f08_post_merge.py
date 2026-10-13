@@ -6,6 +6,7 @@ Defects reproduced here remain expected failures pending an owner-scoped repair.
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from agent.tool_call_batches import expand_local_tool_batches
 from jsonschema import Draft202012Validator
 import model_tools
 import model_router as router
-from model_router import execution_adapters, runtime_capabilities as runtime, triage, worker_admission
+from model_router import execution_adapters, runtime_capabilities as runtime, triage, usage_guard, worker_admission
 from model_router.host_delegation_fixtures import delegate_task_request, host_delegation
 import tools.tool_search as tool_search
 from tools.tool_search import bridge_tool_schemas, resolve_underlying_call
@@ -511,6 +512,100 @@ class F08PostMergeTests(unittest.TestCase):
         self.assertEqual(self._events()[-1]["event"], "spawn_admitted")
         self.assertEqual(triage._TURN_WORKERS, {"p03:host": 1},
                          "P03: host-later refusal unexpectedly restored the admitted allowance")
+
+    def test_b_i3_pre_admission_accepts_handler_authorized_effective_claude_tier_only(self):
+        cfg = _cfg(self.directory.name)
+        cfg["usage_guard"] = {"accounts": {
+            "anthropic": {"soft_percent": 70, "hard_percent": 90, "step_down": {"opus5": "sonnet5"}},
+        }}
+        fresh_soft = usage_guard.Reading(75.0, 0.0, None, None, time.time())
+        fresh_hard = usage_guard.Reading(95.0, 0.0, None, None, time.time())
+
+        def preflight(label, *, callable_updates, reading=fresh_soft, cooldown=0.0):
+            triage.reset_state()
+            scenario = json.loads(json.dumps(cfg))
+            scenario["callable"].update(callable_updates)
+            with patch.object(router, "_load_config", return_value=scenario), \
+                 patch.object(usage_guard, "read", return_value=reading), \
+                 patch.object(router, "_tier_cooldown_remaining",
+                              side_effect=lambda tier, _cfg: cooldown if tier == "opus5" else 0.0):
+                result = router.on_pre_tool_call(
+                    "delegate_claude", {"tier": "opus", "tasks": [{"goal": "inspect"}]},
+                    session_id="b-i3", turn_id=f"b-i3:{label}", tool_call_id=label,
+                )
+            return result
+
+        for label, callable_updates, cooldown in (
+            ("switched-off", {"opus5": False, "sonnet5": True}, 0.0),
+            ("cooling", {"opus5": True, "sonnet5": True}, 60.0),
+        ):
+            with self.subTest(viable=label):
+                self.assertIsNone(preflight(label, callable_updates=callable_updates, cooldown=cooldown))
+                self.assertEqual(triage._TURN_WORKERS, {f"b-i3:{label}": 1})
+
+        for label, callable_updates, reading in (
+            ("no-step-down", {"opus5": False, "sonnet5": True}, fresh_soft),
+            ("effective-unavailable", {"opus5": False, "sonnet5": False, "haiku": True}, fresh_soft),
+            ("globally-disabled", {"opus5": False, "sonnet5": False, "haiku": False}, fresh_soft),
+            ("hard-closed", {"opus5": True, "sonnet5": True}, fresh_hard),
+        ):
+            with self.subTest(refused=label):
+                if label == "no-step-down":
+                    cfg["usage_guard"]["accounts"]["anthropic"]["step_down"] = {}
+                result = preflight(label, callable_updates=callable_updates, reading=reading)
+                self.assertEqual((result or {}).get("action"), "block")
+                self.assertEqual(triage._TURN_WORKERS, {})
+                cfg["usage_guard"]["accounts"]["anthropic"]["step_down"] = {"opus5": "sonnet5"}
+
+        triage.reset_state()
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(usage_guard, "read", return_value=fresh_soft):
+            unknown = router.on_pre_tool_call(
+                "delegate_claude", {"tier": "unknown", "tasks": [{"goal": "inspect"}]},
+                session_id="b-i3", turn_id="b-i3:unknown", tool_call_id="unknown",
+            )
+        self.assertEqual((unknown or {}).get("action"), "block")
+        self.assertEqual(triage._TURN_WORKERS, {})
+
+    def test_b_i4_supported_delegate_task_controls_bypass_ignored_spawn_fields_and_admission(self):
+        stale = {
+            "subagent_id": "sa-existing", "message": "change course", "model": "sol",
+            "tasks": [{"goal": "[sol:bogus] Implement an ignored task."}],
+        }
+        for triage_enabled in (True, False):
+            with self.subTest(triage_enabled=triage_enabled):
+                triage.reset_state()
+                cfg = _cfg(self.directory.name, triage_enabled=triage_enabled)
+                cfg["callable"]["sol"] = False
+                if triage_enabled:
+                    cfg["triage"]["max_workers_per_turn"] = 1
+                    with patch.object(router, "_load_config", return_value=cfg), \
+                         patch.object(router, "_delegation_targets_detail", return_value={}):
+                        self.assertIsNone(router.on_pre_tool_call(
+                            "delegate_task", {"goal": "ordinary spawn"}, turn_id="b-i4:triage",
+                        ))
+                        before = dict(triage._TURN_WORKERS)
+                        for action in ("list", "steer", "stop"):
+                            result = router.on_pre_tool_call(
+                                "delegate_task", {**stale, "action": action}, turn_id="b-i4:triage",
+                            )
+                            self.assertIsNone(result, action)
+                            self.assertEqual(triage._TURN_WORKERS, before, action)
+                else:
+                    budget = Path(self.directory.name) / "b-i4-bounded.jsonl"
+                    cfg["task_budget"] = {"enabled": True, "path": str(budget), "max_routing_decisions": 1}
+                    with patch.object(router, "_load_config", return_value=cfg), \
+                         patch.object(router, "_delegation_targets_detail", return_value={}):
+                        self.assertIsNone(router.on_pre_tool_call(
+                            "delegate_task", {"goal": "ordinary spawn"}, turn_id="b-i4:bounded",
+                        ))
+                        before = budget.read_text(encoding="utf-8")
+                        for action in ("list", "steer", "stop"):
+                            result = router.on_pre_tool_call(
+                                "delegate_task", {**stale, "action": action}, turn_id="b-i4:bounded",
+                            )
+                            self.assertIsNone(result, action)
+                            self.assertEqual(budget.read_text(encoding="utf-8"), before, action)
 
     def _assert_p04_advisory_is_not_forced(self):
         decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")

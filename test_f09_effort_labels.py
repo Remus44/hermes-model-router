@@ -685,7 +685,7 @@ class ExactEffortLabelTests(unittest.TestCase):
         retry.assert_not_called()
         self.assertEqual(stopped.usage.total_tokens, 0)
 
-    def test_stated_soft_step_down_reason_says_it_was_skipped_and_hard_closure_still_stops(self):
+    def test_stated_soft_step_down_reason_says_it_was_skipped(self):
         cfg = shipped_config()
         cfg["effort"]["terra"] = "high"
         reading = usage_guard.Reading(75.0, None, None, None, time.time())
@@ -694,14 +694,27 @@ class ExactEffortLabelTests(unittest.TestCase):
                 "[sol:xhigh] Inspect and report.", cfg, platform="subagent",
             )
         self.assertIn("step-down skipped, stated level", routed["reason"])
-        triage.reset_state()
-        self.addCleanup(triage.reset_state)
-        cfg["triage"] = {"enabled": True, "max_workers_per_turn": 1, "max_children_per_worker": 1}
-        with patch.object(router, "_load_config", return_value=cfg), patch.object(router, "_requested_delegation_targets", return_value=()):
-            self.assertIsNone(router.on_pre_tool_call("delegate_task", {"goal": "[sol:xhigh] Inspect and report."}, turn_id="f09-hard"))
-            refused = router.on_pre_tool_call("delegate_task", {"goal": "[sol:xhigh] Inspect and report."}, turn_id="f09-hard")
-        self.assertEqual(refused["action"], "block")
-        self.assertIn("1 of 1", refused["message"])
+
+    def test_stated_label_account_hard_closure_stops_through_execution_middleware_without_provider_call(self):
+        from hermes_cli.middleware import run_llm_execution_middleware
+
+        cfg = shipped_config()
+        cfg["usage_guard"] = {"accounts": {"openai-codex": {"soft_percent": 70, "hard_percent": 90}}}
+        manager = types.SimpleNamespace(_middleware={"llm_execution": [router.run_llm_with_transient_failover]},
+                                        _report_hook_failure=Mock())
+        downstream = Mock()
+        reading = usage_guard.Reading(95.0, 0.0, None, None, time.time())
+        worker_request = request("[sol:xhigh] Inspect and report.", cfg)
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(usage_guard, "peek", return_value=reading), \
+             patch("hermes_cli.plugins._delivery_manager", return_value=manager):
+            stopped = run_llm_execution_middleware(
+                worker_request, downstream, provider="openai-codex", platform="subagent", turn_id="f09-hard",
+            )
+        downstream.assert_not_called()
+        manager._report_hook_failure.assert_not_called()
+        self.assertEqual(stopped.usage.total_tokens, 0)
+        self.assertIn("ROUTER WORKER STOPPED", stopped.output_text)
 
     def test_stated_dispatch_refusal_names_the_exact_tier_for_cooling_and_batches(self):
         cfg = shipped_config()
@@ -725,6 +738,97 @@ class ExactEffortLabelTests(unittest.TestCase):
             claude = router.on_pre_tool_call("delegate_claude", {"goal": "[sol:high] Inspect and report."}, turn_id="f09-claude")
         self.assertEqual(task["action"], "block")
         self.assertIsNone(claude)
+
+    def test_spark_preservation_after_callable_fallback_keeps_the_stated_level_on_wire_and_route_record(self):
+        cfg = shipped_config()
+        cfg["callable"]["luna"] = False
+        cfg["effort"]["spark"] = "medium"
+        routed, record = self.route_and_record(
+            "[luna:xhigh] Inspect the parser and report.", cfg,
+            platform="subagent", turn_id="f09:sa-spark", model=cfg["models"]["spark"],
+        )
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("spark", "xhigh"), routed)
+        self.assertEqual(routed["request"]["reasoning"]["effort"], "xhigh")
+        self.assertEqual(record["effort"], "xhigh")
+
+        unsupported_cfg = shipped_config()
+        unsupported_cfg["callable"]["luna"] = False
+        refused, record = self.route_and_record(
+            "[luna:max] Inspect the parser and report.", unsupported_cfg,
+            platform="subagent", turn_id="f09:sa-spark-refusal", model=unsupported_cfg["models"]["spark"],
+        )
+        self.assertEqual(refused["metadata"]["tier"], "refused")
+        self.assertIn("cannot run on substitute tier 'spark'", refused["metadata"]["refusal"])
+        self.assertEqual(record["tier"], "refused")
+
+    def test_design_destination_validation_applies_only_when_the_design_gate_selects_sol(self):
+        cfg = shipped_config()
+        cfg["models"]["sol"] = cfg["models"]["spark"]
+        unchanged, record = self.route_and_record("[terra:max] Inspect the parser and report.", cfg)
+        self.assertEqual((unchanged["metadata"]["tier"], unchanged["metadata"]["effort"]), ("terra", "max"), unchanged)
+        self.assertNotIn("refusal", unchanged["metadata"])
+        self.assertEqual(record["effort"], "max")
+
+        stopped, record = self.route_and_record("[terra:max] Design the responsive dashboard layout.", cfg)
+        self.assertEqual(stopped["metadata"]["tier"], "refused")
+        self.assertIn("cannot run on substitute tier 'sol'", stopped["metadata"]["refusal"])
+        self.assertEqual(record["tier"], "refused")
+
+    def test_spark_leaf_site_uses_the_plan_read_only_predicate_not_root_request_predicate(self):
+        cfg = shipped_config()
+        goal = "[spark:xhigh] Assess parser branch risk."
+        self.assertTrue(router._is_spark_read_only_work(goal))
+        self.assertFalse(router._is_spark_read_only_request(goal))
+        routed, _record = self.route_and_record(
+            goal, cfg, platform="subagent", turn_id="f09:sa-plan-read-only", model=cfg["models"]["spark"],
+        )
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("spark", "xhigh"), routed)
+
+    def test_cross_provider_preservation_site_keeps_stated_level_and_mutation_loses_it(self):
+        cfg = shipped_config()
+        cfg["tier_providers"]["sol"] = "anthropic"
+        routed, record = self.route_and_record("[sol:xhigh] Inspect the parser and report.", cfg)
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "xhigh"), routed)
+        self.assertEqual((routed["request"]["reasoning"]["effort"], record["effort"]), ("xhigh", "xhigh"))
+
+        def old_plain_decision(target, reason, config, source, *, kind=None):
+            return router._decision(target, reason, config, kind=source.kind if kind is None else kind)
+
+        with patch.object(router, "_decision_with_carried_stated_effort", side_effect=old_plain_decision):
+            reverted = self.route("[sol:xhigh] Inspect the parser and report.", cfg)
+        self.assertEqual((reverted["metadata"]["tier"], reverted["metadata"]["effort"]),
+                         ("terra", cfg["effort"]["terra"]))
+
+    def test_preferred_fallback_skips_an_incompatible_effort_candidate(self):
+        cfg = shipped_config()
+        cfg["callable"]["sol"] = False
+        cfg["preferences"] = {"default": ["spark", "terra"]}
+        source = router.RouteDecision("sol", cfg["models"]["sol"], "explicit [sol:max] override", "max",
+                                      kind="default", stated_effort="max")
+        fallback = router._resolve_callable_fallback(source, cfg)
+        self.assertEqual((fallback.tier, fallback.effort), ("terra", "max"))
+
+        def old_preference_resolution(target, reason, config, source, *, kind=None):
+            return router._decision(target, reason, config, kind=source.kind if kind is None else kind)
+
+        with patch.object(router, "_decision_with_carried_stated_effort", side_effect=old_preference_resolution):
+            reverted = router._resolve_callable_fallback(source, cfg)
+        self.assertEqual((reverted.tier, reverted.effort), ("spark", cfg["effort"]["spark"]))
+
+    def test_failed_retry_makes_no_route_log_call(self):
+        cfg = shipped_config()
+        original = Mock(side_effect=RuntimeError("HTTP 503: upstream connect error"))
+        retry = Mock(side_effect=RuntimeError("retry unavailable"))
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(router, "_log_decision") as logged:
+            with self.assertRaisesRegex(RuntimeError, "retry unavailable"):
+                router.run_llm_with_transient_failover(
+                    request={**request("[sol:xhigh] Inspect and report.", cfg), "model": cfg["models"]["sol"]},
+                    next_call=original, retry_call=retry, provider="openai-codex", platform="subagent",
+                )
+        original.assert_called_once()
+        retry.assert_called_once()
+        logged.assert_not_called()
 
     def test_typed_labels_keep_read_only_routing_and_admission_with_triage_on_or_off(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
