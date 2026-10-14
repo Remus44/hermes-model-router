@@ -206,44 +206,48 @@ class ExactEffortLabelTests(unittest.TestCase):
                 self.assertEqual(routed["request"]["reasoning"]["effort"], expected)
 
     def test_stated_levels_survive_the_r12_3_route_matrix_and_match_the_route_record(self):
-        cfg = shipped_config()
         for level in ("high", "xhigh", "max"):
             with self.subTest(case="same-tier Sol design", level=level):
+                cfg = shipped_config()
                 routed, _record = self.route_and_record(
                     f"[sol:{level}] Design the responsive dashboard layout.", cfg,
                 )
                 self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("sol", level))
 
-        soft_cfg = shipped_config()
-        soft_cfg["effort"]["terra"] = "high"
-        reading = usage_guard.Reading(75.0, None, None, None, time.time())
-        with patch.object(usage_guard, "peek", return_value=reading):
+        with self.subTest(case="soft stated level"):
+            soft_cfg = shipped_config()
+            soft_cfg["effort"]["terra"] = "high"
+            reading = usage_guard.Reading(75.0, None, None, None, time.time())
+            with patch.object(usage_guard, "peek", return_value=reading):
+                routed, _record = self.route_and_record(
+                    "[sol:xhigh] Inspect the implementation and report.", soft_cfg, platform="subagent",
+                )
+            self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("sol", "xhigh"))
+            self.assertIn("step-down skipped, stated level", routed["reason"])
+
+        with self.subTest(case="disabled Sol fallback"):
+            disabled_sol_cfg = shipped_config()
+            disabled_sol_cfg["callable"]["sol"] = False
             routed, _record = self.route_and_record(
-                "[sol:xhigh] Inspect the implementation and report.", soft_cfg, platform="subagent",
+                "[sol:xhigh] Inspect the implementation and report.", disabled_sol_cfg,
             )
-        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("sol", "xhigh"))
-        self.assertIn("step-down skipped, stated level", routed["reason"])
+            self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "xhigh"), routed)
 
-        disabled_sol_cfg = shipped_config()
-        disabled_sol_cfg["callable"]["sol"] = False
-        routed, _record = self.route_and_record(
-            "[sol:xhigh] Inspect the implementation and report.", disabled_sol_cfg,
-        )
-        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "xhigh"), routed)
+        with self.subTest(case="shipped Spark fallback"):
+            shipped_spark_cfg = yaml.safe_load((ROOT / "router_config.yaml").read_text(encoding="utf-8"))
+            shipped_spark_cfg["triage"] = {"enabled": False}
+            shipped_spark_cfg["orchestration"] = {"enabled": False}
+            shipped_spark_cfg["session_policy"] = {"pin_root_parent": False}
+            shipped_spark_cfg["shadow"] = {"enabled": False}
+            routed, _record = self.route_and_record(
+                "[spark:xhigh] Inspect the local implementation and report.", shipped_spark_cfg,
+            )
+            self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("luna", "xhigh"))
 
-        shipped_spark_cfg = yaml.safe_load((ROOT / "router_config.yaml").read_text(encoding="utf-8"))
-        shipped_spark_cfg["triage"] = {"enabled": False}
-        shipped_spark_cfg["orchestration"] = {"enabled": False}
-        shipped_spark_cfg["session_policy"] = {"pin_root_parent": False}
-        shipped_spark_cfg["shadow"] = {"enabled": False}
-        routed, _record = self.route_and_record(
-            "[spark:xhigh] Inspect the local implementation and report.", shipped_spark_cfg,
-        )
-        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("luna", "xhigh"))
-
-        read_only_cfg = shipped_config()
-        routed, _record = self.route_and_record("[luna:high] Fix the parser module.", read_only_cfg)
-        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "high"))
+        with self.subTest(case="read-only substitution"):
+            read_only_cfg = shipped_config()
+            routed, _record = self.route_and_record("[luna:high] Fix the parser module.", read_only_cfg)
+            self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "high"))
 
     def test_stated_level_dispatch_refuses_an_unavailable_or_non_read_only_label_before_budgeting(self):
         triage.reset_state()
