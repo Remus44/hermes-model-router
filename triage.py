@@ -23,7 +23,9 @@ import logging
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -61,11 +63,29 @@ class _RetainedAdmission:
     requested: int
     recorded_at: float
     generation: str = ""
+    nonce: str = ""
+    state: str = "pending"
+
+
+@dataclass(frozen=True)
+class _AdmissionToken:
+    key: Any
+    fingerprint: str
+    transport: str
+    scope: str
+    nonce: str = ""
+    generation: str = ""
+    response: Any = None
+
+    @property
+    def replay(self) -> bool:
+        return bool(self.generation)
 
 
 # This mirrors only F05's retained stable-ID window. It is not a second capacity
 # owner: a pending entry prevents concurrent re-admission until F05 seals/unwinds.
 _RETAINED_ADMISSIONS: "OrderedDict[Any, _RetainedAdmission]" = OrderedDict()
+_ADMISSION_TOKEN: ContextVar[Optional[_AdmissionToken]] = ContextVar("model_router_retained_admission", default=None)
 
 
 SCHEMA_PARAMETERS: Dict[str, Any] = {
@@ -458,11 +478,16 @@ def _bound_retained_admissions_locked(maximum: int) -> None:
     for key, entry in list(_RETAINED_ADMISSIONS.items()):
         if len(_RETAINED_ADMISSIONS) <= maximum:
             return
-        if not entry.generation:
-            continue
-        invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
-        if retained_invocation_generation(invocation) != entry.generation:
+        if not entry.generation and entry.state == "pending":
+            # A hook-only admission never reached F05. Retiring its bookkeeping
+            # does not refund the already charged host attempt; a later delivery
+            # must re-admit rather than borrow this abandoned permission.
             del _RETAINED_ADMISSIONS[key]
+            continue
+        if entry.generation:
+            invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
+            if retained_invocation_generation(invocation) != entry.generation:
+                del _RETAINED_ADMISSIONS[key]
 
 
 def _retained_replay_locked(invocation: Any) -> Optional[_RetainedAdmission]:
@@ -481,7 +506,72 @@ def _retained_replay_locked(invocation: Any) -> Optional[_RetainedAdmission]:
     return entry
 
 
-def bind_retained_admission(invocation: Any, generation: str, *, create: bool = True) -> bool:
+def retained_replay_preflight(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> Optional[str]:
+    """Capture an exact sealed replay before fresh router policy checks.
+
+    The captured bytes are carried by a ContextVar only across this host call's
+    hook-to-middleware handoff.  A later F05 eviction therefore cannot turn a
+    G1 replay decision into a G2 execution authorization.
+    """
+    invocation = _stable_invocation(tool_name, args, hook)
+    if invocation is None:
+        return None
+    with _LOCK:
+        _purge_retained_admissions_locked()
+        entry = _retained_replay_locked(invocation)
+        if entry is None or not entry.generation:
+            return None
+        if entry.generation == "changed":
+            return "Retained invocation identity changed (payload, transport, or authority) for this stable tool call. Nothing was spawned."
+        from .execution_adapters import retained_invocation_response
+        retained, response = retained_invocation_response(invocation, entry.generation)
+        if not retained:
+            # An unsealed/oversized record is not a policy-exempt delivery, but
+            # it remains a live F05 generation; only drop the mirror if F05 no
+            # longer names this exact owner.
+            from .execution_adapters import retained_invocation_generation
+            if retained_invocation_generation(invocation) != entry.generation:
+                _RETAINED_ADMISSIONS.pop(invocation.key, None)
+            return None
+        _ADMISSION_TOKEN.set(_AdmissionToken(invocation.key, invocation.fingerprint, invocation.transport,
+                                             invocation.scope, generation=entry.generation, response=response))
+        return ""
+
+
+def consume_retained_admission(invocation: Any) -> Optional[_AdmissionToken]:
+    """Return this hook's exact admission once, never a key-only exemption."""
+    token = _ADMISSION_TOKEN.get()
+    if token is None or invocation is None:
+        return None
+    if (token.key != invocation.key or token.fingerprint != invocation.fingerprint
+            or token.transport != invocation.transport or token.scope != invocation.scope):
+        return None
+    _ADMISSION_TOKEN.set(None)
+    if token.replay:
+        return token
+    with _LOCK:
+        entry = _RETAINED_ADMISSIONS.get(invocation.key)
+        if (entry is None or entry.nonce != token.nonce or entry.generation
+                or entry.state != "pending"):
+            return None
+        entry.state = "started"
+        entry.recorded_at = _monotonic()
+        return token
+
+
+def has_unbound_retained_admission(invocation: Any) -> bool:
+    """Whether an admitted stable call is waiting for its one F05 owner."""
+    if invocation is None:
+        return False
+    with _LOCK:
+        entry = _RETAINED_ADMISSIONS.get(invocation.key)
+        return bool(entry is not None and not entry.generation
+                    and entry.fingerprint == invocation.fingerprint
+                    and entry.transport == invocation.transport and entry.scope == invocation.scope)
+
+
+def bind_retained_admission(invocation: Any, generation: str, *, create: bool = True,
+                            admission: Optional[_AdmissionToken] = None) -> bool:
     """Bind triage's already-admitted stable invocation to its exact F05 generation."""
     if invocation is None or not generation:
         return False
@@ -492,14 +582,18 @@ def bind_retained_admission(invocation: Any, generation: str, *, create: bool = 
             if not create:
                 return False
             entry = _RetainedAdmission(invocation.fingerprint, invocation.transport, invocation.scope,
-                                       "", 1, _monotonic())
+                                       "", 1, _monotonic(), nonce=uuid.uuid4().hex)
             _RETAINED_ADMISSIONS[invocation.key] = entry
         elif (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
               or entry.scope != invocation.scope):
             return False
+        elif admission is not None and (entry.nonce != admission.nonce or entry.state not in {"pending", "started"}
+                                        or entry.generation):
+            return False
         elif not create and entry.generation and entry.generation != generation:
             return False
         entry.generation = generation
+        entry.state = "bound"
         entry.recorded_at = _monotonic()
         _RETAINED_ADMISSIONS.move_to_end(invocation.key)
         _bound_retained_admissions_locked(maximum)
@@ -575,8 +669,14 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
                 verdict = ""
                 _TURN_WORKERS[root] = used + requested
         if not verdict and not replayed and stable is not None:
+            nonce = uuid.uuid4().hex
             _RETAINED_ADMISSIONS[stable.key] = _RetainedAdmission(
-                stable.fingerprint, stable.transport, stable.scope, root or "", requested, _monotonic())
+                stable.fingerprint, stable.transport, stable.scope, root or "", requested, _monotonic(), nonce=nonce)
+            _ADMISSION_TOKEN.set(_AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
+                                                 nonce=nonce))
+        elif not verdict and replayed and stable is not None and retained is not None and not retained.generation:
+            _ADMISSION_TOKEN.set(_AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
+                                                 nonce=retained.nonce))
         _bound_retained_admissions_locked(maximum)
     _log(cfg, {"event": "spawn_replayed" if replayed else "spawn_blocked" if verdict else "spawn_admitted",
                "reason": verdict or None, "tool": name, "depth": depth, "requested": requested,

@@ -6672,6 +6672,11 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         declined = _declined_conductor_goal(args, cfg, str(_.get("turn_id") or ""))
         if declined:
             return {"action": "block", "message": declined}
+        retained_replay = triage.retained_replay_preflight(tool_name, args, _)
+        if retained_replay is not None:
+            if retained_replay:
+                return {"action": "block", "message": retained_replay}
+            return None
         unavailable_target = _delegation_target_block(tool_name, args, cfg)
         if unavailable_target:
             return {"action": "block", "message": unavailable_target}
