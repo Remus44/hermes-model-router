@@ -13,9 +13,10 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Tuple
 
 from . import execution_contracts as contracts
 from . import worker_admission
@@ -117,7 +118,7 @@ class ReservationBook:
 
     def _begin(self, scope: str, key: AttemptKey, limit: Optional[int], weight: int,
                transport: str, fingerprint: str = "", *,
-               protect: bool = False) -> Tuple[bool, Optional[_Claim]]:
+               protect: bool = False, expected_generation: str = "") -> Tuple[bool, Optional[_Claim]]:
         """``limit=None`` records the attempt without capacity accounting (every
         legacy dispatch). ``protect`` pins a public invocation until it is sealed
         or released."""
@@ -131,6 +132,8 @@ class ReservationBook:
                 return False, None
             self._purge_locked()
             existing = self._claims.get(key)
+            if expected_generation and (existing is None or existing.generation != expected_generation):
+                return False, None  # a retained handoff cannot authorize a fresh/replacement claim
             if existing is not None:
                 if (existing.scope != scope or existing.receipt.transport != transport
                         or existing.fingerprint != fingerprint):
@@ -293,6 +296,22 @@ def retained_invocation_generation(invocation: StableLegacyInvocation) -> Option
 def retained_invocation_response(invocation: StableLegacyInvocation, generation: str) -> Tuple[bool, Any]:
     """Capture bytes only from the exact still-retained F05 generation."""
     return RESERVATIONS.retained_response(invocation, generation)
+
+
+@contextmanager
+def retained_invocation_binding(invocation: StableLegacyInvocation, generation: str) -> Iterator[bool]:
+    """Pin only the metadata validation/write window, never execution or I/O.
+
+    Called with triage's lock held. Keep the existing triage -> journal order
+    until its mirror write finishes so _begin cannot replace the validated G1.
+    """
+    book = RESERVATIONS
+    with book._lock:
+        book._purge_locked()
+        claim = book._claims.get(invocation.key)
+        yield bool(claim is not None and claim.generation == generation
+                   and claim.scope == invocation.scope and claim.receipt.transport == invocation.transport
+                   and claim.fingerprint == invocation.fingerprint)
 
 
 def retained_admission_limits() -> Tuple[int, float]:
@@ -516,15 +535,17 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
                 return admission.response
         except Exception:
             admission = None
+        if admission is not None and admission.lost:
+            return json.dumps({"error": "Invocation admission was retired or expired before F05. Nothing was spawned by this call."})
         # Own the public invocation before its legacy admission can read usage,
         # enter a Claude reasoning scope or write an audit. A duplicate can only
         # replay a sealed final response; while its owner is still running it
         # reports pending/unknown without touching the raw seam.
         fresh, claim = owner._begin(stable.scope, stable.key, None, 1, stable.transport,
-                                    stable.fingerprint, protect=True)
+                                    stable.fingerprint, protect=True,
+                                    expected_generation=admission.generation if admission is not None else "")
         if not fresh:
             if claim is not None:
-                _bind_retained_triage_admission(stable, claim.generation)
                 if claim.sealed and claim.cached:
                     return claim.response
             return json.dumps({"error": "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})

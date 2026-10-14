@@ -6694,8 +6694,20 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         return None
 
 
+def on_post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, **_: Any) -> None:
+    """Retire only a pre-hook owner the host refused before F05 could consume it."""
+    if tool_name not in {"delegate_task", claude_delegation.TOOL_NAME} or not isinstance(args, dict):
+        return
+    try:
+        triage.retire_pending_admission(tool_name, args, _)
+    except Exception as exc:  # pragma: no cover - observer path must fail open
+        _logger.debug("delegate_task post-tool lifecycle skipped: %s", exc)
+
+
 def register(ctx: Any) -> None:
+    ctx.register_middleware("tool_request", triage.initialize_retained_admission)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    ctx.register_hook("post_tool_call", on_post_tool_call)
     ctx.register_middleware("llm_request", route_llm_request)
     ctx.register_middleware("llm_execution", run_llm_with_transient_failover)
     from .execution_adapters import guard_legacy_tool_execution

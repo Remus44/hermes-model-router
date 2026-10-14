@@ -27,7 +27,7 @@ import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -76,16 +76,28 @@ class _AdmissionToken:
     nonce: str = ""
     generation: str = ""
     response: Any = None
+    sealed: bool = False
+    owner: bool = False
+    lost: bool = False
 
     @property
     def replay(self) -> bool:
-        return bool(self.generation)
+        return self.sealed
+
+
+@dataclass
+class _AdmissionHandoff:
+    key: Any
+    token: Optional[_AdmissionToken] = None
+    consumed: bool = False
+    closed: bool = False
 
 
 # This mirrors only F05's retained stable-ID window. It is not a second capacity
 # owner: a pending entry prevents concurrent re-admission until F05 seals/unwinds.
 _RETAINED_ADMISSIONS: "OrderedDict[Any, _RetainedAdmission]" = OrderedDict()
 _ADMISSION_TOKEN: ContextVar[Optional[_AdmissionToken]] = ContextVar("model_router_retained_admission", default=None)
+_ADMISSION_HANDOFF: ContextVar[Optional[_AdmissionHandoff]] = ContextVar("model_router_admission_handoff", default=None)
 
 
 SCHEMA_PARAMETERS: Dict[str, Any] = {
@@ -465,29 +477,45 @@ def _purge_retained_admissions_locked() -> Tuple[int, float]:
     return maximum, ttl
 
 
-def _bound_retained_admissions_locked(maximum: int) -> None:
-    """Discard only mirrors whose exact F05 record has already gone away.
+def initialize_retained_admission(**kwargs: Any) -> None:
+    """Open a call-local cell on the host caller before bounded hook contexts.
 
-    Matching finished, protected, and pending records are never evicted here:
-    F05 owns their LRU/TTL lifecycle, and in-flight records may temporarily
-    exceed its finished-record target as well.
+    Request middleware runs synchronously. Host hooks copy that Context, not
+    assignments made inside another callback. The shared cell transfers only
+    our canonical token; it adds no authority/identity fields to tool args.
     """
-    if maximum < 1:
+    invocation = _stable_invocation(kwargs.get("tool_name", ""), kwargs.get("args") or {}, kwargs)
+    _ADMISSION_TOKEN.set(None)
+    _ADMISSION_HANDOFF.set(_AdmissionHandoff(invocation.key) if invocation is not None else None)
+
+
+def _set_admission_locked(token: _AdmissionToken) -> None:
+    handoff = _ADMISSION_HANDOFF.get()
+    if handoff is not None and handoff.key == token.key:
+        if not handoff.closed and not handoff.consumed:
+            handoff.token = token
         return
+    # Direct/older host hook callers with no upstream request middleware.
+    _ADMISSION_TOKEN.set(token)
+
+
+def _bound_retained_admissions_locked(maximum: int) -> None:
+    """Cap hook-only pending owners; matching F05 records follow its lifecycle.
+
+    Bound records cannot evict a fresh pending arrival before F05 has a chance
+    to evict its finished LRU record. Active F05 records may exceed its target.
+    """
     from .execution_adapters import StableLegacyInvocation, retained_invocation_generation
     for key, entry in list(_RETAINED_ADMISSIONS.items()):
-        if len(_RETAINED_ADMISSIONS) <= maximum:
-            return
-        if not entry.generation and entry.state == "pending":
-            # A hook-only admission never reached F05. Retiring its bookkeeping
-            # does not refund the already charged host attempt; a later delivery
-            # must re-admit rather than borrow this abandoned permission.
-            del _RETAINED_ADMISSIONS[key]
-            continue
         if entry.generation:
             invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
             if retained_invocation_generation(invocation) != entry.generation:
                 del _RETAINED_ADMISSIONS[key]
+    pending = [key for key, entry in _RETAINED_ADMISSIONS.items()
+               if not entry.generation and entry.state in {"pending", "started"}]
+    if maximum > 0:
+        for key in pending[:-maximum]:
+            del _RETAINED_ADMISSIONS[key]  # retire bookkeeping, never refund
 
 
 def _retained_replay_locked(invocation: Any) -> Optional[_RetainedAdmission]:
@@ -509,9 +537,9 @@ def _retained_replay_locked(invocation: Any) -> Optional[_RetainedAdmission]:
 def retained_replay_preflight(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> Optional[str]:
     """Capture an exact sealed replay before fresh router policy checks.
 
-    The captured bytes are carried by a ContextVar only across this host call's
-    hook-to-middleware handoff.  A later F05 eviction therefore cannot turn a
-    G1 replay decision into a G2 execution authorization.
+    The exact immutable token travels in the caller's shared handoff cell (or
+    in the direct-hook ContextVar for older callers). Captured G1 bytes remain
+    deliverable after F05 eviction without granting any G2 authorization.
     """
     invocation = _stable_invocation(tool_name, args, hook)
     if invocation is None:
@@ -533,30 +561,86 @@ def retained_replay_preflight(tool_name: str, args: Dict[str, Any], hook: Dict[s
             if retained_invocation_generation(invocation) != entry.generation:
                 _RETAINED_ADMISSIONS.pop(invocation.key, None)
             return None
-        _ADMISSION_TOKEN.set(_AdmissionToken(invocation.key, invocation.fingerprint, invocation.transport,
-                                             invocation.scope, generation=entry.generation, response=response))
+        _set_admission_locked(_AdmissionToken(invocation.key, invocation.fingerprint, invocation.transport,
+                                             invocation.scope, nonce=entry.nonce, generation=entry.generation,
+                                             response=response, sealed=True))
         return ""
 
 
+def _matches_admission(token: _AdmissionToken, invocation: Any) -> bool:
+    return (token.key == invocation.key and token.fingerprint == invocation.fingerprint
+            and token.transport == invocation.transport and token.scope == invocation.scope)
+
+
 def consume_retained_admission(invocation: Any) -> Optional[_AdmissionToken]:
-    """Return this hook's exact admission once, never a key-only exemption."""
-    token = _ADMISSION_TOKEN.get()
-    if token is None or invocation is None:
+    """Consume the exact call's handoff; absent legacy tokens are not lost tokens."""
+    if invocation is None:
         return None
-    if (token.key != invocation.key or token.fingerprint != invocation.fingerprint
-            or token.transport != invocation.transport or token.scope != invocation.scope):
-        return None
-    _ADMISSION_TOKEN.set(None)
-    if token.replay:
-        return token
     with _LOCK:
+        handoff = _ADMISSION_HANDOFF.get()
+        if handoff is not None and handoff.key == invocation.key:
+            if handoff.closed or handoff.consumed:
+                return _AdmissionToken(invocation.key, invocation.fingerprint, invocation.transport,
+                                       invocation.scope, lost=True)
+            token = handoff.token
+            handoff.consumed = True
+        else:
+            token = _ADMISSION_TOKEN.get()
+            if token is not None and token.key != invocation.key:
+                return None  # an unrelated legacy call does not consume this token
+            _ADMISSION_TOKEN.set(None)
+        if token is None:
+            return None  # deliberately uncorrelated/no-budget-hook legacy path
+        if not _matches_admission(token, invocation):
+            return replace(token, lost=True)
+        if token.replay:
+            return token  # immutable exact sealed bytes, not a fresh authorization
+        _purge_retained_admissions_locked()
         entry = _RETAINED_ADMISSIONS.get(invocation.key)
-        if (entry is None or entry.nonce != token.nonce or entry.generation
-                or entry.state != "pending"):
-            return None
+        if (entry is None or entry.nonce != token.nonce or entry.fingerprint != token.fingerprint
+                or entry.transport != token.transport or entry.scope != token.scope
+                or (token.generation and entry.generation != token.generation)):
+            return replace(token, lost=True)
+        if entry.generation:
+            from .execution_adapters import retained_invocation_generation
+            if retained_invocation_generation(invocation) != entry.generation:
+                return replace(token, lost=True)
+            return replace(token, generation=entry.generation)
+        if entry.state not in {"pending", "started"}:
+            return replace(token, lost=True)
         entry.state = "started"
         entry.recorded_at = _monotonic()
         return token
+
+
+def retire_pending_admission(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> bool:
+    """Close only this delivery's still-pending owner, never refund or retire a join."""
+    invocation = _stable_invocation(tool_name, args, hook)
+    if invocation is None:
+        return False
+    with _LOCK:
+        handoff = _ADMISSION_HANDOFF.get()
+        correlated = handoff is not None and handoff.key == invocation.key
+        if handoff is not None and correlated:
+            token = handoff.token
+            handoff.closed = True
+            handoff.token = None  # release captured bytes in caller and copied contexts
+        else:
+            token = _ADMISSION_TOKEN.get()
+            _ADMISSION_TOKEN.set(None)
+        if (token is None or token.replay or not token.owner or token.key != invocation.key
+                or (not correlated and not _matches_admission(token, invocation))):
+            return False
+        entry = _RETAINED_ADMISSIONS.get(token.key)
+        # A later host args rewrite can refuse F05, but cannot strand its
+        # original admission. Correlate retirement to our immutable token and
+        # exact mirror nonce/identity, never to the rewritten payload's authority.
+        if (entry is not None and entry.nonce == token.nonce and not entry.generation
+                and entry.state == "pending" and entry.fingerprint == token.fingerprint
+                and entry.transport == token.transport and entry.scope == token.scope):
+            del _RETAINED_ADMISSIONS[invocation.key]
+            return True
+    return False
 
 
 def has_unbound_retained_admission(invocation: Any) -> bool:
@@ -576,26 +660,31 @@ def bind_retained_admission(invocation: Any, generation: str, *, create: bool = 
     if invocation is None or not generation:
         return False
     with _LOCK:
+        from .execution_adapters import retained_invocation_binding
         maximum, _ttl = _purge_retained_admissions_locked()
-        entry = _RETAINED_ADMISSIONS.get(invocation.key)
-        if entry is None:
-            if not create:
+        recorded_at = _monotonic()
+        with retained_invocation_binding(invocation, generation) as current:
+            if not current:
                 return False
-            entry = _RetainedAdmission(invocation.fingerprint, invocation.transport, invocation.scope,
-                                       "", 1, _monotonic(), nonce=uuid.uuid4().hex)
-            _RETAINED_ADMISSIONS[invocation.key] = entry
-        elif (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
-              or entry.scope != invocation.scope):
-            return False
-        elif admission is not None and (entry.nonce != admission.nonce or entry.state not in {"pending", "started"}
-                                        or entry.generation):
-            return False
-        elif not create and entry.generation and entry.generation != generation:
-            return False
-        entry.generation = generation
-        entry.state = "bound"
-        entry.recorded_at = _monotonic()
-        _RETAINED_ADMISSIONS.move_to_end(invocation.key)
+            entry = _RETAINED_ADMISSIONS.get(invocation.key)
+            if entry is None:
+                if not create or admission is not None:
+                    return False
+                entry = _RetainedAdmission(invocation.fingerprint, invocation.transport, invocation.scope,
+                                           "", 1, recorded_at, nonce=uuid.uuid4().hex)
+                _RETAINED_ADMISSIONS[invocation.key] = entry
+            elif (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
+                  or entry.scope != invocation.scope):
+                return False
+            elif admission is not None and (entry.nonce != admission.nonce
+                                            or entry.state not in {"pending", "started", "bound"}):
+                return False
+            if entry.generation and entry.generation != generation:
+                return False
+            entry.generation = generation
+            entry.state = "bound"
+            entry.recorded_at = recorded_at
+            _RETAINED_ADMISSIONS.move_to_end(invocation.key)
         _bound_retained_admissions_locked(maximum)
     return True
 
@@ -627,10 +716,14 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
     root: Optional[str] = None
     origin_source: Optional[str] = None
     replayed = False
+    admission = None
     with _LOCK:
         maximum, _ttl = _purge_retained_admissions_locked()
         retained = _retained_replay_locked(stable) if stable is not None else None
-        if retained is not None and retained.generation == "changed":
+        handoff = _ADMISSION_HANDOFF.get()
+        if stable is not None and handoff is not None and handoff.key == stable.key and handoff.closed:
+            verdict, used = "stale_admission", None  # a late bounded callback cannot resurrect a closed call
+        elif retained is not None and retained.generation == "changed":
             verdict, used = "retained_invocation_identity_changed", None
         elif retained is not None:
             verdict, used, replayed = "", _TURN_WORKERS.get(retained.root_turn, 0), True
@@ -672,12 +765,23 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
             nonce = uuid.uuid4().hex
             _RETAINED_ADMISSIONS[stable.key] = _RetainedAdmission(
                 stable.fingerprint, stable.transport, stable.scope, root or "", requested, _monotonic(), nonce=nonce)
-            _ADMISSION_TOKEN.set(_AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
-                                                 nonce=nonce))
-        elif not verdict and replayed and stable is not None and retained is not None and not retained.generation:
-            _ADMISSION_TOKEN.set(_AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
-                                                 nonce=retained.nonce))
+            admission = _AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
+                                        nonce=nonce, owner=True)
+            _set_admission_locked(admission)
+        elif not verdict and replayed and stable is not None and retained is not None:
+            admission = _AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
+                                        nonce=retained.nonce, generation=retained.generation, owner=False)
+            _set_admission_locked(admission)
         _bound_retained_admissions_locked(maximum)
+    if not verdict and admission is not None and stable is not None:
+        from .execution_adapters import _NATIVE_INVOCATION
+        outer = _NATIVE_INVOCATION.get()
+        # Normal executor ordering: F05 owns this public invocation BEFORE
+        # its inner pre-hook admits it. Bind that already-owned exact claim,
+        # rather than leaving an unbound slot that could authorize a later G2.
+        if outer is not None and outer[0] == stable.key and outer[2][0] is not None:
+            if not bind_retained_admission(stable, outer[2][0].generation, create=False, admission=admission):
+                verdict, replayed = "stale_admission", False
     _log(cfg, {"event": "spawn_replayed" if replayed else "spawn_blocked" if verdict else "spawn_admitted",
                "reason": verdict or None, "tool": name, "depth": depth, "requested": requested,
                "used_before": used, "root_turn": root, "origin_source": origin_source,
@@ -685,6 +789,8 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
     if verdict == "retained_invocation_identity_changed":
         return ("Retained invocation identity changed (payload, transport, or authority) for this stable tool call. "
                 "Nothing was spawned.")
+    if verdict == "stale_admission":
+        return "Invocation admission became stale before outer F05 binding. Nothing was spawned."
     if verdict == "turn_origin_ambiguous":
         return ("The user turn this worker started from is ambiguous (conflicting origin records), so its "
                 "budget cannot be charged to a turn. Finish the remaining work yourself. Nothing was spawned.")
@@ -702,6 +808,8 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
 
 def reset_state() -> None:
     """Tests only."""
+    _ADMISSION_TOKEN.set(None)
+    _ADMISSION_HANDOFF.set(None)
     with _LOCK:
         _TURN_WORKERS.clear()
         _WORKER_CHILDREN.clear()
