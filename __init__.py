@@ -2542,6 +2542,45 @@ def _rejects_forced_tool_choice(request: Dict[str, Any]) -> bool:
     return bool(_NO_FORCED_CHOICE_MODEL.search(str(request.get("model") or "").casefold()))
 
 
+def _reconcile_advisory_tool_choice(request: Dict[str, Any], *, operation: str) -> str:
+    """Make an advisory Anthropic request legal without discarding exact authority.
+
+    The current host emits Anthropic ``tool_choice`` as ``auto``, ``any``, or
+    ``tool`` with a name.  ``any`` is a generic mandatory-call constraint and
+    can become ``auto`` when this route cannot force a call.  A named choice is
+    an authoritative exact demand and must stop visibly instead of being
+    weakened.  Unknown shapes are refused as well: relaxing one could erase an
+    exact name carried in an unsupported representation.
+    """
+    if "tool_choice" not in request:
+        return ""
+    choice = request.get("tool_choice")
+    if choice is None or (isinstance(choice, str) and choice in {"auto", "none"}):
+        return ""
+    if choice == "required":
+        request["tool_choice"] = {"type": "auto"}
+        return ""
+    if isinstance(choice, str):
+        return f"Cannot run advisory {operation} because exact tool '{choice}' is required."
+    if not isinstance(choice, dict):
+        return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
+    choice_type = str(choice.get("type") or "").casefold()
+    if choice_type in {"", "auto", "none"}:
+        return "" if choice_type else (
+            f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
+        )
+    if choice_type == "any":
+        request["tool_choice"] = {"type": "auto"}
+        return ""
+    name = choice.get("name")
+    if not isinstance(name, str):
+        function = choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+    if isinstance(name, str) and name.strip():
+        return f"Cannot run advisory {operation} because exact tool '{name}' is required."
+    return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
+
+
 def _supports_forced_tool_choice(kwargs: Dict[str, Any], decision: RouteDecision) -> bool:
     """Whether this route can be made to call a tool by protocol.
 
@@ -3371,6 +3410,11 @@ def _prepare_orchestration_delegation(
     orchestrator_tier = _conductor_tier(cfg, request, parent_tier)
 
     routed = deepcopy(request)
+    if not force_tools and _rejects_forced_tool_choice(routed):
+        refusal = _reconcile_advisory_tool_choice(routed, operation="preflight")
+        if refusal:
+            routed["_model_router_refusal"] = refusal
+            return routed
     claude_kind, claude_target, balanced = claude_choice
     claude_tool, via_bridge = _claude_route_tool(request) if claude_target else (None, False)
     if claude_tool is None:
@@ -4170,10 +4214,16 @@ def _triage_request(
     forced = triage.force(request, cfg, anthropic=_is_anthropic_shaped(request)) if reason is None else None
     if reason is None and forced is None:
         reason = "no_triage_tool"
+    refusal = str((forced or {}).get("_model_router_refusal") or "") if isinstance(forced, dict) else ""
+    advisory = bool(forced is not None and isinstance(request, dict) and _rejects_forced_tool_choice(request))
+    if refusal:
+        reason = "authoritative_tool_choice"
     # Mid-loop and worker calls are every call but one: logging them buries the signal.
     if reason not in {"mid_loop_call", "subagent_turn"}:
         triage._log(cfg, {
-            "event": "triage_forced" if forced is not None else "triage_skipped",
+            "event": ("triage_skipped" if refusal else
+                      "triage_advisory" if advisory else
+                      "triage_forced" if forced is not None else "triage_skipped"),
             "reason": reason, "kind": kind, "turn_id": str(kwargs.get("turn_id") or ""),
             "parent_model": decision.tier, "prompt_preview": _prompt_preview(request or {})[:160],
         })

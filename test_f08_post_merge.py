@@ -10,7 +10,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent import relay_tools, tool_executor
 from agent.tool_call_batches import expand_local_tool_batches
@@ -620,13 +620,162 @@ class F08PostMergeTests(unittest.TestCase):
         self.assertEqual(self._events()[-1]["event"], "triage_advisory",
                          "P04: advisory rewrite was logged as triage_forced")
 
-    @unittest.expectedFailure  # F08 P04: owner decision pending
     def test_p04_advisory_claude_five_rewrite_is_not_telemetry_forced(self):
         self._assert_p04_advisory_is_not_forced()
 
-    def test_p04_red_evidence_is_an_assertion(self):
-        with self.assertRaisesRegex(AssertionError, "P04: advisory rewrite"):
-            self._assert_p04_advisory_is_not_forced()
+    # --- R12-7: advisory tool-choice compatibility --------------------------------
+
+    @staticmethod
+    def _r12_7_direct_triage_request(model, *, thinking):
+        request = _anthropic_request(model, thinking=thinking)
+        request["tools"] = [
+            {"name": triage.TOOL_NAME, "input_schema": triage.SCHEMA_PARAMETERS},
+            *request["tools"],
+        ]
+        return request
+
+    def test_r12_7_triage_advisory_downgrades_generic_any_without_mutating_or_pinning(self):
+        advisory_models = (
+            ("claude-opus-5-5", False),
+            ("claude-opus-5-5", True),
+            ("claude-sonnet-4-6", True),
+        )
+        for shape, build in (("bridge", _anthropic_request), ("direct", self._r12_7_direct_triage_request)):
+            for model, thinking in advisory_models:
+                with self.subTest(shape=shape, model=model, thinking=thinking):
+                    request = build(model, thinking=thinking)
+                    request["tool_choice"] = {"type": "any"}
+                    original = json.loads(json.dumps(request))
+                    routed = triage.force(request, self.cfg, anthropic=True)
+                    self.assertEqual(request, original, "R12-7: triage mutated the caller request")
+                    self.assertEqual(routed["tool_choice"], {"type": "auto"})
+                    self.assertEqual(len(routed["tools"]), len(request["tools"]),
+                                     "R12-7: advisory triage narrowed the toolset")
+                    self.assertIn("[ROUTER TRIAGE]", routed["messages"][-1]["content"][-1]["text"])
+                    if shape == "bridge":
+                        schema = next(tool for tool in routed["tools"] if tool["name"] == "mcp__tool_call")["input_schema"]
+                        self.assertEqual(schema["required"], ["name", "arguments"],
+                                         "R12-7: advisory bridge pinning changed")
+                        name = schema["properties"]["calls"]["items"]["properties"]["name"]
+                        self.assertNotEqual(name.get("enum"), [triage.TOOL_NAME])
+                        self.assertNotIn("const", name)
+
+    def test_r12_7_triage_advisory_preserves_auto_and_forces_legal_older_control(self):
+        advisory = _anthropic_request("claude-opus-5-5", thinking=False)
+        advisory["tool_choice"] = {"type": "auto"}
+        original = json.loads(json.dumps(advisory))
+        routed = triage.force(advisory, self.cfg, anthropic=True)
+        self.assertEqual(advisory, original)
+        self.assertEqual(routed["tool_choice"], {"type": "auto"})
+
+        forced = _anthropic_request("claude-haiku-4-5", thinking=False)
+        forced["tool_choice"] = {"type": "any"}
+        forced_original = json.loads(json.dumps(forced))
+        legal = triage.force(forced, self.cfg, anthropic=True)
+        self.assertEqual(forced, forced_original)
+        self.assertEqual(legal["tool_choice"], {"type": "tool", "name": "mcp__tool_call"})
+        self.assertEqual([tool["name"] for tool in legal["tools"]], ["mcp__tool_call"])
+
+    def test_r12_7_triage_advisory_refuses_named_authority_in_each_supported_shape(self):
+        advisory_models = (
+            ("claude-opus-5-5", False),
+            ("claude-opus-5-5", True),
+            ("claude-sonnet-4-6", True),
+        )
+        for shape, build in (("bridge", _anthropic_request), ("direct", self._r12_7_direct_triage_request)):
+            for model, thinking in advisory_models:
+                with self.subTest(shape=shape, model=model, thinking=thinking):
+                    request = build(model, thinking=thinking)
+                    request["tool_choice"] = {"type": "tool", "name": "mcp__web_search"}
+                    original = json.loads(json.dumps(request))
+                    refused = triage.force(request, self.cfg, anthropic=True)
+                    self.assertEqual(request, original, "R12-7: triage mutated an exact choice request")
+                    self.assertEqual(refused["_model_router_refusal"],
+                                     "Cannot run advisory triage because exact tool 'mcp__web_search' is required.")
+                    self.assertEqual(refused["tools"], request["tools"])
+                    self.assertNotIn("[ROUTER TRIAGE]", json.dumps(refused))
+
+    def test_r12_7_named_advisory_choice_stops_through_registered_host_chain(self):
+        from hermes_cli import plugins
+        from hermes_cli.middleware import apply_llm_request_middleware, run_llm_execution_middleware
+        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+
+        cfg = _cfg(self.directory.name)
+        cfg.update(provider="anthropic", models={"terra": "claude-opus-5-5"},
+                   tier_providers={"terra": "anthropic"})
+        request = _anthropic_request("claude-opus-5-5", thinking=False)
+        request["tool_choice"] = {"type": "tool", "name": "mcp__web_search"}
+        original = json.loads(json.dumps(request))
+        manager = PluginManager()
+        manager._discovered = True
+        ctx = PluginContext(PluginManifest(name="r12-7", source="test", key="r12-7"), manager)
+        terminal = Mock(return_value="ORDINARY PROVIDER EXECUTED")
+        active_before = router.claude_delegation._ACTIVE
+        availability_before = router.claude_delegation._LAST_AVAILABLE
+        self.addCleanup(setattr, router.claude_delegation, "_ACTIVE", active_before)
+        self.addCleanup(setattr, router.claude_delegation, "_LAST_AVAILABLE", availability_before)
+        with patch.object(plugins, "_plugin_manager", manager), \
+             patch("hermes_cli.plugins._delivery_manager", return_value=manager), \
+             patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(router, "_run_opus5_bridge") as bridge:
+            router.register(ctx)
+            self.addCleanup(lambda: [registration.dispose() for registration in reversed(manager._registration_order)])
+            composed = apply_llm_request_middleware(
+                request, model="claude-opus-5-5", provider="anthropic", api_mode="anthropic_messages",
+                api_call_count=1, platform="cli", turn_id="r12-7:exact",
+            )
+            stopped = run_llm_execution_middleware(
+                composed.payload, terminal, provider="anthropic", api_mode="anthropic_messages",
+                api_call_count=1, platform="cli", turn_id="r12-7:exact",
+            )
+        self.assertEqual(request, original, "R12-7: host request composition mutated input")
+        self.assertEqual(composed.payload["_model_router_refusal"],
+                         "Cannot run advisory triage because exact tool 'mcp__web_search' is required.")
+        self.assertEqual(len(composed.payload["tools"]), len(request["tools"]))
+        self.assertEqual(self._events(cfg)[-1]["event"], "triage_skipped")
+        self.assertEqual(self._events(cfg)[-1]["reason"], "authoritative_tool_choice")
+        terminal.assert_not_called()
+        bridge.assert_not_called()
+        self.assertEqual(stopped.usage.total_tokens, 0)
+        self.assertIn("ROUTER WORKER STOPPED", stopped.output_text)
+        self.assertIn("exact tool 'mcp__web_search'", stopped.output_text)
+
+    def test_r12_7_conductor_advisory_reconciles_or_refuses_through_preflight(self):
+        cfg = _cfg(self.directory.name, triage_enabled=False)
+        cfg["orchestration"] = {
+            "enabled": True, "min_chars": 1, "max_tasks": 2,
+            "path": str(Path(self.directory.name) / "orchestration.jsonl"),
+        }
+        decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")
+        advisory_models = (
+            ("claude-opus-5-5", False),
+            ("claude-opus-5-5", True),
+            ("claude-sonnet-4-6", True),
+        )
+        for model, thinking in advisory_models:
+            for choice, expected in (
+                ({"type": "any"}, {"type": "auto"}),
+                ({"type": "tool", "name": "mcp__web_search"}, None),
+            ):
+                with self.subTest(model=model, thinking=thinking, choice=choice), host_delegation(depth=2):
+                    request = _anthropic_request(model, thinking=thinking)
+                    request["tool_choice"] = choice
+                    original = json.loads(json.dumps(request))
+                    routed = router._force_terra_supervisor_preflight(
+                        {"request": request, "model": "gpt-5.6-terra", "provider": "anthropic",
+                         "api_call_count": 1, "turn_id": f"r12-7:conductor:{model}:{thinking}:{choice['type']}", "platform": "cli"},
+                        cfg, decision,
+                    )
+                    self.assertEqual(request, original, "R12-7: conductor mutated the caller request")
+                    self.assertIsNotNone(routed)
+                    if expected is None:
+                        self.assertEqual(routed["_model_router_refusal"],
+                                         "Cannot run advisory preflight because exact tool 'mcp__web_search' is required.")
+                        self.assertEqual(routed["tools"], request["tools"])
+                    else:
+                        self.assertEqual(routed["tool_choice"], expected)
+                        self.assertEqual(len(routed["tools"]), len(request["tools"]),
+                                         "R12-7: advisory conductor narrowed the toolset")
 
     # --- P05: a late child is charged to the root turn it came from -------------------------
     # The host reports the originating turn to the router in the subagent_start hook; the

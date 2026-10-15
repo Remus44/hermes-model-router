@@ -293,7 +293,10 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
     if vehicle is None:
         return None
     tool, via_bridge = vehicle
-    from . import _append_user_instruction, _rejects_forced_tool_choice, _tool_schema_slot
+    from . import (
+        _append_user_instruction, _reconcile_advisory_tool_choice,
+        _rejects_forced_tool_choice, _tool_schema_slot,
+    )
 
     routed = deepcopy(request)
     advisory = anthropic and _rejects_forced_tool_choice(routed)
@@ -324,6 +327,10 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
             else:
                 schema["required"] = ["name", "arguments"]
     if advisory:
+        refusal = _reconcile_advisory_tool_choice(routed, operation="triage")
+        if refusal:
+            routed["_model_router_refusal"] = refusal
+            return routed
         # Anthropic refuses a forced tool_choice while thinking is on, and on Claude 5
         # models at all. One optional tool would let the reply end the turn, so the
         # toolset stays whole and the triage is asked for, not forced.
