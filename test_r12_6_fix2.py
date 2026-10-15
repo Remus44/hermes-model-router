@@ -697,6 +697,50 @@ class RegisteredClaudeChainTests(unittest.TestCase):
                     {"session_id": "r12-live", "turn_id": "r12:live", "tool_call_id": "same"}))
                 self.assertNotIn(stable.key, triage._RETAINED_ADMISSIONS)
 
+    def test_n1_lost_sealed_replay_refuses_later_host_rewrite_and_preserves_exact_original(self):
+        original = self._deliver()
+        stable = self._stable()
+        generation = triage._RETAINED_ADMISSIONS[stable.key].generation
+        modifier = self.ctx.register_hook("pre_tool_call", lambda **kw:
+            {"action": "modify", "args": {"goal": "sealed-rewritten", "tier": "sonnet5"}})
+        rewritten = self._deliver()
+        self.assertIn("error", json.loads(rewritten),
+                      "N1: lost sealed replay delivered original public bytes for rewritten payload")
+        self.assertNotEqual(rewritten, original,
+                            "N1: later rewritten payload received the sealed original response")
+        self.assertEqual(len(self.raw_calls), 1)
+        self.assertEqual(len(self.audits), 1)
+        self.assertEqual(triage._TURN_WORKERS["r12:live"], 1)
+        self.assertEqual(triage._RETAINED_ADMISSIONS[stable.key].generation, generation)
+        modifier.dispose()
+        self.assertEqual(self._deliver(), original,
+                         "N1: exact original replay was lost after refusing rewritten payload")
+        self.assertEqual(len(self.raw_calls), 1)
+        self.assertEqual(triage._TURN_WORKERS["r12:live"], 1)
+
+    def test_i3_r_unretainable_later_rewrite_retires_original_owner_before_fresh_retry(self):
+        for suffix, unretainable in (("nan", float("nan")), ("bytes", b"unretainable")):
+            with self.subTest(shape=suffix):
+                call_id = f"unretainable-{suffix}"
+                stable = self._stable(call_id)
+                charges_before = triage._TURN_WORKERS.get("r12:live", 0)
+                raw_before, audits_before = len(self.raw_calls), len(self.audits)
+                modifier = self.ctx.register_hook("pre_tool_call", lambda **kw:
+                    {"action": "modify", "args": {"goal": "unretainable-rewrite", "tier": "haiku",
+                                                       "unretainable": unretainable}})
+                refused = self._deliver(call_id)
+                self.assertIn("error", json.loads(refused))
+                self.assertEqual(len(self.raw_calls), raw_before)
+                self.assertNotIn(stable.key, triage._RETAINED_ADMISSIONS,
+                                 "I3-R: unretainable final rewrite stranded the original pending owner")
+                modifier.dispose()
+                fresh = self._deliver(call_id)
+                self.assertNotIn("error", json.loads(fresh))
+                self.assertEqual(len(self.raw_calls), raw_before + 1)
+                self.assertEqual(len(self.audits), audits_before + 1)
+                self.assertEqual(triage._TURN_WORKERS["r12:live"], charges_before + 2,
+                                 "I3-R: valid retry borrowed the refused admission instead of charging fresh")
+
     def test_i5_completed_generation_ttl_expiry_requires_new_charge(self):
         clock = [100.0]
         with patch.object(ea, "_now", side_effect=lambda: clock[0]), \

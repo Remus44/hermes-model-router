@@ -529,6 +529,8 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
         try:
             from . import triage
             admission = triage.consume_retained_admission(stable)
+            if admission is not None and admission.lost:
+                return json.dumps({"error": "Invocation admission was retired or expired before F05. Nothing was spawned by this call."})
             if admission is not None and admission.replay:
                 # Exact sealed bytes were captured in the pre-hook. Do not
                 # re-lookup by key after an eviction can have replaced G1.

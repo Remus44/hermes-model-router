@@ -616,11 +616,15 @@ def consume_retained_admission(invocation: Any) -> Optional[_AdmissionToken]:
 def retire_pending_admission(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> bool:
     """Close only this delivery's still-pending owner, never refund or retire a join."""
     invocation = _stable_invocation(tool_name, args, hook)
-    if invocation is None:
+    # A later host rewrite can make the final payload unretainable. Validate its
+    # actual host identity without treating that rewritten payload as authority;
+    # the caller handoff still carries the immutable original token.
+    identity = _stable_invocation(tool_name, {}, hook)
+    if identity is None:
         return False
     with _LOCK:
         handoff = _ADMISSION_HANDOFF.get()
-        correlated = handoff is not None and handoff.key == invocation.key
+        correlated = handoff is not None and handoff.key == identity.key
         if handoff is not None and correlated:
             token = handoff.token
             handoff.closed = True
@@ -628,8 +632,9 @@ def retire_pending_admission(tool_name: str, args: Dict[str, Any], hook: Dict[st
         else:
             token = _ADMISSION_TOKEN.get()
             _ADMISSION_TOKEN.set(None)
-        if (token is None or token.replay or not token.owner or token.key != invocation.key
-                or (not correlated and not _matches_admission(token, invocation))):
+        if (token is None or token.replay or not token.owner or token.key != identity.key
+                or token.transport != identity.transport or token.scope != identity.scope
+                or (not correlated and (invocation is None or not _matches_admission(token, invocation)))):
             return False
         entry = _RETAINED_ADMISSIONS.get(token.key)
         # A later host args rewrite can refuse F05, but cannot strand its
@@ -638,7 +643,7 @@ def retire_pending_admission(tool_name: str, args: Dict[str, Any], hook: Dict[st
         if (entry is not None and entry.nonce == token.nonce and not entry.generation
                 and entry.state == "pending" and entry.fingerprint == token.fingerprint
                 and entry.transport == token.transport and entry.scope == token.scope):
-            del _RETAINED_ADMISSIONS[invocation.key]
+            del _RETAINED_ADMISSIONS[token.key]
             return True
     return False
 
