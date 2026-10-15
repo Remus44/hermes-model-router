@@ -690,10 +690,59 @@ class F08PostMergeTests(unittest.TestCase):
                     original = json.loads(json.dumps(request))
                     refused = triage.force(request, self.cfg, anthropic=True)
                     self.assertEqual(request, original, "R12-7: triage mutated an exact choice request")
-                    self.assertEqual(refused["_model_router_refusal"],
+                    self.assertEqual(refused.get("_model_router_refusal"),
                                      "Cannot run advisory triage because exact tool 'mcp__web_search' is required.")
                     self.assertEqual(refused["tools"], request["tools"])
                     self.assertNotIn("[ROUTER TRIAGE]", json.dumps(refused))
+
+    def test_r12_7_malformed_generic_choices_preserve_possible_authority_for_both_advisory_callers(self):
+        """Generic/auto dictionaries are legal only in their exact supported form."""
+        cases = (
+            ({"type": "auto"}, "", {"type": "auto"}),
+            ({"type": "any"}, "", {"type": "auto"}),
+            ({"type": "any", "name": "mcp__web_search"}, "mcp__web_search", None),
+            ({"type": "any", "function": {"name": "mcp__web_search"}}, "mcp__web_search", None),
+            ({"type": "auto", "name": "mcp__web_search"}, "mcp__web_search", None),
+            ({"type": "auto", "name": "mcp__web_search", "function": {"name": "mcp__other"}}, None, None),
+            ({"type": "any", "unrecognized_extension": True}, None, None),
+        )
+
+        def expected(operation, name):
+            if name:
+                return f"Cannot run advisory {operation} because exact tool '{name}' is required."
+            return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
+
+        conductor_cfg = _cfg(self.directory.name, triage_enabled=False)
+        conductor_cfg["orchestration"] = {
+            "enabled": True, "min_chars": 1, "max_tasks": 2,
+            "path": str(Path(self.directory.name) / "r12-7-malformed-orchestration.jsonl"),
+        }
+        decision = router.RouteDecision("terra", "gpt-5.6-terra", "test")
+        for caller in ("triage", "conductor"):
+            for choice, authority, accepted in cases:
+                with self.subTest(caller=caller, choice=choice), host_delegation(depth=2):
+                    request = _anthropic_request("claude-opus-5-5", thinking=False)
+                    request["tool_choice"] = choice
+                    original = json.loads(json.dumps(request))
+                    routed = (
+                        triage.force(request, self.cfg, anthropic=True)
+                        if caller == "triage" else
+                        router._force_terra_supervisor_preflight(
+                            {"request": request, "model": "gpt-5.6-terra", "provider": "anthropic",
+                             "api_call_count": 1,
+                             "turn_id": f"r12-7:malformed:{caller}:{len(str(choice))}", "platform": "cli"},
+                            conductor_cfg, decision,
+                        )
+                    )
+                    self.assertEqual(request, original, "R12-7: malformed choice mutated the caller request")
+                    self.assertIsNotNone(routed)
+                    if accepted is not None:
+                        self.assertNotIn("_model_router_refusal", routed)
+                        self.assertEqual(routed["tool_choice"], accepted)
+                    else:
+                        self.assertEqual(routed.get("_model_router_refusal"),
+                                         expected("triage" if caller == "triage" else "preflight", authority))
+                        self.assertEqual(routed["tools"], request["tools"])
 
     def test_r12_7_named_advisory_choice_stops_through_registered_host_chain(self):
         from hermes_cli import plugins
@@ -729,16 +778,22 @@ class F08PostMergeTests(unittest.TestCase):
                 api_call_count=1, platform="cli", turn_id="r12-7:exact",
             )
         self.assertEqual(request, original, "R12-7: host request composition mutated input")
-        self.assertEqual(composed.payload["_model_router_refusal"],
-                         "Cannot run advisory triage because exact tool 'mcp__web_search' is required.")
         self.assertEqual(len(composed.payload["tools"]), len(request["tools"]))
-        self.assertEqual(self._events(cfg)[-1]["event"], "triage_skipped")
-        self.assertEqual(self._events(cfg)[-1]["reason"], "authoritative_tool_choice")
-        terminal.assert_not_called()
-        bridge.assert_not_called()
-        self.assertEqual(stopped.usage.total_tokens, 0)
-        self.assertIn("ROUTER WORKER STOPPED", stopped.output_text)
-        self.assertIn("exact tool 'mcp__web_search'", stopped.output_text)
+        with self.subTest(boundary="public stopped response"):
+            self.assertIn("ROUTER WORKER STOPPED", getattr(stopped, "output_text", ""))
+            self.assertIn("exact tool 'mcp__web_search'", getattr(stopped, "output_text", ""))
+        with self.subTest(boundary="zero terminal callback"):
+            terminal.assert_not_called()
+        with self.subTest(boundary="zero bridge callback"):
+            bridge.assert_not_called()
+        with self.subTest(boundary="zero usage"):
+            self.assertEqual(getattr(getattr(stopped, "usage", None), "total_tokens", None), 0)
+        with self.subTest(boundary="safe refusal metadata"):
+            self.assertEqual(composed.payload.get("_model_router_refusal"),
+                             "Cannot run advisory triage because exact tool 'mcp__web_search' is required.")
+        with self.subTest(boundary="refusal telemetry"):
+            self.assertEqual(self._events(cfg)[-1]["event"], "triage_skipped")
+            self.assertEqual(self._events(cfg)[-1]["reason"], "authoritative_tool_choice")
 
     def test_r12_7_conductor_advisory_reconciles_or_refuses_through_preflight(self):
         cfg = _cfg(self.directory.name, triage_enabled=False)
@@ -769,13 +824,95 @@ class F08PostMergeTests(unittest.TestCase):
                     self.assertEqual(request, original, "R12-7: conductor mutated the caller request")
                     self.assertIsNotNone(routed)
                     if expected is None:
-                        self.assertEqual(routed["_model_router_refusal"],
+                        self.assertEqual(routed.get("_model_router_refusal"),
                                          "Cannot run advisory preflight because exact tool 'mcp__web_search' is required.")
                         self.assertEqual(routed["tools"], request["tools"])
                     else:
                         self.assertEqual(routed["tool_choice"], expected)
                         self.assertEqual(len(routed["tools"]), len(request["tools"]),
                                          "R12-7: advisory conductor narrowed the toolset")
+
+    def test_r12_7_registered_triage_disabled_conductor_refusal_reaches_host_stop(self):
+        """Installed request/execution middleware stops named advisory conductors before I/O."""
+        from hermes_cli import plugins
+        from hermes_cli.middleware import apply_llm_request_middleware, run_llm_execution_middleware
+        from hermes_cli.plugins import PluginContext, PluginManifest, PluginManager
+
+        cfg = _cfg(self.directory.name, triage_enabled=False)
+        cfg["orchestration"] = {
+            "enabled": True, "min_chars": 1, "max_tasks": 2,
+            "path": str(Path(self.directory.name) / "r12-7-registered-conductor.jsonl"),
+        }
+        cfg["claude_delegation"] = {
+            "tiers": {"sonnet": "claude-sonnet-4-6"},
+        }
+        active_before = router.claude_delegation._ACTIVE
+        availability_before = router.claude_delegation._LAST_AVAILABLE
+        cases = (
+            ("claude-opus-5-5", False, {"type": "tool", "name": "mcp__web_search"}),
+            ("claude-opus-5-5", True, {"type": "tool", "name": "mcp__web_search"}),
+            ("claude-sonnet-4-6", True, {"type": "tool", "name": "mcp__web_search"}),
+            ("claude-opus-5-5", False, {"type": "any"}),
+            ("claude-opus-5-5", True, {"type": "any"}),
+            ("claude-sonnet-4-6", True, {"type": "any"}),
+        )
+        try:
+            for model, thinking, choice in cases:
+                with self.subTest(model=model, thinking=thinking, choice=choice), host_delegation(depth=2):
+                    request = _anthropic_request(model, thinking=thinking)
+                    request["tool_choice"] = choice
+                    original = json.loads(json.dumps(request))
+                    manager = PluginManager()
+                    manager._discovered = True
+                    ctx = PluginContext(PluginManifest(name="r12-7-conductor", source="test", key="r12-7-conductor"), manager)
+                    terminal = Mock(return_value="ORDINARY PROVIDER EXECUTED")
+                    try:
+                        with patch.object(plugins, "_plugin_manager", manager), \
+                             patch("hermes_cli.plugins._delivery_manager", return_value=manager), \
+                             patch.object(router, "_load_config", return_value=cfg), \
+                             patch.object(router, "_run_opus5_bridge") as bridge:
+                            router.register(ctx)
+                            composed = apply_llm_request_middleware(
+                                request, model=model, provider="anthropic", api_mode="anthropic_messages",
+                                api_call_count=1, platform="cli",
+                                turn_id=f"r12-7:registered-conductor:{model}:{thinking}:{choice['type']}",
+                            )
+                            stopped = run_llm_execution_middleware(
+                                composed.payload, terminal, provider="anthropic", api_mode="anthropic_messages",
+                                api_call_count=1, platform="cli",
+                                turn_id=f"r12-7:registered-conductor:{model}:{thinking}:{choice['type']}",
+                            )
+                    finally:
+                        for registration in reversed(manager._registration_order):
+                            registration.dispose()
+                    self.assertEqual(request, original, "R12-7: registered conductor composition mutated input")
+                    self.assertTrue(composed.trace, "R12-7: installed conductor path recorded no composition trace")
+                    self.assertEqual(composed.payload.get("model"), model,
+                                     "R12-7: external conductor model changed during advisory composition")
+                    if choice["type"] == "any":
+                        self.assertNotIn("_model_router_refusal", composed.payload)
+                        self.assertEqual(composed.payload["tool_choice"], {"type": "auto"})
+                        terminal.assert_called_once()
+                        bridge.assert_not_called()
+                    else:
+                        output = getattr(stopped, "output_text", "")
+                        with self.subTest(model=model, thinking=thinking, boundary="public stopped response"):
+                            self.assertIn("ROUTER WORKER STOPPED", output[:500])
+                            self.assertIn("exact tool 'mcp__web_search'", output[:500])
+                        with self.subTest(model=model, thinking=thinking, boundary="zero terminal callback"):
+                            terminal.assert_not_called()
+                        with self.subTest(model=model, thinking=thinking, boundary="zero bridge callback"):
+                            bridge.assert_not_called()
+                        with self.subTest(model=model, thinking=thinking, boundary="zero usage"):
+                            self.assertEqual(getattr(getattr(stopped, "usage", None), "total_tokens", None), 0)
+                        with self.subTest(model=model, thinking=thinking, boundary="safe refusal metadata"):
+                            self.assertEqual(composed.payload.get("_model_router_refusal"),
+                                             "Cannot run advisory preflight because exact tool 'mcp__web_search' is required.")
+                        with self.subTest(model=model, thinking=thinking, boundary="unchanged full toolset"):
+                            self.assertEqual(composed.payload["tools"], request["tools"])
+        finally:
+            router.claude_delegation._ACTIVE = active_before
+            router.claude_delegation._LAST_AVAILABLE = availability_before
 
     # --- P05: a late child is charged to the root turn it came from -------------------------
     # The host reports the originating turn to the router in the subagent_start hook; the

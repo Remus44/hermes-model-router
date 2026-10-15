@@ -2565,19 +2565,24 @@ def _reconcile_advisory_tool_choice(request: Dict[str, Any], *, operation: str) 
     if not isinstance(choice, dict):
         return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
     choice_type = str(choice.get("type") or "").casefold()
-    if choice_type in {"", "auto", "none"}:
-        return "" if choice_type else (
-            f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
-        )
-    if choice_type == "any":
-        request["tool_choice"] = {"type": "auto"}
+    names = []
+    top_level_name = choice.get("name")
+    if isinstance(top_level_name, str) and top_level_name.strip():
+        names.append(top_level_name.strip())
+    function = choice.get("function")
+    function_name = function.get("name") if isinstance(function, dict) else None
+    if isinstance(function_name, str) and function_name.strip():
+        names.append(function_name.strip())
+    if len(set(names)) > 1:
+        return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
+    if names:
+        return f"Cannot run advisory {operation} because exact tool '{names[0]}' is required."
+    if choice_type in {"auto", "none", "any"}:
+        if set(choice) != {"type"}:
+            return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
+        if choice_type == "any":
+            request["tool_choice"] = {"type": "auto"}
         return ""
-    name = choice.get("name")
-    if not isinstance(name, str):
-        function = choice.get("function")
-        name = function.get("name") if isinstance(function, dict) else None
-    if isinstance(name, str) and name.strip():
-        return f"Cannot run advisory {operation} because exact tool '{name}' is required."
     return f"Cannot run advisory {operation} because tool_choice has an unsupported shape."
 
 
