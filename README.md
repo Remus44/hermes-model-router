@@ -177,7 +177,13 @@ older Claude parents are advisory while thinking is on and forced while it is of
 Codex remains a required-tool path. An advisory parent may answer without a recorded
 triage decision. Generic mandatory Anthropic choice is reconciled to `auto`; an
 authoritative named, ambiguous, unsupported, or malformed choice stops visibly
-rather than being silently discarded.
+rather than being silently discarded. The same reconciliation is used by triage
+and by an eligible triage-off conductor. Supported forms are the documented
+absent/`None`/`auto`/`none`/generic-mandatory forms; named authority wins over
+generic relaxation. The malformed or extended representations in the local caller
+matrix are defensive coverage, not a claim that the native host emits them. For the
+covered refusal path, the public stopped response is returned before ordinary,
+bridge, or downstream execution.
 
 While triage is on it replaces the forced conductor and the small-task budget, and
 the router enforces the worker budget on every `delegate_task` and `delegate_claude`
@@ -203,9 +209,12 @@ uncharged; a refusal by a later host or handler guard remains an admitted attemp
 with no refund, and `spawn_admitted` never proves that a worker launched or
 completed. The four-worker policy is not a host concurrency limit, batch width, or
 depth limit. The bounded child-session-to-originating-root association is process
-local, resets on restart, and uses a documented fallback for an unknown child;
-durable/background correlation remains S06 work. Triage-off retains its other guard
-paths and is not unlimited execution.
+local, resets on restart, and uses this fallback for an unknown or expired child:
+the parent session's latest root-turn pointer, otherwise its session key; the event
+records `origin_source: "latest_session_pointer"`. An unknown late child can
+therefore count against a newer turn. Conflicting recorded origins refuse rather
+than use that fallback. Durable/background correlation remains S06 work. Triage-off
+retains its other guard paths and is not unlimited execution.
 
 The triage log records `triage_forced` only for a constrained request,
 `triage_advisory` for an advisory rewrite, and `triage_skipped` with its reason,
@@ -703,7 +712,7 @@ Historical image attachments are stripped from replayed context rather than rese
 ### Quota fallback
 
 Distinct from `fallbacks`, which handles a *disabled* tier. `quota_fallbacks`
-selects a possible replacement after a tier answered `429` mid-turn:
+selects a possible replacement only for a Spark quota failure (`429`) mid-turn:
 
 ```yaml
 quota_fallbacks:
@@ -712,14 +721,19 @@ quota_fallbacks:
     effort: medium
 ```
 
-When a host supplies a compatible `retry_call`, a replacement is submitted once.
-The installed host supplies no compatible callback: the original failure propagates,
-and the recorded cooldown steers later calls instead. The current call can fail.
+When a host supplies a compatible `retry_call`, the callback permits at most one
+eligible, policy-permitted replacement; it does not guarantee that a candidate is
+callable or that a retry will occur. The installed host supplies no compatible
+callback: the original failure propagates, and recorded failure state can steer
+later calls instead. The current call can fail.
 
 Quota, transient failure, and unavailable-model handling use separate selection
-mechanisms. Each records its cooldown before the original failure is re-raised when
-the retry seam is absent. Moving work to another account remains a dispatch decision,
-not a model swap.
+mechanisms. Quota handling honors the cooldown enable switch and enters cooldown
+immediately using a provider reset hint capped by `quota_max_seconds`, or
+`quota_seconds` when no hint is available; transient failures enter only after the
+configured recent-failure threshold. Unavailable-model cooldown uses its configured
+duration. Moving work to another account remains a dispatch decision, not a model
+swap.
 
 ### A model this account cannot use
 
@@ -729,9 +743,9 @@ what decides whether a leaf survives:
 | Condition | Recognised by | What happens |
 |---|---|---|
 | Switched off in the dashboard | `callable: false` | the `fallbacks` chain, at routing time |
-| Quota exhausted (429) | account/weekly quota wording | `quota_fallbacks` only with a host `retry_call`; always records a 15-minute cooldown |
-| Provider blip (5xx) | 500/502/503/504, connection resets | transient selection only with a host `retry_call`; always records a short cooldown |
-| **Refused outright (400/404)** | *"is not supported when using…"*, *"does not exist or you do not have access"* | configured `fallbacks` only with a host `retry_call`; always records a 6-hour cooldown |
+| Quota exhausted (429) | account/weekly quota wording | Spark-only `quota_fallbacks`, only with a host `retry_call`; with cooldowns enabled, a provider reset hint is capped by `quota_max_seconds`, otherwise `quota_seconds` (default 15 minutes) applies |
+| Provider blip (5xx) | 500/502/503/504, connection resets | transient selection only with a host `retry_call`; failure state is recorded, and cooldown starts only at the configured recent-failure threshold |
+| **Refused outright (400/404)** | *"is not supported when using…"*, *"does not exist or you do not have access"* | configured `fallbacks` only with a host `retry_call`; the unavailable-model cooldown uses configured `unavailable_seconds` |
 
 The last row was a gap until 1.8.1. A tier switched **on** but refused by the
 provider — `The 'gpt-5.3-codex-spark' model is not supported when using Codex with
@@ -993,9 +1007,11 @@ cooldown:
 run: `delegate_task` rejects the whole batch. Keep them equal.
 
 Declining to dispatch is logged too. `terra-spark-orchestration.jsonl` records
-`preflight_forced` when a conductor is created and `preflight_skipped` — with
-the gate that rejected it — when one is not, so a turn that ran twenty calls
-with no worker says why.
+`preflight_forced` before the conductor/preflight builder is called, and
+`preflight_skipped` — with the gate that rejected it — when the preflight gate does
+not proceed. The former does not prove a conductor was created or that its contract
+was appended or delivered: the builder can refuse before those outcomes. It still
+helps explain why a turn that ran twenty calls had no worker.
 
 ### Usage reporting
 
@@ -1723,9 +1739,10 @@ tail -5 ~/.hermes/logs/terra-spark-orchestration.jsonl \
   | jq '{event, parent_model, skip_reason, tools_seen}'
 ```
 
-`preflight_forced` means the contract went out and the parent was asked to
-delegate; what it does next is the model's decision. `preflight_skipped` names
-the gate instead:
+`preflight_forced` records that the preflight event was emitted before the
+conductor/preflight builder is invoked. It does not by itself prove conductor creation,
+contract append/delivery, or a parent request completion; the builder can refuse.
+`preflight_skipped` names the gate instead:
 
 | `skip_reason` | Meaning |
 |---|---|
