@@ -728,12 +728,14 @@ callback: the original failure propagates, and recorded failure state can steer
 later calls instead. The current call can fail.
 
 Quota, transient failure, and unavailable-model handling use separate selection
-mechanisms. Quota handling honors the cooldown enable switch and enters cooldown
-immediately using a provider reset hint capped by `quota_max_seconds`, or
-`quota_seconds` when no hint is available; transient failures enter only after the
-configured recent-failure threshold. Unavailable-model cooldown uses its configured
-duration. Moving work to another account remains a dispatch decision, not a model
-swap.
+mechanisms, but share one recording guard: failure history and cooldown entry occur
+only when cooldowns are enabled and the affected router tier is applicable. With
+cooldowns disabled, those helpers write no failure/cooldown state and the cooldown
+availability policy is disabled. Under that guard, quota enters cooldown immediately
+using a provider reset hint capped by `quota_max_seconds`, or `quota_seconds` when
+no hint is available; transient failures enter only after the configured recent-failure
+threshold; and unavailable-model cooldown uses its configured duration. Moving work
+to another account remains a dispatch decision, not a model swap.
 
 ### A model this account cannot use
 
@@ -743,9 +745,9 @@ what decides whether a leaf survives:
 | Condition | Recognised by | What happens |
 |---|---|---|
 | Switched off in the dashboard | `callable: false` | the `fallbacks` chain, at routing time |
-| Quota exhausted (429) | account/weekly quota wording | Spark-only `quota_fallbacks`, only with a host `retry_call`; with cooldowns enabled, a provider reset hint is capped by `quota_max_seconds`, otherwise `quota_seconds` (default 15 minutes) applies |
-| Provider blip (5xx) | 500/502/503/504, connection resets | transient selection only with a host `retry_call`; failure state is recorded, and cooldown starts only at the configured recent-failure threshold |
-| **Refused outright (400/404)** | *"is not supported when using…"*, *"does not exist or you do not have access"* | configured `fallbacks` only with a host `retry_call`; the unavailable-model cooldown uses configured `unavailable_seconds` |
+| Quota exhausted (429) | account/weekly quota wording | Spark-only `quota_fallbacks`, only with a host `retry_call`; under the shared enabled/applicable-tier guard, a provider reset hint is capped by `quota_max_seconds`, otherwise `quota_seconds` (default 15 minutes) applies |
+| Provider blip (5xx) | 500/502/503/504, connection resets | transient selection only with a host `retry_call`; under the shared enabled/applicable-tier guard, failure state is recorded and cooldown starts only at the configured recent-failure threshold |
+| **Refused outright (400/404)** | *"is not supported when using…"*, *"does not exist or you do not have access"* | configured `fallbacks` only with a host `retry_call`; under the shared enabled/applicable-tier guard, the unavailable-model cooldown uses configured `unavailable_seconds` |
 
 The last row was a gap until 1.8.1. A tier switched **on** but refused by the
 provider — `The 'gpt-5.3-codex-spark' model is not supported when using Codex with
