@@ -358,6 +358,61 @@ def _carried_stated_effort(
     )
 
 
+def _router_is_disabled() -> bool:
+    return os.environ.get("HERMES_MODEL_ROUTER_DISABLE", "").casefold() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _stated_effort_from_request(request: Any, cfg: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(request, dict):
+        return None
+    text = _last_user_text_and_index(_request_items(request))[0]
+    label = _label_match(_without_host_injected_context(_without_router_contract(text)), cfg)
+    if label is None or label.group("level") is None:
+        return None
+    return label.group("level").casefold()
+
+
+def _submitted_effort_authority_applies(cfg: Dict[str, Any], provider: str, api_mode: Any) -> bool:
+    configured_provider = str(cfg.get("provider") or "openai-codex").casefold()
+    return (
+        bool(cfg.get("enabled", True))
+        and not _router_is_disabled()
+        and configured_provider == "openai-codex"
+        and provider == configured_provider
+        and str(api_mode or "") == "codex_responses"
+    )
+
+
+def _submitted_stated_effort_refusal(
+    request: Dict[str, Any], original_request: Any, cfg: Dict[str, Any]
+) -> str:
+    """Return a public-stop reason if final submission lost original label authority.
+
+    The execution middleware is the final repository-owned boundary before the
+    host's single-use provider callback.  It must use the host-forwarded original
+    request, never a post-router prompt or route record, because later request
+    middleware may rewrite both the destination and user text.
+    """
+    stated = _stated_effort_from_request(original_request, cfg)
+    if stated is None:
+        return ""
+    final_model = str(request.get("model") or "")
+    tiers = tuple(
+        tier for tier, model in (cfg.get("models") or {}).items()
+        if str(model) == final_model
+    )
+    levels = _codex_tier_efforts(cfg)
+    if not tiers or not any(stated in levels.get(tier, ()) for tier in tiers):
+        return f"Stated effort '{stated}' cannot run on final model '{final_model or 'unknown'}'."
+    reasoning = request.get("reasoning")
+    final_effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if final_effort != stated:
+        return f"Stated effort '{stated}' was changed or removed before submission."
+    return ""
+
+
 def _decision_with_carried_stated_effort(
     target_tier: str, reason: str, cfg: Dict[str, Any], source: RouteDecision, *, kind: Optional[str] = None
 ) -> RouteDecision:
@@ -4284,10 +4339,7 @@ def on_pre_gateway_dispatch(**kwargs: Any) -> None:
 
 def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     cfg = _load_config()
-    disabled = os.environ.get("HERMES_MODEL_ROUTER_DISABLE", "").casefold() in {
-        "1", "true", "yes", "on"
-    }
-    if disabled or not cfg.get("enabled", True):
+    if _router_is_disabled() or not cfg.get("enabled", True):
         return None
 
     active_model = str(kwargs.get("model", ""))
@@ -6122,6 +6174,13 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     refusal = str(request.get("_model_router_refusal") or "") if isinstance(request, dict) else ""
     if refusal:
         return worker_admission.stopped_response(refusal, str(request.get("model", "")))
+    if (
+        isinstance(request, dict)
+        and _submitted_effort_authority_applies(cfg, provider, kwargs.get("api_mode"))
+    ):
+        authority_refusal = _submitted_stated_effort_refusal(request, kwargs.get("original_request"), cfg)
+        if authority_refusal:
+            return worker_admission.stopped_response(authority_refusal, str(request.get("model", "")))
     worker = (cfg.get("enabled", True) and isinstance(request, dict)
               and (str(kwargs.get("platform", "")).casefold() == "subagent"
                    or ":sa-" in str(kwargs.get("turn_id", ""))))
@@ -6238,7 +6297,6 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
     stopped = stop_if_closed()
     if stopped is not None:
         return stopped
-
     try:
         return delivered(next_call(request))
     except Exception as error:
@@ -6285,14 +6343,11 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             (tier for tier, model in (cfg.get("models") or {}).items() if model == fallback_model),
             "fallback",
         )
-        retry_text, _ = _last_user_text_and_index(_request_items(request))
-        retry_label = _label_match(
-            _normalise(_without_host_injected_context(_without_router_contract(retry_text))), cfg,
-        )
+        original_request = kwargs.get("original_request")
         stated_effort = (
-            retry_label.group("level").casefold()
-            if retry_label and retry_label.group("level")
-            else None
+            _stated_effort_from_request(original_request, cfg)
+            if isinstance(original_request, dict)
+            else _stated_effort_from_request(request, cfg)
         )
         try:
             fallback_effort = str(
@@ -6306,6 +6361,11 @@ def run_llm_with_transient_failover(**kwargs: Any) -> Any:
             )
         except RuntimeError as effort_error:
             return worker_admission.stopped_response(str(effort_error), active_model)
+        supported_fallback_efforts = _codex_tier_efforts(cfg).get(fallback_tier, ())
+        if stated_effort is not None and fallback_effort not in supported_fallback_efforts:
+            return worker_admission.stopped_response(
+                f"Fallback tier '{fallback_tier}' cannot run effort '{fallback_effort}'.", active_model,
+            )
         fallback_request = dict(request)
         fallback_request["model"] = fallback_model
         reasoning = dict(fallback_request.get("reasoning") or {})
