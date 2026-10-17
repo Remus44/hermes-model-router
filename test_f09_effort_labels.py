@@ -10,6 +10,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import yaml
@@ -871,6 +872,116 @@ class ExactEffortLabelTests(unittest.TestCase):
                             next_call=call,
                         )
                     self.assertEqual(call.call_count, 1)
+
+
+class NormalizedDelegationPreflightTests(unittest.TestCase):
+    """The registered pre-tool hook must parse labels as classification does."""
+
+    def setUp(self):
+        from hermes_cli import plugins
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+        self.manager = PluginManager()
+        self.manager._discovered = True
+        context = PluginContext(
+            PluginManifest(name="f09-normalized-preflight", source="test", key="f09-normalized-preflight"),
+            self.manager,
+        )
+        self.root = SimpleNamespace(session_id="f09-normalized-root", _delegate_depth=0)
+        triage.reset_state()
+        self.addCleanup(triage.reset_state)
+        manager_patch = patch.object(plugins, "_plugin_manager", self.manager)
+        manager_patch.start()
+        self.addCleanup(manager_patch.stop)
+        delivery_patch = patch("hermes_cli.plugins._delivery_manager", return_value=self.manager)
+        delivery_patch.start()
+        self.addCleanup(delivery_patch.stop)
+        with patch.object(router.claude_delegation, "register", return_value=True):
+            router.register(context)
+        self.assertIn(router.on_pre_tool_call, self.manager._hooks["pre_tool_call"])
+        self.addCleanup(self._dispose_registrations)
+
+    def _dispose_registrations(self):
+        for registration in reversed(list(self.manager._registration_order)):
+            registration.dispose()
+
+    def _deliver(self, args, cfg, *, turn_id, cooldown=0):
+        from hermes_cli import plugins
+
+        raw_dispatch = Mock(return_value="raw dispatch")
+        with patch.object(router, "_load_config", return_value=cfg), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(router, "_tier_cooldown_remaining", return_value=cooldown), \
+             patch.object(triage, "_caller", return_value=self.root):
+            block, _modified_args = plugins._dispatch_pre_tool_call_hooks(
+                "delegate_task", args, session_id="f09-normalized-root", turn_id=turn_id,
+            )
+        return block, raw_dispatch, ("" if block else raw_dispatch())
+
+    @staticmethod
+    def _cfg():
+        cfg = shipped_config()
+        cfg["triage"] = {"enabled": True, "max_workers_per_turn": 4, "max_children_per_worker": 1}
+        return cfg
+
+    def test_registered_hook_refuses_normalized_stated_labels_before_admission_or_raw_dispatch(self):
+        cases = (
+            ("luna write", "[lúna:high] Fix the parser module.", self._cfg(), 0,
+             "restricted to non-design read-only"),
+            ("spark write", "[spárk:high] Fix the parser module.", self._cfg(), 0,
+             "restricted to non-design read-only"),
+            ("unavailable", "[sól:high] Inspect and report.",
+             {**self._cfg(), "callable": {**self._cfg()["callable"], "sol": False}}, 0, "sol is switched off"),
+            ("cooling", "[térra:high] Inspect and report.", self._cfg(), 30,
+             "terra is cooling down for another 30s"),
+            ("unsupported", "[sól:bogus] Inspect and report.", self._cfg(), 0,
+             "Unsupported sol effort 'bogus'"),
+        )
+        for name, goal, cfg, cooldown, expected in cases:
+            with self.subTest(name=name):
+                triage.reset_state()
+                block, raw_dispatch, _result = self._deliver({"goal": goal}, cfg, turn_id=f"f09-normalized:{name}",
+                                                              cooldown=cooldown)
+                self.assertIsNotNone(block, "normalized label escaped registered preflight")
+                message = block or ""
+                self.assertIn(expected, message)
+                raw_dispatch.assert_not_called()
+                self.assertEqual(triage._TURN_WORKERS, {}, "preflight refusal consumed worker admission")
+                with patch.object(router, "_load_config", return_value=cfg), \
+                     patch.object(router, "_tier_cooldown_remaining", return_value=cooldown), \
+                     patch.object(triage, "enabled", return_value=False):
+                    direct = router.on_pre_tool_call(
+                        "delegate_task", {"goal": goal}, turn_id=f"f09-normalized:direct:{name}",
+                    )
+                self.assertEqual((direct or {}).get("message"), message)
+
+    def test_registered_hook_keeps_normalized_controls_and_boundaries(self):
+        cases = (
+            ("ascii refusal", {"goal": "[luna:high] Fix the parser module."}, False),
+            ("normalized read only", {"goal": "[lúna:high] Inspect the parser and report."}, True),
+            ("normalized bare", {"goal": "[sól] Inspect the parser and report."}, True),
+            ("non-spawn action", {"action": "stop", "goal": "[sól:bogus] Inspect and report."}, True),
+            ("supported no-space boundary", {"goal": "[sól:high]Fix the parser module."}, True),
+            ("malformed normalized", {"goal": "[sól:x-high] Inspect and report."}, False),
+            ("batched", {"tasks": [
+                {"goal": "[sol:high] Inspect and report."},
+                {"goal": "[sól:bogus] Inspect and report."},
+            ]}, False),
+        )
+        for name, args, admitted in cases:
+            with self.subTest(name=name):
+                triage.reset_state()
+                block, raw_dispatch, result = self._deliver(args, self._cfg(), turn_id=f"f09-normalized:{name}")
+                if admitted:
+                    self.assertIsNone(block)
+                    self.assertEqual(result, "raw dispatch")
+                    raw_dispatch.assert_called_once()
+                    expected_admission = {} if name == "non-spawn action" else {f"f09-normalized:{name}": 1}
+                    self.assertEqual(triage._TURN_WORKERS, expected_admission)
+                else:
+                    self.assertIsNotNone(block)
+                    raw_dispatch.assert_not_called()
+                    self.assertEqual(triage._TURN_WORKERS, {}, "preflight refusal consumed worker admission")
 
 
 if __name__ == "__main__":

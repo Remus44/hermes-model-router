@@ -6670,7 +6670,7 @@ def _unsupported_delegation_label(args: Dict[str, Any], cfg: Dict[str, Any]) -> 
     for task in tasks:
         entry = task if isinstance(task, dict) else {}
         goal = str(entry.get("goal") or args.get("goal") or "")
-        unsupported = _unsupported_label(goal, cfg)
+        unsupported = _unsupported_label(_normalise(goal), cfg)
         if unsupported:
             return unsupported
     return None
@@ -6682,7 +6682,7 @@ def _stated_delegation_label_block(args: Dict[str, Any], cfg: Dict[str, Any]) ->
     for task in tasks:
         entry = task if isinstance(task, dict) else {}
         goal = str(entry.get("goal") or args.get("goal") or "")
-        label = _label_match(goal, cfg)
+        label = _label_match(_normalise(goal), cfg)
         if not label or not label.group("level"):
             continue
         tier = label.group("tier").casefold()
