@@ -368,7 +368,7 @@ def _stated_effort_from_request(request: Any, cfg: Dict[str, Any]) -> Optional[s
     if not isinstance(request, dict):
         return None
     text = _last_user_text_and_index(_request_items(request))[0]
-    label = _label_match(_without_host_injected_context(_without_router_contract(text)), cfg)
+    label = _label_match(_normalise(_without_host_injected_context(_without_router_contract(text))), cfg)
     if label is None or label.group("level") is None:
         return None
     return label.group("level").casefold()

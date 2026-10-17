@@ -283,6 +283,61 @@ class G01EffortSubmissionTests(unittest.TestCase):
                 )
                 self.assert_public_stop(result, terminal, bridge)
 
+    def test_registered_chain_normalized_label_preserves_stated_effort_authority(self):
+        def harmless(request):
+            request["max_output_tokens"] = 256
+
+        cases = (
+            ("accented-high-overwritten", "[sól:high] Inspect and report.", set_effort("medium"), True, "high"),
+            ("fullwidth-xhigh-harmless", "[ＳＯＬ：ＸＨＩＧＨ] Inspect and report.", harmless, False, "xhigh"),
+            ("accented-bare-default", "[sól] Inspect and report.", set_effort("high"), False, "medium"),
+        )
+        for name, text, mutate, must_stop, routed_effort in cases:
+            with self.subTest(cell=name):
+                _composed, result, terminal, bridge, observations = self.run_registered(
+                    text=text, mutate=mutate, worker=must_stop,
+                )
+                self.assert_route_observation(observations, "gpt-6.1-sol", routed_effort)
+                if must_stop:
+                    self.assert_public_stop(result, terminal, bridge)
+                    self.assertEqual(observations["admission"], [])
+                else:
+                    self.assertNotIn("ROUTER WORKER STOPPED", getattr(result, "output_text", ""))
+                    bridge.assert_not_called()
+                    self.assertEqual(len(terminal), 1)
+
+    def test_r2_normalized_label_retry_keeps_immutable_original_effort(self):
+        cfg = shipped_config()
+        cfg["callable"]["spark"] = True
+        for cell, original_text, original_level in (
+            ("accented-high", "[sól:high] Inspect and report.", "high"),
+            ("fullwidth-xhigh", "[ＳＯＬ：ＸＨＩＧＨ] Inspect and report.", "xhigh"),
+        ):
+            with self.subTest(cell=cell):
+                original = responses_request(original_text)
+                request = responses_request("Inspect and report.")
+                request["model"] = cfg["models"]["sol"]
+                request["reasoning"] = {"effort": original_level}
+                submitted = []
+
+                def retry_call(payload):
+                    submitted.append(clone(payload))
+                    return "recovered"
+
+                with patch.object(router, "_load_config", return_value=cfg):
+                    recovered = router.run_llm_with_transient_failover(
+                        request=request,
+                        original_request=original,
+                        next_call=Mock(side_effect=RuntimeError("HTTP 503: upstream connect error")),
+                        retry_call=retry_call,
+                        provider="openai-codex",
+                        api_mode="codex_responses",
+                    )
+                self.assertEqual(recovered, "recovered")
+                self.assertEqual(len(submitted), 1)
+                self.assertEqual(submitted[0]["model"], cfg["models"]["spark"])
+                self.assertEqual(submitted[0]["reasoning"]["effort"], original_level)
+
     def test_registered_chain_rejects_unsupported_missing_and_malformed_final_effort(self):
         def unsupported(request):
             request["model"] = "gpt-5.3-codex-spark"
