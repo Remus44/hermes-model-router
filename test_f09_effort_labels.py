@@ -622,6 +622,45 @@ class ExactEffortLabelTests(unittest.TestCase):
         routed, _record = self.route_and_record("[spark:xhigh] Inspect the local implementation and report.", cfg)
         self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", "xhigh"), routed)
 
+    def test_root_spark_label_validates_the_level_on_the_preserved_destination(self):
+        """O-1: the shipped cross-provider default is a hop, not the destination."""
+        cfg = shipped_config()
+        self.assertEqual(cfg["default_model"], "qwen")
+        self.assertNotEqual(cfg["tier_providers"]["qwen"], cfg["tier_providers"]["terra"])
+        for qwen_callable in (True, False):
+            for level in ("low", "high"):
+                with self.subTest(qwen_callable=qwen_callable, level=level):
+                    cfg["callable"]["qwen"] = qwen_callable
+                    routed, _record = self.route_and_record(f"[spark:{level}] Inspect the parser module.", cfg)
+                    self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]), ("terra", level),
+                                     routed)
+
+        levels = {tier: tuple(values) for tier, values in router._codex_tier_efforts(cfg).items()}
+        levels["terra"] = tuple(level for level in levels["terra"] if level != "low")
+        with patch.object(router, "_codex_tier_efforts", return_value=levels):
+            refused, _record = self.route_and_record("[spark:low] Inspect the parser module.", cfg)
+        self.assertEqual(refused["metadata"]["tier"], "refused", refused)
+        self.assertIn("cannot run on substitute tier 'terra'", refused["metadata"]["refusal"])
+
+    def test_root_spark_label_with_an_unavailable_active_tier_refuses_visibly(self):
+        """O-1 review: the deferral must not turn a visible refusal into a fail-open RuntimeError."""
+        cfg = shipped_config()
+        cfg["callable"].update({"terra": False, "qwen": True})
+        try:
+            routed, _record = self.route_and_record("[spark:medium] Inspect the parser module.", cfg)
+        except RuntimeError as error:
+            self.fail(f"fail-open RuntimeError instead of a visible refusal: {error}")
+        self.assertEqual(routed["metadata"]["tier"], "refused", routed)
+
+    def test_root_spark_label_on_a_switched_off_default_is_validated_on_its_fallback(self):
+        """O-1 review: with Qwen off, a Sol parent's root Spark label lands on the Qwen fallback."""
+        cfg = shipped_config()
+        cfg["callable"]["qwen"] = False
+        routed, _record = self.route_and_record("[spark:high] Inspect the parser module.", cfg,
+                                                model=cfg["models"]["sol"])
+        self.assertEqual((routed["metadata"]["tier"], routed["metadata"]["effort"]),
+                         (cfg["fallbacks"]["qwen"], "high"), routed)
+
     def test_spark_leaf_demotion_uses_the_dispatch_read_only_predicate_and_carries_the_level(self):
         cfg = shipped_config()
         with patch.object(router, "_is_spark_read_only_work", return_value=False), \

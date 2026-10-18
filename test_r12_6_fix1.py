@@ -88,6 +88,36 @@ class R126Fix1Tests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(fresh["action"], "block")
 
+    def test_i4_stated_label_sealed_replay_bypasses_new_tier_switch(self):
+        """O-2: a stated-level redelivery replays its sealed bytes like an unlabelled one."""
+        args = {"goal": "[sol:high] Inspect the parser module."}
+        calls = []
+
+        def hook(call_id, payload):
+            return router.on_pre_tool_call("delegate_task", payload, session_id="r12-fix1-root",
+                                           turn_id="r12-fix1:turn", tool_call_id=call_id)
+
+        def guard(call_id, payload, raw):
+            return execution_adapters.guard_legacy_tool_execution(
+                tool_name="delegate_task", args=payload, next_call=raw,
+                session_id="r12-fix1-root", turn_id="r12-fix1:turn", tool_call_id=call_id)
+
+        book = execution_adapters.ReservationBook()
+        with patch.object(router, "_load_config", return_value=self.config), \
+             patch.object(router, "_delegation_targets_detail", return_value={}), \
+             patch.object(triage, "_caller", return_value=self.root), \
+             patch.object(execution_adapters, "RESERVATIONS", book):
+            self.assertIsNone(hook("same", args))
+            first = guard("same", args, lambda _sent: calls.append(1) or json.dumps({"delegation_id": "G1"}))
+            self.config["callable"]["sol"] = False
+            self.assertIsNone(hook("same", args), "O-2: sealed stated-label redelivery was refused")
+            self.assertEqual(guard("same", args, lambda _sent: calls.append(2) or "wrong"), first)
+            fresh = hook("fresh", {"goal": "[sol:high] Inspect another module."})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(fresh["action"], "block")
+        self.assertIn("[sol:high]", fresh["message"])
+        self.assertEqual(sum(triage._TURN_WORKERS.values()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

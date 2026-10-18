@@ -4460,9 +4460,19 @@ def _route_llm_request(**kwargs: Any) -> Optional[Dict[str, Any]]:
     # [spark] is an internal leaf label emitted by a Terra plan, not a public
     # root-route escape hatch. A user/root turn must still be assessed by Terra.
     if decision.tier == "spark" and not subagent_marker:
-        decision = _decision_with_carried_stated_effort(
-            str(cfg.get("default_model", "terra")), "root Spark label deferred to default orchestrator", cfg, decision,
-        )
+        default_tier = str(cfg.get("default_model", "terra"))
+        deferred_reason = "root Spark label deferred to default orchestrator"
+        providers = cfg.get("tier_providers") or {}
+        if (
+            decision.stated_effort and active_tier and _is_callable_tier(active_tier, cfg)
+            and providers.get(default_tier) != providers.get(active_tier)
+        ):
+            # The callable-fallback or cross-provider step below moves this turn off
+            # the hop; validate the stated level there, not on a hop it never runs on.
+            # An unavailable active tier keeps the visible refusal on the hop.
+            decision = replace(_decision(default_tier, deferred_reason, cfg), stated_effort=decision.stated_effort)
+        else:
+            decision = _decision_with_carried_stated_effort(default_tier, deferred_reason, cfg, decision)
     is_spark_subagent = (
         subagent_marker
         and active_model == str((cfg.get("models") or {}).get("spark", ""))
@@ -6781,17 +6791,19 @@ def on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         unsupported = _unsupported_delegation_label(args, cfg)
         if unsupported:
             return {"action": "block", "message": _unsupported_label_message(unsupported)}
-        stated_label_block = _stated_delegation_label_block(args, cfg) if tool_name == "delegate_task" else ""
-        if stated_label_block:
-            return {"action": "block", "message": stated_label_block}
         declined = _declined_conductor_goal(args, cfg, str(_.get("turn_id") or ""))
         if declined:
             return {"action": "block", "message": declined}
+        # A sealed replay is already-admitted work: tier state that changed since
+        # (switch-off, cooldown) must not reinterpret it as a refusal.
         retained_replay = triage.retained_replay_preflight(tool_name, args, _)
         if retained_replay is not None:
             if retained_replay:
                 return {"action": "block", "message": retained_replay}
             return None
+        stated_label_block = _stated_delegation_label_block(args, cfg) if tool_name == "delegate_task" else ""
+        if stated_label_block:
+            return {"action": "block", "message": stated_label_block}
         unavailable_target = _delegation_target_block(tool_name, args, cfg)
         if unavailable_target:
             return {"action": "block", "message": unavailable_target}

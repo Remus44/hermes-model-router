@@ -686,6 +686,27 @@ level only when the destination supports it, otherwise it stops visibly. Luna, T
 `high`, and `xhigh`. No tier accepts `none`. An unsupported level is refused
 before delegation, while an unsupported label on a root user message is ordinary
 unlabelled text. Otherwise the parent writes a bare `[<tier>]` label.
+Labels match after case folding and accent stripping (`[SOL:HIGH]` and `[sól:high]`
+are `[sol:high]`), both at dispatch and at submission. A root `[spark:<level>]` that
+defers to a `default_model` on another provider (the shipped `qwen`) never runs on
+that default. Its level is validated on the tier the turn actually reaches: the
+active tier, or the fallback that replaces a switched-off default. While the active
+tier itself is unavailable, the label is refused visibly.
+
+The stated level is also enforced where the request leaves the router. Execution
+middleware reads the host's original request, not the routed one. If a later
+`llm_request` middleware removes or changes the stated level, or moves the request
+to a model whose tier lacks it, the call stops with a zero-token router response and
+no provider call. This applies while the router is enabled, on the configured
+`openai-codex` provider, in `codex_responses` mode. A labelled turn on a Codex model
+the router does not route stops the same way rather than being sent at another level.
+A retry through a host `retry_call` carries the stated level to the fallback tier, or
+stops when that tier lacks it.
+Two limits are accepted. The final check protects the stated level, not the stated
+tier: a later middleware that moves `[sol:high]` to Terra at `high` is sent, while the
+route record still names Sol. Every such stop reuses the worker text
+(`[ROUTER WORKER STOPPED] … Re-dispatch this task on an available account.`), even on
+a root turn or when no account is involved.
 
 `explicit_<tier>` and `explicit_<tier>_xhigh` are retired effort keys. The router
 ignores them in a local overlay and never rewrites that overlay automatically.
