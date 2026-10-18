@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import model_router as router
-from model_router import on_pre_tool_call, route_llm_request, triage
+from model_router import execution_adapters, on_pre_tool_call, route_llm_request, triage
 
 MODELS = {"luna": "gpt-6-luna", "terra": "gpt-5.6-terra", "sol": "gpt-6-sol", "grok": "grok-4.7"}
 PROVIDERS = {"luna": "openai-codex", "terra": "openai-codex", "sol": "openai-codex", "grok": "xai-oauth"}
@@ -39,7 +39,8 @@ def _cfg(temp_dir, triage_on=True):
     return {
         "enabled": True, "provider": "openai-codex",
         "models": MODELS, "tier_providers": PROVIDERS,
-        "callable": {tier: True for tier in MODELS},
+        "callable": {**{tier: True for tier in MODELS},
+                     "haiku": True, "sonnet5": True, "opus5": True},
         "default_model": "terra",
         "effort": {"terra": "medium", "sol": "medium", "luna": "low", "grok": "medium"},
         "session_policy": {"pin_root_parent": True},
@@ -104,9 +105,14 @@ class TriageIsForcedTests(_Patched):
         request = self.route()["request"]
         self.assertEqual([t["name"] for t in request["tools"]], ["tool_call"])
         self.assertEqual(request["tool_choice"], "required")
-        props = request["tools"][0]["parameters"]["properties"]
-        self.assertEqual(props["name"]["enum"], ["triage_task"])
-        self.assertEqual(props["arguments"]["properties"]["decision"]["enum"], ["solo", "delegate"])
+        parameters = request["tools"][0]["parameters"]
+        self.assertEqual(parameters["required"], ["calls"])
+        calls = parameters["properties"]["calls"]
+        self.assertEqual((calls["minItems"], calls["maxItems"]), (1, 1))
+        entry = calls["items"]
+        self.assertEqual(entry["required"], ["name", "arguments"])
+        self.assertEqual(entry["properties"]["name"]["enum"], ["triage_task"])
+        self.assertEqual(entry["properties"]["arguments"]["properties"]["decision"]["enum"], ["solo", "delegate"])
         text = request["input"][-1]["content"][-1]["text"]
         self.assertIn("[ROUTER TRIAGE]", text)
         self.assertIn("at most 4 workers", text)
@@ -158,6 +164,9 @@ class TriageIsForcedTests(_Patched):
         request = self.route(tier="grok")["request"]
         self.assertEqual(request["model"], "grok-4.7")
         self.assertEqual([t["name"] for t in request["tools"]], ["tool_call"])
+    def test_bridge_instruction_names_calls_not_the_legacy_singular_shape(self):
+        self.assertIn("`calls`", triage.instruction(self.cfg, via_bridge=True))
+        self.assertNotIn("with name \"triage_task\" and the triage as `arguments`", triage.instruction(self.cfg, via_bridge=True))
 
 
 class TriageIsSkippedTests(_Patched):
@@ -269,7 +278,7 @@ class WorkerBudgetTests(_Patched):
         self.assertIsNone(self.spawn(self.root, tool="delegate_claude"))
         blocked = self.spawn(self.root)
         self.assertEqual(blocked["action"], "block")
-        self.assertIn("4 of 4", blocked["message"])
+        self.assertIn("4 of 4 admitted spawn attempts", blocked["message"])
 
     def test_a_batch_over_the_budget_is_refused_whole(self):
         self.assertIsNone(self.spawn(self.root, tasks=3))
@@ -296,6 +305,34 @@ class WorkerBudgetTests(_Patched):
         self.assertIsNone(self.spawn(self.worker("w1")))
         self.assertIn("4 of 4", self.spawn(self.worker("w2"))["message"])
 
+    def start_worker(self, name, turn_id):
+        router.on_subagent_start(parent_session_id="root", parent_turn_id=turn_id,
+                                 child_session_id=name, child_subagent_id=f"sa-{name}",
+                                 child_role="leaf", child_goal="late")
+
+    def test_a_late_worker_is_charged_to_the_turn_it_started_from(self):
+        self.spawn(self.root, tasks=4)
+        self.spawn(self.root, turn_id="root:root:turn2")
+        self.start_worker("w1", "root:root:turn1")
+        blocked = self.spawn(self.worker("w1"), turn_id="w1:sa-0-x:t")
+        self.assertIn("4 of 4", blocked["message"])
+        event = self.events()[-1]
+        self.assertEqual((event["origin_source"], event["root_turn"]), ("child_link", "root:root:turn1"))
+
+    def test_a_worker_of_the_newest_turn_keeps_its_own_allowance(self):
+        self.spawn(self.root, tasks=4)
+        self.spawn(self.root, turn_id="root:root:turn2")
+        self.start_worker("w2", "root:root:turn2")
+        self.assertIsNone(self.spawn(self.worker("w2"), turn_id="w2:sa-0-x:t"))
+        self.assertEqual(triage._TURN_WORKERS, {"root:root:turn1": 4, "root:root:turn2": 2})
+
+    def test_an_unlinked_worker_falls_back_to_the_latest_turn_and_says_so(self):
+        self.spawn(self.root)
+        self.assertIsNone(self.spawn(self.worker("w1"), turn_id="w1:sa-0-x:t"))
+        event = self.events()[-1]
+        self.assertEqual((event["origin_source"], event["root_turn"]),
+                         ("latest_session_pointer", "root:root:turn1"))
+
     def test_a_sub_worker_never_delegates(self):
         leaf = SimpleNamespace(session_id="leaf", _delegate_depth=2, _parent_session_id="w1")
         self.assertIn("cannot delegate further", self.spawn(leaf)["message"])
@@ -311,6 +348,78 @@ class WorkerBudgetTests(_Patched):
         self.spawn(self.root)
         events = [e["event"] for e in self.events()]
         self.assertEqual(events, ["spawn_admitted", "spawn_blocked"])
+
+
+class RetainedAdmissionTests(_Patched):
+    root = SimpleNamespace(session_id="retained-root", _delegate_depth=0)
+
+    def spawn(self, tool, args, *, tool_call_id=None):
+        with patch.object(triage, "_caller", return_value=self.root):
+            return on_pre_tool_call(tool_name=tool, args=args, session_id="retained-root",
+                                    turn_id="retained:turn", tool_call_id=tool_call_id)
+
+    def test_stable_ids_are_one_admitted_attempt_but_missing_ids_are_distinct(self):
+        args = {"goal": "g", "tier": "haiku"}
+        self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="same"))
+        self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="same"))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 1})
+        changed = self.spawn("delegate_claude", {"goal": "changed", "tier": "haiku"}, tool_call_id="same")
+        transport = self.spawn("delegate_task", {"goal": "g"}, tool_call_id="same")
+        self.assertEqual(changed["action"], "block")
+        self.assertEqual(transport["action"], "block")
+        self.assertIn("identity", changed["message"])
+        self.assertIn("identity", transport["message"])
+
+        triage.reset_state()
+        self.assertIsNone(self.spawn("delegate_claude", args))
+        self.assertIsNone(self.spawn("delegate_claude", args))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 2})
+
+    def test_replay_exemption_expires_with_its_f05_generation(self):
+        args = {"goal": "g", "tier": "haiku"}
+        book = execution_adapters.ReservationBook()
+        invocation = execution_adapters.stable_legacy_invocation(
+            "delegate_claude", args, session_id="retained-root", turn_id="retained:turn", tool_call_id="expiry",
+        )
+        with patch.object(execution_adapters, "RESERVATIONS", book):
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="expiry"))
+            fresh, claim = book._begin(invocation.scope, invocation.key, None, 1, invocation.transport,
+                                       invocation.fingerprint, protect=True)
+            self.assertTrue(fresh)
+            self.assertTrue(book._seal_tool_response(invocation.key, claim, json.dumps({"delegation_id": "one"})))
+            book._release(invocation.key, claim)
+            self.assertTrue(triage.bind_retained_admission(invocation, claim.generation))
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="expiry"))
+            self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 1})
+            with patch.object(execution_adapters, "_RECORD_TTL_SECONDS", 0):
+                self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="expiry"))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 2})
+
+    def test_replay_exemption_is_removed_when_f05_lru_evicts_it(self):
+        args = {"goal": "g", "tier": "haiku"}
+        book = execution_adapters.ReservationBook()
+        invocation = execution_adapters.stable_legacy_invocation(
+            "delegate_claude", args, session_id="retained-root", turn_id="retained:turn", tool_call_id="lru",
+        )
+        other = execution_adapters.stable_legacy_invocation(
+            "delegate_claude", args, session_id="other-session", turn_id="other:turn", tool_call_id="other",
+        )
+        with patch.object(execution_adapters, "RESERVATIONS", book), \
+             patch.object(execution_adapters, "_MAX_RECORDS", 1):
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="lru"))
+            fresh, claim = book._begin(invocation.scope, invocation.key, None, 1, invocation.transport,
+                                       invocation.fingerprint, protect=True)
+            self.assertTrue(fresh)
+            self.assertTrue(book._seal_tool_response(invocation.key, claim, json.dumps({"delegation_id": "one"})))
+            book._release(invocation.key, claim)
+            self.assertTrue(triage.bind_retained_admission(invocation, claim.generation))
+            fresh, replacement = book._begin(other.scope, other.key, None, 1, other.transport,
+                                             other.fingerprint, protect=True)
+            self.assertTrue(fresh)
+            self.assertTrue(book._seal_tool_response(other.key, replacement, json.dumps({"delegation_id": "two"})))
+            book._release(other.key, replacement)
+            self.assertIsNone(self.spawn("delegate_claude", args, tool_call_id="lru"))
+        self.assertEqual(triage._TURN_WORKERS, {"retained:turn": 2})
 
 
 class WorkerBudgetOffTests(_Patched):

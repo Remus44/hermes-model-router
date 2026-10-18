@@ -14,7 +14,7 @@ class SmallTaskGuardrailTests(unittest.TestCase):
         return {
             "enabled": True,
             "models": {"terra": "gpt-5.6-terra", "luna": "gpt-6-luna", "grok": "grok-4.7"},
-            "callable": {"terra": True, "luna": True, "grok": True},
+            "callable": {"terra": True, "luna": True, "grok": True, "sonnet5": True},
             "tier_providers": {"terra": "openai-codex", "luna": "openai-codex", "grok": "xai-oauth"},
             "preferences": {"code": ["grok", "terra"]},
             "task_budget": {

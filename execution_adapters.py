@@ -13,9 +13,10 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Tuple
 
 from . import execution_contracts as contracts
 from . import worker_admission
@@ -58,6 +59,15 @@ class LegacyReceipt:
     task_outcomes: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class StableLegacyInvocation:
+    """The public F05 identity shared with retained triage admission."""
+    key: AttemptKey
+    fingerprint: str
+    transport: str
+    scope: str
+
+
 @dataclass
 class _Claim:
     scope: str
@@ -72,6 +82,7 @@ class _Claim:
     # A public invocation's record stays pinned until its final public response
     # is sealed or the invocation unwinds, even after the raw call has returned.
     protected: bool = False
+    generation: str = ""
 
     @property
     def evictable(self) -> bool:
@@ -107,7 +118,7 @@ class ReservationBook:
 
     def _begin(self, scope: str, key: AttemptKey, limit: Optional[int], weight: int,
                transport: str, fingerprint: str = "", *,
-               protect: bool = False) -> Tuple[bool, Optional[_Claim]]:
+               protect: bool = False, expected_generation: str = "") -> Tuple[bool, Optional[_Claim]]:
         """``limit=None`` records the attempt without capacity accounting (every
         legacy dispatch). ``protect`` pins a public invocation until it is sealed
         or released."""
@@ -121,6 +132,8 @@ class ReservationBook:
                 return False, None
             self._purge_locked()
             existing = self._claims.get(key)
+            if expected_generation and (existing is None or existing.generation != expected_generation):
+                return False, None  # a retained handoff cannot authorize a fresh/replacement claim
             if existing is not None:
                 if (existing.scope != scope or existing.receipt.transport != transport
                         or existing.fingerprint != fingerprint):
@@ -137,7 +150,7 @@ class ReservationBook:
             self._purge_locked(room=1)
             entry = _Claim(scope, weight if limit is not None else 0,
                 LegacyReceipt(key, transport, scope, "local-" + uuid.uuid4().hex), fingerprint=fingerprint,
-                protected=protect)
+                protected=protect, generation=uuid.uuid4().hex)
             self._claims[key] = entry
             return True, entry
 
@@ -153,6 +166,31 @@ class ReservationBook:
     def records(self) -> Tuple[LegacyReceipt, ...]:
         with self._lock:
             return tuple(entry.receipt for entry in self._claims.values())
+
+    def retained_generation(self, invocation: StableLegacyInvocation) -> Optional[str]:
+        """Generation of the exact retained F05 record, or ``None`` after eviction/change."""
+        with self._lock:
+            self._purge_locked()
+            entry = self._claims.get(invocation.key)
+            if (entry is None or entry.scope != invocation.scope
+                    or entry.receipt.transport != invocation.transport
+                    or entry.fingerprint != invocation.fingerprint):
+                return None
+            self._claims.move_to_end(invocation.key)
+            return entry.generation
+
+    def retained_response(self, invocation: StableLegacyInvocation, generation: str) -> Tuple[bool, Any]:
+        """Atomically capture one exact sealed public response for replay delivery."""
+        with self._lock:
+            self._purge_locked()
+            entry = self._claims.get(invocation.key)
+            if (entry is None or entry.generation != generation or entry.scope != invocation.scope
+                    or entry.receipt.transport != invocation.transport or entry.fingerprint != invocation.fingerprint):
+                return False, None
+            if not entry.sealed or not entry.cached:
+                return False, entry.response
+            self._claims.move_to_end(invocation.key)
+            return True, entry.response
 
     def _owned_locked(self, key: AttemptKey, claim: Optional[_Claim]) -> bool:
         # Identity, not equality: a replacement claim under the same key is never ours.
@@ -233,6 +271,52 @@ def _identifier(value: Any) -> str:
     # Reject unretainable identifiers instead of truncating them into a different
     # handle/model. The original legacy response is still returned verbatim.
     return value if isinstance(value, str) and 0 < len(value) <= 256 else ""
+
+
+def stable_legacy_invocation(tool_name: Any, args: Any, *, session_id: Any, turn_id: Any,
+                             tool_call_id: Any) -> Optional[StableLegacyInvocation]:
+    """Return F05's canonical retainable identity, never synthesizing partial IDs."""
+    name = str(tool_name or "").removeprefix("mcp__")
+    transport = {"delegate_task": "hermes_codex", "delegate_claude": "hermes_claude"}.get(name)
+    session, turn, call = (_identifier(session_id), _identifier(turn_id), _identifier(tool_call_id))
+    if not transport or not all((session, turn, call)):
+        return None
+    try:
+        fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    except (TypeError, ValueError):
+        return None
+    return StableLegacyInvocation((session, 0, turn, call), fingerprint, transport, f"public:{session}")
+
+
+def retained_invocation_generation(invocation: StableLegacyInvocation) -> Optional[str]:
+    """Read F05 retention without granting a new execution authorization."""
+    return RESERVATIONS.retained_generation(invocation)
+
+
+def retained_invocation_response(invocation: StableLegacyInvocation, generation: str) -> Tuple[bool, Any]:
+    """Capture bytes only from the exact still-retained F05 generation."""
+    return RESERVATIONS.retained_response(invocation, generation)
+
+
+@contextmanager
+def retained_invocation_binding(invocation: StableLegacyInvocation, generation: str) -> Iterator[bool]:
+    """Pin only the metadata validation/write window, never execution or I/O.
+
+    Called with triage's lock held. Keep the existing triage -> journal order
+    until its mirror write finishes so _begin cannot replace the validated G1.
+    """
+    book = RESERVATIONS
+    with book._lock:
+        book._purge_locked()
+        claim = book._claims.get(invocation.key)
+        yield bool(claim is not None and claim.generation == generation
+                   and claim.scope == invocation.scope and claim.receipt.transport == invocation.transport
+                   and claim.fingerprint == invocation.fingerprint)
+
+
+def retained_admission_limits() -> Tuple[int, float]:
+    """The triage mirror follows the same bounded F05 journal window."""
+    return _MAX_RECORDS, _RECORD_TTL_SECONDS
 
 
 def _normalize(receipt: LegacyReceipt, raw: Any, *, exceptional: bool = False,
@@ -433,30 +517,49 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
     if name not in ("delegate_task", "delegate_claude") or args.get("action", "spawn") in ("list", "steer", "stop"):
         return kwargs["next_call"](args)
     raw_next = kwargs["next_call"]
-    identifiers = tuple(kwargs.get(k) for k in ("session_id", "turn_id", "tool_call_id"))
+    identifiers = tuple(kwargs.get(key) for key in ("session_id", "turn_id", "tool_call_id"))
+    stable = stable_legacy_invocation(name, args, session_id=identifiers[0], turn_id=identifiers[1],
+                                      tool_call_id=identifiers[2])
+    if all(isinstance(value, str) and value for value in identifiers) and stable is None:
+        return json.dumps({"error": "Legacy invocation is not a JSON-compatible retainable tool payload. Nothing was spawned."})
     invocation = None
     owner = RESERVATIONS
-    if all(isinstance(value, str) and value for value in identifiers):
-        session, turn, tool_call = (str(identifiers[0]), str(identifiers[1]), str(identifiers[2]))
-        key = (session, 0, turn, tool_call)
+    admission = None
+    if stable is not None:
         try:
-            fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True, allow_nan=False).encode()).hexdigest()
-        except (TypeError, ValueError):
-            return json.dumps({"error": "Legacy invocation is not a JSON-compatible tool payload. Nothing was spawned."})
-        transport = "hermes_claude" if name == "delegate_claude" else "hermes_codex"
+            from . import triage
+            admission = triage.consume_retained_admission(stable)
+            if admission is not None and admission.lost:
+                return json.dumps({"error": "Invocation admission was retired or expired before F05. Nothing was spawned by this call."})
+            if admission is not None and admission.replay:
+                # Exact sealed bytes were captured in the pre-hook. Do not
+                # re-lookup by key after an eviction can have replaced G1.
+                return admission.response
+        except Exception:
+            admission = None
+        if admission is not None and admission.lost:
+            return json.dumps({"error": "Invocation admission was retired or expired before F05. Nothing was spawned by this call."})
         # Own the public invocation before its legacy admission can read usage,
-        # enter a Claude reasoning scope or write an audit.  A duplicate can only
+        # enter a Claude reasoning scope or write an audit. A duplicate can only
         # replay a sealed final response; while its owner is still running it
         # reports pending/unknown without touching the raw seam.
-        fresh, claim = owner._begin(f"public:{session}", key, None, 1, transport,
-                                    fingerprint, protect=True)
+        fresh, claim = owner._begin(stable.scope, stable.key, None, 1, stable.transport,
+                                    stable.fingerprint, protect=True,
+                                    expected_generation=admission.generation if admission is not None else "")
         if not fresh:
-            if claim is not None and claim.sealed and claim.cached:
-                return claim.response
+            if claim is not None:
+                if claim.sealed and claim.cached:
+                    return claim.response
             return json.dumps({"error": "Invocation already started/unknown, response unavailable, or payload changed. Nothing was spawned by this call."})
         # The cell carries the exact outer owner through the raw native dispatch
         # to final sealing/unwind; the inner boundary must never re-claim it.
-        invocation = (key, fingerprint, [claim])
+        assert claim is not None
+        invocation = (stable.key, stable.fingerprint, [claim])
+        if admission is not None and not _bind_retained_triage_admission(
+                stable, claim.generation, create=False, admission=admission):
+            owner._finish(invocation[0], claim, None, exceptional=True)
+            owner._release(invocation[0], claim)
+            return json.dumps({"error": "Invocation admission became stale before F05 binding. Nothing was spawned by this call."})
     token = _NATIVE_INVOCATION.set(invocation)
     try:
         if name == "delegate_claude":
@@ -471,6 +574,8 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
             response = worker_admission.guard_tool_execution(**{**kwargs, "next_call": admitted})
         if invocation is not None and invocation[2][0] is not None:
             owner._seal_tool_response(invocation[0], invocation[2][0], response)
+            if admission is not None:
+                _bind_retained_triage_admission(stable, invocation[2][0].generation, admission=admission)
         return response
     except BaseException:
         if invocation is not None and invocation[2][0] is not None:
@@ -479,11 +584,25 @@ def guard_legacy_tool_execution(**kwargs: Any) -> Any:
             # unsealed cache; an unwind before dispatch closes it here. Identity-
             # checked and idempotent.
             owner._finish(invocation[0], invocation[2][0], None, exceptional=True)
+            if admission is not None:
+                _bind_retained_triage_admission(stable, invocation[2][0].generation, admission=admission)
         raise
     finally:
         _NATIVE_INVOCATION.reset(token)
         if invocation is not None and invocation[2][0] is not None:
             owner._release(invocation[0], invocation[2][0])  # no-op once sealed
+
+
+def _bind_retained_triage_admission(invocation: Optional[StableLegacyInvocation], generation: str, *,
+                                   create: bool = True, admission: Any = None) -> bool:
+    """Mirror an already-owned F05 record after releasing its journal lock."""
+    if invocation is None or not generation:
+        return False
+    try:
+        from . import triage
+        return triage.bind_retained_admission(invocation, generation, create=create, admission=admission)
+    except Exception:
+        return False
 
 
 def _cap(snapshot: Any, transport: str, name: str) -> Any:

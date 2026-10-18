@@ -382,6 +382,25 @@ class LegacyBoundaryTests(unittest.TestCase):
         self.assertIn("error", json.loads(refused))
         self.assertEqual(len(calls), 1)
 
+    def test_retained_generation_expires_before_same_stable_key_can_be_reused(self):
+        invocation = adapters.stable_legacy_invocation(
+            "delegate_claude", {"goal": "g", "tier": "haiku"},
+            session_id="stable-session", turn_id="stable:turn", tool_call_id="stable-call",
+        )
+        self.assertIsNotNone(invocation)
+        fresh, first = self.book._begin(invocation.scope, invocation.key, None, 1, invocation.transport,
+                                        invocation.fingerprint, protect=True)
+        self.assertTrue(fresh)
+        self.assertTrue(self.book._seal_tool_response(invocation.key, first, json.dumps({"delegation_id": "one"})))
+        self.book._release(invocation.key, first)
+        self.assertEqual(self.book.retained_generation(invocation), first.generation)
+        with patch.object(adapters, "_RECORD_TTL_SECONDS", 0):
+            self.assertIsNone(self.book.retained_generation(invocation))
+        fresh, replacement = self.book._begin(invocation.scope, invocation.key, None, 1, invocation.transport,
+                                              invocation.fingerprint, protect=True)
+        self.assertTrue(fresh)
+        self.assertNotEqual(replacement.generation, first.generation)
+
     def test_default_factory_has_one_mandatory_reservation_owner(self):
         registry = adapters.legacy_adapters(delegate_task=lambda **kw: None,
             delegate_claude=lambda args: None, claude_bridge=lambda **kw: None)

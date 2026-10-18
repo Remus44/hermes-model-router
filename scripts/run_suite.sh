@@ -56,7 +56,10 @@ case "$mode" in
             model_router.test_quota_redispatch \
             model_router.test_balance \
             model_router.test_any_parent_orchestrates \
-            model_router.test_workflow_switch
+            model_router.test_workflow_switch \
+            model_router.test_triage \
+            model_router.test_f08_post_merge \
+            model_router.test_r12_6_fix2
         ;;
     --full)
         exec "$test_python" -B -m unittest discover -s model_router -t . -p 'test_*.py'

@@ -22,7 +22,12 @@ import json
 import logging
 import re
 import threading
+import time
+import uuid
+from collections import OrderedDict
+from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -39,6 +44,61 @@ _LOCK = threading.Lock()
 _TURN_WORKERS: Dict[str, int] = {}
 _WORKER_CHILDREN: Dict[str, int] = {}
 _ROOT_TURN_BY_SESSION: Dict[str, str] = {}
+# child session -> (originating root turn, recorded-at). A depth-1 caller is charged to the
+# root turn it came from, not to whichever root turn the parent session admitted last.
+# Bounded: entries expire after the TTL and the map keeps at most _ORIGIN_MAX of them.
+_ORIGIN_BY_CHILD: Dict[str, Tuple[str, float]] = {}
+_ORIGIN_MAX = 512
+_ORIGIN_TTL_SECONDS = 6 * 60 * 60
+_ORIGIN_AMBIGUOUS = "\x00ambiguous"
+_monotonic = time.monotonic
+
+
+@dataclass
+class _RetainedAdmission:
+    fingerprint: str
+    transport: str
+    scope: str
+    root_turn: str
+    requested: int
+    recorded_at: float
+    generation: str = ""
+    nonce: str = ""
+    state: str = "pending"
+
+
+@dataclass(frozen=True)
+class _AdmissionToken:
+    key: Any
+    fingerprint: str
+    transport: str
+    scope: str
+    nonce: str = ""
+    generation: str = ""
+    response: Any = None
+    sealed: bool = False
+    owner: bool = False
+    lost: bool = False
+
+    @property
+    def replay(self) -> bool:
+        return self.sealed
+
+
+@dataclass
+class _AdmissionHandoff:
+    key: Any
+    token: Optional[_AdmissionToken] = None
+    consumed: bool = False
+    closed: bool = False
+
+
+# This mirrors only F05's retained stable-ID window. It is not a second capacity
+# owner: a pending entry prevents concurrent re-admission until F05 seals/unwinds.
+_RETAINED_ADMISSIONS: "OrderedDict[Any, _RetainedAdmission]" = OrderedDict()
+_ADMISSION_TOKEN: ContextVar[Optional[_AdmissionToken]] = ContextVar("model_router_retained_admission", default=None)
+_ADMISSION_HANDOFF: ContextVar[Optional[_AdmissionHandoff]] = ContextVar("model_router_admission_handoff", default=None)
+
 
 SCHEMA_PARAMETERS: Dict[str, Any] = {
     "type": "object",
@@ -209,7 +269,7 @@ def _vehicle(request: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], bool]]:
 
 
 def instruction(cfg: Dict[str, Any], *, via_bridge: bool) -> str:
-    how = (f'Call it through tool_call with name "{TOOL_NAME}" and the triage as `arguments`. '
+    how = (f'Call it through tool_call in `calls` with name "{TOOL_NAME}" and the triage `arguments`. '
            if via_bridge else "")
     return (
         "\n\n[ROUTER TRIAGE] Before any other work, assess this request and call "
@@ -233,8 +293,13 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
     if vehicle is None:
         return None
     tool, via_bridge = vehicle
-    from . import _append_user_instruction, _rejects_forced_tool_choice, _tool_schema_slot
+    from . import (
+        _append_user_instruction, _reconcile_advisory_tool_choice,
+        _rejects_forced_tool_choice, _tool_schema_slot,
+    )
 
+    routed = deepcopy(request)
+    advisory = anthropic and _rejects_forced_tool_choice(routed)
     pinned = deepcopy(tool)
     owner, key = _tool_schema_slot(pinned)
     if via_bridge:
@@ -244,9 +309,28 @@ def force(request: Dict[str, Any], cfg: Dict[str, Any], *, anthropic: bool) -> O
             properties["name"] = {"type": "string", "enum": [TOOL_NAME],
                                   "description": "The triage tool."}
             properties["arguments"] = deepcopy(SCHEMA_PARAMETERS)
-            schema["required"] = ["name", "arguments"]
-    routed = deepcopy(request)
-    if anthropic and _rejects_forced_tool_choice(routed):
+            if not advisory:
+                raw_calls = properties.get("calls")
+                calls: Dict[str, Any] = raw_calls if isinstance(raw_calls, dict) else {"type": "array"}
+                properties["calls"] = calls
+                calls["minItems"] = 1
+                calls["maxItems"] = 1
+                raw_items = calls.get("items")
+                items: Dict[str, Any] = raw_items if isinstance(raw_items, dict) else {"type": "object"}
+                calls["items"] = items
+                entry_properties = items.setdefault("properties", {})
+                entry_properties["name"] = {"type": "string", "enum": [TOOL_NAME],
+                                            "description": "The triage tool."}
+                entry_properties["arguments"] = deepcopy(SCHEMA_PARAMETERS)
+                items["required"] = ["name", "arguments"]
+                schema["required"] = ["calls"]
+            else:
+                schema["required"] = ["name", "arguments"]
+    if advisory:
+        refusal = _reconcile_advisory_tool_choice(routed, operation="triage")
+        if refusal:
+            routed["_model_router_refusal"] = refusal
+            return routed
         # Anthropic refuses a forced tool_choice while thinking is on, and on Claude 5
         # models at all. One optional tool would let the reply end the turn, so the
         # toolset stays whole and the triage is asked for, not forced.
@@ -341,10 +425,290 @@ def _requested_count(tool_name: str, args: Dict[str, Any]) -> int:
     return 1
 
 
-def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook: Dict[str, Any]) -> str:
-    """Refusal text when this spawn breaks the turn's worker budget; "" admits it.
+def record_child_origin(child_session: Optional[str], parent_turn_id: Optional[str]) -> bool:
+    """Bind a child session to the root turn that started it (the ``subagent_start`` payload).
 
-    Counts are charged on admission, so a refused call never consumes budget.
+    Recorded only when the origin is unambiguous: a non-empty parent turn that is not itself a
+    sub-agent turn. A second, different origin for the same child marks it ambiguous; the gate
+    then refuses its spawns rather than guess. Returns True when a link (or ambiguity) was stored.
+    """
+    child_session = str(child_session or "")
+    parent_turn_id = str(parent_turn_id or "")
+    if not child_session or not parent_turn_id or ":sa-" in parent_turn_id:
+        return False
+    now = _monotonic()
+    with _LOCK:
+        for key in [k for k, (_, at) in _ORIGIN_BY_CHILD.items() if now - at > _ORIGIN_TTL_SECONDS]:
+            del _ORIGIN_BY_CHILD[key]
+        known = _ORIGIN_BY_CHILD.pop(child_session, None)
+        root = parent_turn_id
+        if known is not None and known[0] != parent_turn_id:
+            root = _ORIGIN_AMBIGUOUS
+        _ORIGIN_BY_CHILD[child_session] = (root, now)
+        while len(_ORIGIN_BY_CHILD) > max(1, _ORIGIN_MAX):
+            del _ORIGIN_BY_CHILD[next(iter(_ORIGIN_BY_CHILD))]
+    return True
+
+
+def _child_origin_locked(child_session: str) -> Optional[str]:
+    """Recorded root turn for a child (``_ORIGIN_AMBIGUOUS`` when conflicting); None if unknown or expired."""
+    entry = _ORIGIN_BY_CHILD.get(child_session)
+    if entry is None:
+        return None
+    if _monotonic() - entry[1] > _ORIGIN_TTL_SECONDS:
+        del _ORIGIN_BY_CHILD[child_session]
+        return None
+    return entry[0]
+
+
+def _stable_invocation(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> Any:
+    from .execution_adapters import stable_legacy_invocation
+    return stable_legacy_invocation(tool_name, args, session_id=hook.get("session_id"),
+                                    turn_id=hook.get("turn_id"), tool_call_id=hook.get("tool_call_id"))
+
+
+def _purge_retained_admissions_locked() -> Tuple[int, float]:
+    from .execution_adapters import (StableLegacyInvocation, retained_admission_limits,
+                                     retained_invocation_generation)
+    maximum, ttl = retained_admission_limits()
+    now = _monotonic()
+    for key, entry in list(_RETAINED_ADMISSIONS.items()):
+        if now - entry.recorded_at <= ttl:
+            continue
+        if entry.generation:
+            invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
+            if retained_invocation_generation(invocation) == entry.generation:
+                entry.recorded_at = now  # protected/in-flight F05 record outlives its finished-record TTL.
+                continue
+        del _RETAINED_ADMISSIONS[key]
+    return maximum, ttl
+
+
+def initialize_retained_admission(**kwargs: Any) -> None:
+    """Open a call-local cell on the host caller before bounded hook contexts.
+
+    Request middleware runs synchronously. Host hooks copy that Context, not
+    assignments made inside another callback. The shared cell transfers only
+    our canonical token; it adds no authority/identity fields to tool args.
+    """
+    invocation = _stable_invocation(kwargs.get("tool_name", ""), kwargs.get("args") or {}, kwargs)
+    _ADMISSION_TOKEN.set(None)
+    _ADMISSION_HANDOFF.set(_AdmissionHandoff(invocation.key) if invocation is not None else None)
+
+
+def _set_admission_locked(token: _AdmissionToken) -> None:
+    handoff = _ADMISSION_HANDOFF.get()
+    if handoff is not None and handoff.key == token.key:
+        if not handoff.closed and not handoff.consumed:
+            handoff.token = token
+        return
+    # Direct/older host hook callers with no upstream request middleware.
+    _ADMISSION_TOKEN.set(token)
+
+
+def _bound_retained_admissions_locked(maximum: int) -> None:
+    """Cap hook-only pending owners; matching F05 records follow its lifecycle.
+
+    Bound records cannot evict a fresh pending arrival before F05 has a chance
+    to evict its finished LRU record. Active F05 records may exceed its target.
+    """
+    from .execution_adapters import StableLegacyInvocation, retained_invocation_generation
+    for key, entry in list(_RETAINED_ADMISSIONS.items()):
+        if entry.generation:
+            invocation = StableLegacyInvocation(key, entry.fingerprint, entry.transport, entry.scope)
+            if retained_invocation_generation(invocation) != entry.generation:
+                del _RETAINED_ADMISSIONS[key]
+    pending = [key for key, entry in _RETAINED_ADMISSIONS.items()
+               if not entry.generation and entry.state in {"pending", "started"}]
+    if maximum > 0:
+        for key in pending[:-maximum]:
+            del _RETAINED_ADMISSIONS[key]  # retire bookkeeping, never refund
+
+
+def _retained_replay_locked(invocation: Any) -> Optional[_RetainedAdmission]:
+    entry = _RETAINED_ADMISSIONS.get(invocation.key)
+    if entry is None:
+        return None
+    if (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
+            or entry.scope != invocation.scope):
+        return _RetainedAdmission("", "", "", "", 0, 0.0, "changed")
+    if entry.generation:
+        from .execution_adapters import retained_invocation_generation
+        if retained_invocation_generation(invocation) != entry.generation:
+            del _RETAINED_ADMISSIONS[invocation.key]
+            return None
+    _RETAINED_ADMISSIONS.move_to_end(invocation.key)
+    return entry
+
+
+def retained_replay_preflight(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> Optional[str]:
+    """Capture an exact sealed replay before fresh router policy checks.
+
+    The exact immutable token travels in the caller's shared handoff cell (or
+    in the direct-hook ContextVar for older callers). Captured G1 bytes remain
+    deliverable after F05 eviction without granting any G2 authorization.
+    """
+    invocation = _stable_invocation(tool_name, args, hook)
+    if invocation is None:
+        return None
+    with _LOCK:
+        _purge_retained_admissions_locked()
+        entry = _retained_replay_locked(invocation)
+        if entry is None or not entry.generation:
+            return None
+        if entry.generation == "changed":
+            return "Retained invocation identity changed (payload, transport, or authority) for this stable tool call. Nothing was spawned."
+        from .execution_adapters import retained_invocation_response
+        retained, response = retained_invocation_response(invocation, entry.generation)
+        if not retained:
+            # An unsealed/oversized record is not a policy-exempt delivery, but
+            # it remains a live F05 generation; only drop the mirror if F05 no
+            # longer names this exact owner.
+            from .execution_adapters import retained_invocation_generation
+            if retained_invocation_generation(invocation) != entry.generation:
+                _RETAINED_ADMISSIONS.pop(invocation.key, None)
+            return None
+        _set_admission_locked(_AdmissionToken(invocation.key, invocation.fingerprint, invocation.transport,
+                                             invocation.scope, nonce=entry.nonce, generation=entry.generation,
+                                             response=response, sealed=True))
+        return ""
+
+
+def _matches_admission(token: _AdmissionToken, invocation: Any) -> bool:
+    return (token.key == invocation.key and token.fingerprint == invocation.fingerprint
+            and token.transport == invocation.transport and token.scope == invocation.scope)
+
+
+def consume_retained_admission(invocation: Any) -> Optional[_AdmissionToken]:
+    """Consume the exact call's handoff; absent legacy tokens are not lost tokens."""
+    if invocation is None:
+        return None
+    with _LOCK:
+        handoff = _ADMISSION_HANDOFF.get()
+        if handoff is not None and handoff.key == invocation.key:
+            if handoff.closed or handoff.consumed:
+                return _AdmissionToken(invocation.key, invocation.fingerprint, invocation.transport,
+                                       invocation.scope, lost=True)
+            token = handoff.token
+            handoff.consumed = True
+        else:
+            token = _ADMISSION_TOKEN.get()
+            if token is not None and token.key != invocation.key:
+                return None  # an unrelated legacy call does not consume this token
+            _ADMISSION_TOKEN.set(None)
+        if token is None:
+            return None  # deliberately uncorrelated/no-budget-hook legacy path
+        if not _matches_admission(token, invocation):
+            return replace(token, lost=True)
+        if token.replay:
+            return token  # immutable exact sealed bytes, not a fresh authorization
+        _purge_retained_admissions_locked()
+        entry = _RETAINED_ADMISSIONS.get(invocation.key)
+        if (entry is None or entry.nonce != token.nonce or entry.fingerprint != token.fingerprint
+                or entry.transport != token.transport or entry.scope != token.scope
+                or (token.generation and entry.generation != token.generation)):
+            return replace(token, lost=True)
+        if entry.generation:
+            from .execution_adapters import retained_invocation_generation
+            if retained_invocation_generation(invocation) != entry.generation:
+                return replace(token, lost=True)
+            return replace(token, generation=entry.generation)
+        if entry.state not in {"pending", "started"}:
+            return replace(token, lost=True)
+        entry.state = "started"
+        entry.recorded_at = _monotonic()
+        return token
+
+
+def retire_pending_admission(tool_name: str, args: Dict[str, Any], hook: Dict[str, Any]) -> bool:
+    """Close only this delivery's still-pending owner, never refund or retire a join."""
+    invocation = _stable_invocation(tool_name, args, hook)
+    # A later host rewrite can make the final payload unretainable. Validate its
+    # actual host identity without treating that rewritten payload as authority;
+    # the caller handoff still carries the immutable original token.
+    identity = _stable_invocation(tool_name, {}, hook)
+    if identity is None:
+        return False
+    with _LOCK:
+        handoff = _ADMISSION_HANDOFF.get()
+        correlated = handoff is not None and handoff.key == identity.key
+        if handoff is not None and correlated:
+            token = handoff.token
+            handoff.closed = True
+            handoff.token = None  # release captured bytes in caller and copied contexts
+        else:
+            token = _ADMISSION_TOKEN.get()
+            _ADMISSION_TOKEN.set(None)
+        if (token is None or token.replay or not token.owner or token.key != identity.key
+                or token.transport != identity.transport or token.scope != identity.scope
+                or (not correlated and (invocation is None or not _matches_admission(token, invocation)))):
+            return False
+        entry = _RETAINED_ADMISSIONS.get(token.key)
+        # A later host args rewrite can refuse F05, but cannot strand its
+        # original admission. Correlate retirement to our immutable token and
+        # exact mirror nonce/identity, never to the rewritten payload's authority.
+        if (entry is not None and entry.nonce == token.nonce and not entry.generation
+                and entry.state == "pending" and entry.fingerprint == token.fingerprint
+                and entry.transport == token.transport and entry.scope == token.scope):
+            del _RETAINED_ADMISSIONS[token.key]
+            return True
+    return False
+
+
+def has_unbound_retained_admission(invocation: Any) -> bool:
+    """Whether an admitted stable call is waiting for its one F05 owner."""
+    if invocation is None:
+        return False
+    with _LOCK:
+        entry = _RETAINED_ADMISSIONS.get(invocation.key)
+        return bool(entry is not None and not entry.generation
+                    and entry.fingerprint == invocation.fingerprint
+                    and entry.transport == invocation.transport and entry.scope == invocation.scope)
+
+
+def bind_retained_admission(invocation: Any, generation: str, *, create: bool = True,
+                            admission: Optional[_AdmissionToken] = None) -> bool:
+    """Bind triage's already-admitted stable invocation to its exact F05 generation."""
+    if invocation is None or not generation:
+        return False
+    with _LOCK:
+        from .execution_adapters import retained_invocation_binding
+        maximum, _ttl = _purge_retained_admissions_locked()
+        recorded_at = _monotonic()
+        with retained_invocation_binding(invocation, generation) as current:
+            if not current:
+                return False
+            entry = _RETAINED_ADMISSIONS.get(invocation.key)
+            if entry is None:
+                if not create or admission is not None:
+                    return False
+                entry = _RetainedAdmission(invocation.fingerprint, invocation.transport, invocation.scope,
+                                           "", 1, recorded_at, nonce=uuid.uuid4().hex)
+                _RETAINED_ADMISSIONS[invocation.key] = entry
+            elif (entry.fingerprint != invocation.fingerprint or entry.transport != invocation.transport
+                  or entry.scope != invocation.scope):
+                return False
+            elif admission is not None and (entry.nonce != admission.nonce
+                                            or entry.state not in {"pending", "started", "bound"}):
+                return False
+            if entry.generation and entry.generation != generation:
+                return False
+            entry.generation = generation
+            entry.state = "bound"
+            entry.recorded_at = recorded_at
+            _RETAINED_ADMISSIONS.move_to_end(invocation.key)
+        _bound_retained_admissions_locked(maximum)
+    return True
+
+
+def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook: Dict[str, Any]) -> str:
+    """Refusal text when this spawn exceeds the turn's admitted-attempt budget; an empty string admits it.
+
+    Counts are charged on admission, so a refusal made here never consumes budget.
+    Later host or handler refusals retain their admitted attempt: there is no refund seam.
+    A depth-1 caller is charged to the root turn recorded for its own session at
+    ``subagent_start``; a child with no (or an expired) record falls back to its parent
+    session's latest root turn and the event says so (``origin_source``).
     """
     name = str(tool_name or "").removeprefix("mcp__")
     if not enabled(cfg) or name not in _SPAWN_TOOLS or not isinstance(args, dict):
@@ -360,22 +724,45 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
         depth = 1 if ":sa-" in turn_id else 0
     requested = _requested_count(name, args)
     cap = max_workers(cfg)
+    stable = _stable_invocation(name, args, hook)
+    root: Optional[str] = None
+    origin_source: Optional[str] = None
+    replayed = False
+    admission = None
     with _LOCK:
-        if depth >= 2:
+        maximum, _ttl = _purge_retained_admissions_locked()
+        retained = _retained_replay_locked(stable) if stable is not None else None
+        handoff = _ADMISSION_HANDOFF.get()
+        if stable is not None and handoff is not None and handoff.key == stable.key and handoff.closed:
+            verdict, used = "stale_admission", None  # a late bounded callback cannot resurrect a closed call
+        elif retained is not None and retained.generation == "changed":
+            verdict, used = "retained_invocation_identity_changed", None
+        elif retained is not None:
+            verdict, used, replayed = "", _TURN_WORKERS.get(retained.root_turn, 0), True
+            root, origin_source = retained.root_turn, "retained_replay"
+        elif depth >= 2:
             verdict, used = "sub_worker_cannot_delegate", None
         elif depth == 1:
-            parent_session = str(getattr(agent, "_parent_session_id", "") or "")
-            root = _ROOT_TURN_BY_SESSION.get(parent_session) or f"session:{parent_session or session}"
-            used = _TURN_WORKERS.get(root, 0)
-            own = _WORKER_CHILDREN.get(session, 0)
-            if own + requested > max_children(cfg):
-                verdict = "worker_child_limit"
-            elif used + requested > cap:
-                verdict = "turn_worker_limit"
+            linked = _child_origin_locked(session)
+            if linked == _ORIGIN_AMBIGUOUS:
+                verdict, used, origin_source = "turn_origin_ambiguous", None, "ambiguous"
             else:
-                verdict = ""
-                _WORKER_CHILDREN[session] = own + requested
-                _TURN_WORKERS[root] = used + requested
+                if linked is not None:
+                    root, origin_source = linked, "child_link"
+                else:
+                    parent_session = str(getattr(agent, "_parent_session_id", "") or "")
+                    root = _ROOT_TURN_BY_SESSION.get(parent_session) or f"session:{parent_session or session}"
+                    origin_source = "latest_session_pointer"
+                used = _TURN_WORKERS.get(root, 0)
+                own = _WORKER_CHILDREN.get(session, 0)
+                if own + requested > max_children(cfg):
+                    verdict = "worker_child_limit"
+                elif used + requested > cap:
+                    verdict = "turn_worker_limit"
+                else:
+                    verdict = ""
+                    _WORKER_CHILDREN[session] = own + requested
+                    _TURN_WORKERS[root] = used + requested
         else:
             root = turn_id or f"session:{session}"
             if session:
@@ -386,16 +773,46 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
             else:
                 verdict = ""
                 _TURN_WORKERS[root] = used + requested
-    _log(cfg, {"event": "spawn_blocked" if verdict else "spawn_admitted", "reason": verdict or None,
-               "tool": name, "depth": depth, "requested": requested, "used_before": used,
+        if not verdict and not replayed and stable is not None:
+            nonce = uuid.uuid4().hex
+            _RETAINED_ADMISSIONS[stable.key] = _RetainedAdmission(
+                stable.fingerprint, stable.transport, stable.scope, root or "", requested, _monotonic(), nonce=nonce)
+            admission = _AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
+                                        nonce=nonce, owner=True)
+            _set_admission_locked(admission)
+        elif not verdict and replayed and stable is not None and retained is not None:
+            admission = _AdmissionToken(stable.key, stable.fingerprint, stable.transport, stable.scope,
+                                        nonce=retained.nonce, generation=retained.generation, owner=False)
+            _set_admission_locked(admission)
+        _bound_retained_admissions_locked(maximum)
+    if not verdict and admission is not None and stable is not None:
+        from .execution_adapters import _NATIVE_INVOCATION
+        outer = _NATIVE_INVOCATION.get()
+        # Normal executor ordering: F05 owns this public invocation BEFORE
+        # its inner pre-hook admits it. Bind that already-owned exact claim,
+        # rather than leaving an unbound slot that could authorize a later G2.
+        if outer is not None and outer[0] == stable.key and outer[2][0] is not None:
+            if not bind_retained_admission(stable, outer[2][0].generation, create=False, admission=admission):
+                verdict, replayed = "stale_admission", False
+    _log(cfg, {"event": "spawn_replayed" if replayed else "spawn_blocked" if verdict else "spawn_admitted",
+               "reason": verdict or None, "tool": name, "depth": depth, "requested": requested,
+               "used_before": used, "root_turn": root, "origin_source": origin_source,
                "turn_id": turn_id, "session_id": session})
+    if verdict == "retained_invocation_identity_changed":
+        return ("Retained invocation identity changed (payload, transport, or authority) for this stable tool call. "
+                "Nothing was spawned.")
+    if verdict == "stale_admission":
+        return "Invocation admission became stale before outer F05 binding. Nothing was spawned."
+    if verdict == "turn_origin_ambiguous":
+        return ("The user turn this worker started from is ambiguous (conflicting origin records), so its "
+                "budget cannot be charged to a turn. Finish the remaining work yourself. Nothing was spawned.")
     if verdict == "sub_worker_cannot_delegate":
         return "Sub-workers cannot delegate further. Finish this task yourself. Nothing was spawned."
     if verdict == "worker_child_limit":
         return (f"A worker may start at most {max_children(cfg)} sub-worker, and this call would exceed it. "
                 "Finish the remaining work yourself. Nothing was spawned.")
     if verdict == "turn_worker_limit":
-        return (f"Worker budget for this user turn: {used} of {cap} workers already started (sub-workers "
+        return (f"Worker budget for this user turn: {used} of {cap} admitted spawn attempts (sub-workers "
                 f"included); this call asks for {requested} more. Do the remaining work yourself or wait for "
                 "the running workers. Nothing was spawned.")
     return ""
@@ -403,7 +820,11 @@ def spawn_block(tool_name: str, args: Dict[str, Any], cfg: Dict[str, Any], hook:
 
 def reset_state() -> None:
     """Tests only."""
+    _ADMISSION_TOKEN.set(None)
+    _ADMISSION_HANDOFF.set(None)
     with _LOCK:
         _TURN_WORKERS.clear()
         _WORKER_CHILDREN.clear()
         _ROOT_TURN_BY_SESSION.clear()
+        _ORIGIN_BY_CHILD.clear()
+        _RETAINED_ADMISSIONS.clear()

@@ -507,4 +507,3 @@ def propose_host_migration(host_text: str, cfg: Mapping[str, Any]) -> str:
         line = new[mark.line]
         new[mark.line] = line[:mark.column] + quote + want + quote + line[end.column:]
     return "".join(difflib.unified_diff(old, new, "config.yaml", "config.yaml (proposed)"))
-

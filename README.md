@@ -156,26 +156,41 @@ Codex labels choose models within the configured provider and Claude workers use
 #### Triage: the parent decides
 
 The model that receives the prompt decides who does the work. On the first call
-of an actionable user turn the router narrows the toolset to `triage_task` (reached
-through the `tool_call` bridge, because Hermes defers plugin tools) and the parent
-records `decision: solo` or `decision: delegate`, with a kind, a scope, a one-line
-rationale and, for `delegate`, the planned subtasks and their routes. The routing
-note (preferred routes per kind of work, account usage) travels with that call.
-The next call has the full toolset again, and the tool result tells the parent what
-follows from its own decision.
+of an actionable user turn the router asks for `triage_task` through the deferred
+`tool_call` bridge and the parent records `decision: solo` or `decision: delegate`,
+with a kind, a scope, a one-line rationale and, for `delegate`, the planned
+subtasks and their routes. The routing note (preferred routes per kind of work,
+account usage) travels with that call. On a forced path, the advertised `calls[]`
+envelope permits exactly one `triage_task` entry with the triage arguments schema.
+On an advisory Claude path, the full toolset remains available and the older
+singular `name`/`arguments` bridge pinning remains intentionally unchanged;
+`calls[]` entries are not equivalently pinned there. The next call has the full
+toolset again, and the tool result tells the parent what follows from its own
+decision.
 
 Questions and short remarks with no imperative in them ("mi a következő
 kritikus?", "ment a levél") skip triage, as do workers, later calls of a turn,
 memory reviews, delegation completions and background-process notices. A short
 go-ahead after a discussion ("rendben, csináld meg!") is triaged: it stands for the
-whole discussed plan. A Claude parent with thinking on is asked rather than forced,
-because Anthropic refuses a forced tool choice while thinking.
+whole discussed plan. Claude 5 parents are advisory whether thinking is on or off;
+older Claude parents are advisory while thinking is on and forced while it is off.
+Codex remains a required-tool path. An advisory parent may answer without a recorded
+triage decision. Generic mandatory Anthropic choice is reconciled to `auto`; an
+authoritative named, ambiguous, unsupported, or malformed choice stops visibly
+rather than being silently discarded. The same reconciliation is used by triage
+and by an eligible triage-off conductor. Supported forms are the documented
+absent/`None`/`auto`/`none`/generic-mandatory forms; named authority wins over
+generic relaxation. The malformed or extended representations in the local caller
+matrix are defensive coverage, not a claim that the native host emits them. For the
+covered refusal path, the public stopped response is returned before ordinary,
+bridge, or downstream execution.
 
 While triage is on it replaces the forced conductor and the small-task budget, and
 the router enforces the worker budget on every `delegate_task` and `delegate_claude`
 spawn:
 
-- at most `max_workers_per_turn` (4) workers per user turn, sub-workers included;
+- at most `max_workers_per_turn` (4) admitted spawn attempts per user turn,
+  sub-workers included;
 - each worker may start `max_children_per_worker` (1) sub-worker;
 - a sub-worker never delegates.
 
@@ -188,9 +203,23 @@ triage:
 ```
 
 Hermes's `delegation.max_spawn_depth` must be at least 2 for a worker to reach its
-sub-worker. A refused spawn returns `Nothing was spawned.` and costs no budget. The
-triage log records each `triage_forced`/`triage_skipped` (with its reason), every
-`triage_decision`, and each `spawn_admitted`/`spawn_blocked`:
+sub-worker. Router-known refusals (unsupported label, declined conductor goal, and
+switched-off/cooling target) occur before charging. A budget-owned refusal is
+uncharged; a refusal by a later host or handler guard remains an admitted attempt
+with no refund, and `spawn_admitted` never proves that a worker launched or
+completed. The four-worker policy is not a host concurrency limit, batch width, or
+depth limit. The bounded child-session-to-originating-root association is process
+local, resets on restart, and uses this fallback for an unknown or expired child:
+the parent session's latest root-turn pointer, otherwise its session key; the event
+records `origin_source: "latest_session_pointer"`. An unknown late child can
+therefore count against a newer turn. Conflicting recorded origins refuse rather
+than use that fallback. Durable/background correlation remains S06 work. Triage-off
+retains its other guard paths and is not unlimited execution.
+
+The triage log records `triage_forced` only for a constrained request,
+`triage_advisory` for an advisory rewrite, and `triage_skipped` with its reason,
+plus `triage_decision`, `spawn_admitted`, and `spawn_blocked`. None of these events
+alone proves a remote call, recorded decision, worker launch, or completion:
 
 ```bash
 tail -20 ~/.hermes/logs/model-router-triage.jsonl | jq '{event, reason, decision, rationale}'
@@ -303,9 +332,9 @@ measured which of those features a particular Claude Code installation loads
 from `cwd`, so verify that setup in the target project rather than treating this
 paragraph as a capability probe.
 
-The router does not *route* these children — `route_llm_request` returns `None`
-for a model outside its own tier map, so nothing here rewrites them — but it does
-record them. Invisible to the router had meant invisible to the operator: a
+For an external-model request outside its tier map, the router may leave model and
+provider unchanged while still rewriting instructions or tools; it also records the
+result. Invisible to the router had meant invisible to the operator: a
 Claude worker produced no card, no count and no line in the per-account load, so
 the one account whose usage most needed watching was the one nothing reported on.
 They now appear as `opus5`, `sonnet5` and `haiku` alongside the other tiers, and
@@ -647,12 +676,37 @@ effort:
 ```
 
 When the user states effort for a Codex model, the parent writes
-`[<tier>:<level>]`. The requested level reaches the route and wire exactly; it
-is never remapped between `high` and `xhigh`. Luna, Terra, and Sol accept
+`[<tier>:<level>]`. A supported stated level is preserved on the same tier and is
+never remapped between `high` and `xhigh`. Soft step-down is skipped for a stated
+level (the hard account limit can still close the account). A stated-level label for
+a switched-off/cooling tier or a Luna/Spark read-only violation is refused at
+dispatch; where a request has no refusal seam, a substitution preserves the stated
+level only when the destination supports it, otherwise it stops visibly. Luna, Terra, and Sol accept
 `low`, `medium`, `high`, `xhigh`, and `max`; Spark accepts `low`, `medium`,
 `high`, and `xhigh`. No tier accepts `none`. An unsupported level is refused
 before delegation, while an unsupported label on a root user message is ordinary
 unlabelled text. Otherwise the parent writes a bare `[<tier>]` label.
+Labels match after case folding and accent stripping (`[SOL:HIGH]` and `[sól:high]`
+are `[sol:high]`), both at dispatch and at submission. A root `[spark:<level>]` that
+defers to a `default_model` on another provider (the shipped `qwen`) never runs on
+that default. Its level is validated on the tier the turn actually reaches: the
+active tier, or the fallback that replaces a switched-off default. While the active
+tier itself is unavailable, the label is refused visibly.
+
+The stated level is also enforced where the request leaves the router. Execution
+middleware reads the host's original request, not the routed one. If a later
+`llm_request` middleware removes or changes the stated level, or moves the request
+to a model whose tier lacks it, the call stops with a zero-token router response and
+no provider call. This applies while the router is enabled, on the configured
+`openai-codex` provider, in `codex_responses` mode. A labelled turn on a Codex model
+the router does not route stops the same way rather than being sent at another level.
+A retry through a host `retry_call` carries the stated level to the fallback tier, or
+stops when that tier lacks it.
+Two limits are accepted. The final check protects the stated level, not the stated
+tier: a later middleware that moves `[sol:high]` to Terra at `high` is sent, while the
+route record still names Sol. Every such stop reuses the worker text
+(`[ROUTER WORKER STOPPED] … Re-dispatch this task on an available account.`), even on
+a root turn or when no account is involved.
 
 `explicit_<tier>` and `explicit_<tier>_xhigh` are retired effort keys. The router
 ignores them in a local overlay and never rewrites that overlay automatically.
@@ -679,7 +733,7 @@ Historical image attachments are stripped from replayed context rather than rese
 ### Quota fallback
 
 Distinct from `fallbacks`, which handles a *disabled* tier. `quota_fallbacks`
-handles a tier that answered `429` mid-turn:
+selects a possible replacement only for a Spark quota failure (`429`) mid-turn:
 
 ```yaml
 quota_fallbacks:
@@ -688,17 +742,21 @@ quota_fallbacks:
     effort: medium
 ```
 
-It fires once per turn and only if the replacement is itself callable, so an
-exhausted Spark continues on Luna instead of failing the turn.
+When a host supplies a compatible `retry_call`, the callback permits at most one
+eligible, policy-permitted replacement; it does not guarantee that a candidate is
+callable or that a retry will occur. The installed host supplies no compatible
+callback: the original failure propagates, and recorded failure state can steer
+later calls instead. The current call can fail.
 
-Note what that last condition rules out. A usage quota belongs to the account, and
-the failure is recorded **before** a replacement is looked for — which benches
-every sibling on that account first. So on a genuine quota exhaustion this
-substitution cannot fire at all: the configured replacement is already cooling.
-What survives here is the case it is actually good for — a transient blip, or a
-model this account cannot use — where a same-account sibling is the right answer.
-Moving quota-stopped work needs a different account, and that is a dispatch
-decision, not a model swap.
+Quota, transient failure, and unavailable-model handling use separate selection
+mechanisms, but share one recording guard: failure history and cooldown entry occur
+only when cooldowns are enabled and the affected router tier is applicable. With
+cooldowns disabled, those helpers write no failure/cooldown state and the cooldown
+availability policy is disabled. Under that guard, quota enters cooldown immediately
+using a provider reset hint capped by `quota_max_seconds`, or `quota_seconds` when
+no hint is available; transient failures enter only after the configured recent-failure
+threshold; and unavailable-model cooldown uses its configured duration. Moving work
+to another account remains a dispatch decision, not a model swap.
 
 ### A model this account cannot use
 
@@ -708,20 +766,20 @@ what decides whether a leaf survives:
 | Condition | Recognised by | What happens |
 |---|---|---|
 | Switched off in the dashboard | `callable: false` | the `fallbacks` chain, at routing time |
-| Quota exhausted (429) | account/weekly quota wording | `quota_fallbacks`, then a 15-minute cooldown |
-| Provider blip (5xx) | 500/502/503/504, connection resets | a hardcoded substitute, then a short cooldown |
-| **Refused outright (400/404)** | *"is not supported when using…"*, *"does not exist or you do not have access"* | the configured `fallbacks` chain, then a 6-hour cooldown |
+| Quota exhausted (429) | account/weekly quota wording | Spark-only `quota_fallbacks`, only with a host `retry_call`; under the shared enabled/applicable-tier guard, a provider reset hint is capped by `quota_max_seconds`, otherwise `quota_seconds` (default 15 minutes) applies |
+| Provider blip (5xx) | 500/502/503/504, connection resets | transient selection only with a host `retry_call`; under the shared enabled/applicable-tier guard, failure state is recorded and cooldown starts only at the configured recent-failure threshold |
+| **Refused outright (400/404)** | *"is not supported when using…"*, *"does not exist or you do not have access"* | configured `fallbacks` only with a host `retry_call`; under the shared enabled/applicable-tier guard, the unavailable-model cooldown uses configured `unavailable_seconds` |
 
 The last row was a gap until 1.8.1. A tier switched **on** but refused by the
 provider — `The 'gpt-5.3-codex-spark' model is not supported when using Codex with
 a ChatGPT account.` — matched no runtime failover, so the leaf simply aborted.
 
-It deliberately walks the **configured** `fallbacks` chain rather than the
-hardcoded transient map: if you wrote `spark: luna`, a Spark that does not exist
-on your account belongs on Luna, not wherever the blip handler would have put it.
+When a compatible host retry seam is present, unavailable-model selection walks the
+**configured** `fallbacks` chain rather than the transient map: if you wrote
+`spark: luna`, an unavailable Spark selects Luna rather than a transient substitute.
 The cooldown is long because nothing about this recovers by waiting; tune it with
-`cooldown.unavailable_seconds`. Design and image guards still apply — an
-unavailable model is no reason to break a routing policy.
+`cooldown.unavailable_seconds`. Design and image guards still apply — an unavailable
+model is no reason to break a routing policy.
 
 An ordinary malformed-request 400 is untouched and still raises.
 
@@ -972,9 +1030,11 @@ cooldown:
 run: `delegate_task` rejects the whole batch. Keep them equal.
 
 Declining to dispatch is logged too. `terra-spark-orchestration.jsonl` records
-`preflight_forced` when a conductor is created and `preflight_skipped` — with
-the gate that rejected it — when one is not, so a turn that ran twenty calls
-with no worker says why.
+`preflight_forced` before the conductor/preflight builder is called, and
+`preflight_skipped` — with the gate that rejected it — when the preflight gate does
+not proceed. The former does not prove a conductor was created or that its contract
+was appended or delivered: the builder can refuse before those outcomes. It still
+helps explain why a turn that ran twenty calls had no worker.
 
 ### Usage reporting
 
@@ -1325,8 +1385,10 @@ selects nothing.
 three things apart: *configured* features (router config), *runtime* capability
 (snapshot) and the *topology* (requested/selected; `active` is always `unknown`,
 since a snapshot cannot observe the running topology). Snapshots are cached (30 s,
-16 entries, locked) under a fingerprint of host limits, schema, seams and routing
-config, so any change invalidates them. A snapshot is evidence, not admission:
+16 entries, locked) under a fingerprint of host limits, seam availability, schema
+property names and routing-config facts. A change to those inputs invalidates a
+snapshot; an arbitrary host revision, schema description, or property type change
+need not. A snapshot is evidence, not admission:
 fresh admission is still required immediately before execution. The diagnostic
 is not called on the routing path, so existing routing decisions are unchanged.
 
@@ -1412,14 +1474,17 @@ records one receipt around a private raw subprocess operation that never calls a
 public entrypoint back. Invalid input and an exact refusal raise before the boundary
 (nothing launched, no receipt); an attempted run leaves one receipt, one lifecycle
 `started`/`terminal` pair and, only on a validated success, one routed-call record.
-A caller that passes no identity gets legacy facts: requested model from the
-explicit tier, resolved value from the actual `--model` alias argument, observed
-model only from the validated CLI result; account stays `unknown` and nothing else
-is invented. A caller's own identity is passed unchanged, including the exact
-canonical model argument; an exact identity is re-checked against the CLI
-`exact_model` capability before launch, so a direct call cannot bypass it. No
-boundary calls its own public entrypoint recursively or performs a second account
-admission.
+A caller that passes no identity gets a synthesized `profile_preferred` identity:
+requested model from the explicit tier, resolved value from the actual `--model`
+alias argument, observed model only from the validated CLI result, and account
+`unknown`. A supplied preferred identity can be corrected to admitted transport and
+resolved facts; an exact identity is re-checked against the CLI `exact_model`
+capability before launch, so a direct call cannot bypass it. The shared normalized
+boundary is not uniform admission: standalone callers own usage/account checks,
+receive only a process-memory receipt, and are never stably deduplicated across
+runs. Its durable evidence is the lifecycle log and, only after validated success,
+one routed-call record. No boundary calls its own public entrypoint recursively or
+performs a second account admission.
 Legacy goals, context, supported tool payloads and host-owned budgets/permissions
 remain authoritative. They are **not** converted into fabricated `ExecutionRequest`
 permissions, criteria or deadlines.
@@ -1697,9 +1762,10 @@ tail -5 ~/.hermes/logs/terra-spark-orchestration.jsonl \
   | jq '{event, parent_model, skip_reason, tools_seen}'
 ```
 
-`preflight_forced` means the contract went out and the parent was asked to
-delegate; what it does next is the model's decision. `preflight_skipped` names
-the gate instead:
+`preflight_forced` records that the preflight event was emitted before the
+conductor/preflight builder is invoked. It does not by itself prove conductor creation,
+contract append/delivery, or a parent request completion; the builder can refuse.
+`preflight_skipped` names the gate instead:
 
 | `skip_reason` | Meaning |
 |---|---|
