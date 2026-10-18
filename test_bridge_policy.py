@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -6,6 +7,8 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections import OrderedDict
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -1689,6 +1692,265 @@ class AccountOfExecutionTests(unittest.TestCase):
                     self.assertNotIn('summary_full_path', entry)
                 else:
                     self.assertIn('summary_full_path', entry)
+
+    # --- D50: the seven retained R5 acceptance cells.  These are deliberately
+    # independent: each owns its middleware/hook state and its temporary files.
+    @staticmethod
+    def _d50_cfg():
+        return {
+            'enabled': True, 'provider': 'openai-codex', 'models': {'terra': 'gpt-terra'},
+            'callable': {'sonnet5': True, 'opus5': True},
+            'coding_agent': {'enabled': False, 'delegated_review': {
+                'enabled': True, 'selection_mode': 'profile_preferred',
+                'requested_model': 'claude-sonnet-5-5',
+            }},
+        }
+
+    @contextmanager
+    def _d50_registered_host_scope(self, cfg):
+        """Register against the fixture config and isolate mutable router owners."""
+        from hermes_cli.plugins import PluginManager
+        from model_router import execution_adapters, target_identity
+
+        manager = PluginManager()
+        manager._report_hook_failure = Mock()
+        ctx = SimpleNamespace(
+            register_hook=lambda name, fn: manager._hooks.setdefault(name, []).append(fn),
+            register_middleware=lambda name, fn: manager._middleware.setdefault(name, []).append(fn),
+            register_tool=lambda *args, **kwargs: None,
+        )
+        pending = OrderedDict()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(router, '_load_config', return_value=cfg))
+            stack.enter_context(patch.object(router, '_PENDING_REPLACEMENTS', pending))
+            stack.enter_context(patch.object(target_identity, '_CACHE', OrderedDict()))
+            stack.enter_context(patch.object(execution_adapters, 'RESERVATIONS',
+                                             execution_adapters.ReservationBook()))
+            stack.enter_context(patch.object(router.claude_delegation, 'register', return_value=True))
+            stack.enter_context(patch('hermes_cli.plugins._delivery_manager', return_value=manager))
+            router.register(ctx)
+            yield manager, pending
+
+    def _d50_profile_replacement_through_host(self, response, *, record_side_effect=None):
+        """Run one failed preferred review through the registered host boundary."""
+        from hermes_cli.middleware import run_llm_execution_middleware
+        from model_router.claude_opus_bridge import ClaudeBridgeFailure
+        from model_router.execution_contracts import ModelFact, TargetIdentity
+        from model_router.target_identity import RESOLVED
+
+        identity = TargetIdentity('anthropic', 'unknown', 'claude_cli', 'sonnet', 'profile_preferred',
+                                  requested=ModelFact('claude-sonnet-5-5', 'fixture'))
+        request = {'model': 'gpt-terra', 'messages': [{'role': 'user', 'content':
+                   '[sonnet-review] Review parser'}]}
+        patches = [
+            patch.object(router, '_verified_delegated_claude_review', return_value=(Path('/tmp'), 'sonnet')),
+            patch('model_router.target_identity.resolve_target', return_value=SimpleNamespace(
+                status=RESOLVED, identity=identity, reasons=())),
+            patch.object(router.usage_guard, 'guarded', return_value=False),
+            patch.object(router.worker_admission, 'refusal', return_value=''),
+            patch.object(router.claude_delegation, '_log'),
+            patch.object(router, '_run_opus5_bridge', side_effect=ClaudeBridgeFailure(
+                'Claude Code timed out', 'timeout', identity=identity)),
+        ]
+        if record_side_effect is not None:
+            patches.append(patch.object(router, '_record_ordinary_replacement_result',
+                                        side_effect=record_side_effect))
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            result = run_llm_execution_middleware(
+                request, Mock(return_value=response), provider='openai-codex',
+                api_mode='codex_responses', platform='subagent', turn_id='d50:sa-1')
+        return result
+
+    def test_d50_cjk_response_model_survives_registered_execution_normalizer_hook_and_child(self):
+        from agent.turn_finalizer import apply_llm_output_transform
+
+        original_pending = router._PENDING_REPLACEMENTS
+        response = self._n1_response('final', 'PASS: CJK replacement')
+        response.model = '模型' * 16
+        with self._d50_registered_host_scope(self._d50_cfg()):
+            result = self._d50_profile_replacement_through_host(response)
+            normalized = self._codex_normalized(result)
+            final, transformed, _ = apply_llm_output_transform(
+                SimpleNamespace(session_id='d50', model='gpt-terra', platform='subagent'),
+                normalized.content, turn_id='d50:sa-1', logger=self.HOOK_LOG)
+            entry = self._child_entry(final, completed=True)
+
+            self.assertEqual(normalized.finish_reason, 'stop')
+            self.assertFalse(transformed, 'the output hook must not add a second delivered marker')
+            marker = self._marker_line(entry['summary'])
+            self.assertEqual(marker['carrier'], 'middleware')
+            self.assertRegex(marker['actual']['model'], r'~[0-9a-f]{6}$')
+            self.assertLessEqual(len(marker['actual']['model']), 20)
+        self.assertIs(router._PENDING_REPLACEMENTS, original_pending)
+
+    def test_d50_annotation_failure_keeps_pending_provenance_for_final_output_once(self):
+        from agent.turn_finalizer import apply_llm_output_transform
+
+        original_pending = router._PENDING_REPLACEMENTS
+        response = self._n1_response('final', 'PASS: final hook recovery')
+        with self._d50_registered_host_scope(self._d50_cfg()) as (manager, pending):
+            result = self._d50_profile_replacement_through_host(
+                response, record_side_effect=RuntimeError('forced annotation failure'))
+            self.assertIs(result, response, 'the host reports a failed middleware callback and preserves its response')
+            manager._report_hook_failure.assert_called_once()
+            self.assertIn('d50:sa-1', pending,
+                          'middleware must retain provenance before annotation can fail')
+
+            final, transformed, raw = apply_llm_output_transform(
+                SimpleNamespace(session_id='d50', model='gpt-terra', platform='subagent'),
+                'PASS: final hook recovery', turn_id='d50:sa-1', logger=self.HOOK_LOG)
+            entry = self._child_entry(final, completed=True)
+            self.assertTrue(transformed)
+            self.assertEqual(raw, 'PASS: final hook recovery')
+            self.assertEqual(self._marker_line(entry['summary'])['carrier'], 'final_output')
+            self.assertEqual(entry['summary'].count(self.PREFIX), 1)
+        self.assertIs(router._PENDING_REPLACEMENTS, original_pending)
+
+    def test_d50_opus5_response_non_ascii_requested_identity_has_one_bounded_marker(self):
+        result = router._opus5_response({
+            'result': 'PASS: identity preserved', 'effective_model': 'claude-sonnet-5-5',
+            'bridge_run_id': '01234567-89ab-cdef-0123-456789abcdef',
+            'identity': {
+                'provider': 'anthropic', 'transport': 'claude_cli',
+                'requested': {'value': '要求模型😀' * 8, 'source': 'operator_request', 'canonical': True},
+                'resolved': {'value': 'sonnet', 'source': 'claude_cli.argv', 'canonical': False},
+                'observed': {'value': 'claude-sonnet-5-5',
+                             'source': 'claude_cli.result.modelUsage', 'canonical': True},
+            },
+            'substitution': {'policy': 'profile_preferred', 'reason': 'usage step-down'},
+        })
+        _, summary = self._normalized_and_summary(result)
+        marker = self._marker_line(summary)
+
+        self.assertEqual(summary.count(self.PREFIX), 1)
+        self.assertEqual(marker['kind'], 'claude_cli_step_down')
+        self.assertRegex(marker['requested'], r'~[0-9a-f]{6}$')
+        self.assertLessEqual(len(self.PREFIX + json.dumps(marker, sort_keys=True,
+                                                           separators=(',', ':'))), 400)
+
+    def test_d50_step_down_ref_resolves_persisted_terminal_lifecycle_and_single_route(self):
+        from model_router import claude_opus_bridge as bridge, target_identity
+
+        from model_router import execution_adapters
+
+        original_cache = target_identity._CACHE
+        original_reservations = execution_adapters.RESERVATIONS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lifecycle, routes, audits = (root / 'lifecycle.jsonl', root / 'routes.jsonl',
+                                          root / 'claude-audit.jsonl')
+            cfg = {
+                'models': {}, 'coding_agent': {'lifecycle_path': str(lifecycle)},
+                'logging': {'enabled': True, 'path': str(routes)},
+                'claude_delegation': {'log_path': str(audits)},
+            }
+            with self._d50_registered_host_scope(cfg):
+                identity = target_identity.resolve_target('opus', transport='claude_cli', cfg=cfg,
+                                                          host_cfg={}).identity
+                payload = {'type': 'result', 'subtype': 'success', 'result': 'PASS: lifecycle',
+                           'modelUsage': {'claude-sonnet-5-5': {'inputTokens': 9}}, 'num_turns': 1}
+                with patch.object(bridge, '_load_config', return_value=cfg), \
+                     patch.object(bridge.subprocess, 'run', return_value=SimpleNamespace(
+                         stdout=json.dumps(payload), stderr='', returncode=0)):
+                    result = bridge.dispatch('[opus-review] Review parser', root, review=True,
+                                             model='sonnet', requested_alias='opus',
+                                             adjustment='usage step-down', identity=identity)
+                marker = self._marker_line(self._normalized_and_summary(router._opus5_response(result))[1])
+                events = [json.loads(line) for line in lifecycle.read_text().splitlines() if line]
+                route_records = [json.loads(line) for line in routes.read_text().splitlines() if line]
+                audit_records = ([json.loads(line) for line in audits.read_text().splitlines() if line]
+                                 if audits.exists() else [])
+
+        terminal = [event for event in events if event.get('event') == 'terminal']
+        prefix, suffix = marker['ref'][:9], marker['ref'][-6:]
+        resolved = [event for event in terminal
+                    if event['bridge_run_id'].startswith(prefix)
+                    and hashlib.sha256(event['bridge_run_id'].encode('utf-8')).hexdigest()[:6] == suffix]
+        self.assertEqual(len(resolved), 1, 'step-down ref resolves by UUID prefix plus hash, not literal grep')
+        self.assertEqual(resolved[0]['canonical_model'], 'claude-sonnet-5-5')
+        self.assertEqual(len(route_records), 1)
+        self.assertEqual(audit_records, [])
+        self.assertIs(target_identity._CACHE, original_cache)
+        self.assertIs(execution_adapters.RESERVATIONS, original_reservations)
+
+    def test_d50_step_down_alias_wrong_source_and_not_observed_controls_stay_unknown(self):
+        cases = (
+            ('alias_only', {'value': 'claude-sonnet-5-5',
+                            'source': 'claude_cli.result.modelUsage', 'canonical': False}),
+            ('wrong_source', {'value': 'claude-sonnet-5-5', 'source': 'fixture', 'canonical': True}),
+            ('not_observed', {'value': 'claude-sonnet-5-5', 'source': 'not_observed', 'canonical': True}),
+        )
+        for name, observed in cases:
+            with self.subTest(control=name):
+                marker = router._substitution_provenance(
+                    'claude_cli_step_down',
+                    identity={'provider': 'anthropic', 'requested': {'value': 'claude-opus-5-5'},
+                              'resolved': {'value': 'sonnet'}, 'observed': observed},
+                    substitution={'policy': 'profile_preferred'}, reference='d50-control')
+                visible = json.loads(router._provenance_annotation(marker)[len(self.PREFIX):])
+                self.assertEqual(visible['actual']['model'], 'unknown')
+
+    def test_d50_real_static_trimmer_boundary_and_readme_threshold(self):
+        from tools import delegate_tool_results as results
+
+        source_marker = router._provenance_annotation(router._substitution_provenance(
+            'claude_cli_step_down', carrier='d50-static', reference='d50-static-ref',
+            identity={'provider': 'anthropic', 'requested': {'value': 'claude-opus-5-5'},
+                      'resolved': {'value': 'sonnet'},
+                      'observed': {'value': 'claude-sonnet-5-5',
+                                   'source': 'claude_cli.result.modelUsage', 'canonical': True}},
+            substitution={'policy': 'profile_preferred'}))
+        marker = source_marker + (' ' * (400 - len(source_marker)))
+        self.assertEqual(len(marker), 400)
+        json.loads(marker[len(self.PREFIX):])
+        self.assertIn('1,600', Path(__file__).with_name('README.md').read_text())
+
+        for cap, retained in ((1596, False), (1597, True), (1600, True)):
+            with self.subTest(cap=cap):
+                entry = self._child_entry(('evidence\n' * 200) + marker, completed=True)
+                with patch('tools.delegate_tool._load_config', return_value={'max_summary_chars': cap}), \
+                     patch.object(results, '_notify_memory_manager'), \
+                     patch.object(results, '_fire_subagent_stop_hooks', return_value=0), \
+                     patch.object(results, '_spill_summary_to_file', return_value=None):
+                    results._finalize_child_results([entry], [{'goal': 'review parser'}], [],
+                                                     SimpleNamespace())
+                self.assertEqual(self.PREFIX in entry['summary'], retained)
+                if retained:
+                    self.assertEqual(self._marker_line(entry['summary'])['kind'], 'claude_cli_step_down')
+
+    def test_d50_all_at_cap_step_down_marker_is_parseable_bounded_and_not_overflow(self):
+        huge = 'x' * 4096
+        marker = router._substitution_provenance(
+            'claude_cli_step_down', carrier='c' * 24, reference=huge,
+            identity={'provider': huge, 'account': huge, 'transport': huge, 'alias': huge,
+                      'selection_mode': huge,
+                      'requested': {'value': huge, 'source': huge},
+                      'resolved': {'value': huge, 'source': huge},
+                      'observed': {'value': huge, 'source': 'claude_cli.result.modelUsage', 'canonical': True}},
+            substitution={'policy': huge, 'reason': huge})
+        line = router._provenance_annotation(marker)
+        visible = json.loads(line[len(self.PREFIX):])
+        self.assertLessEqual(len(line), 400)
+        self.assertNotEqual(visible.get('detail'), 'overflow')
+        self.assertEqual(visible['kind'], 'claude_cli_step_down')
+        self.assertEqual(visible['carrier'], 'c' * 24)
+        self.assertEqual(len(visible['policy']), 24)
+        self.assertEqual(len(visible['reason']), 20)
+        self.assertEqual(len(visible['actual']['model']), 20)
+        self.assertEqual(len(visible['actual']['provider']), 20)
+
+        # A fixed step-down must retain this 20-character semantic kind: changing
+        # it to the 24-character formatting control below would stop it using
+        # observed Claude model/provider evidence.
+        formatting = router._substitution_provenance(
+            'k' * 24, carrier='c' * 24,
+            identity={'provider': 'anthropic', 'observed': {'value': 'claude-sonnet-5-5',
+                      'source': 'claude_cli.result.modelUsage', 'canonical': True}}, substitution={})
+        visible_formatting = json.loads(router._provenance_annotation(formatting)[len(self.PREFIX):])
+        self.assertEqual(visible_formatting['kind'], 'k' * 24)
+        self.assertEqual(visible_formatting['carrier'], 'c' * 24)
 
     def test_h01_installed_host_runner_preserves_failure_without_retry_seam(self):
         """H01 is inherited (existed at 70125ce)."""
