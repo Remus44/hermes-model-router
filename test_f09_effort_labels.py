@@ -20,7 +20,18 @@ from model_router import triage, usage_guard, worker_admission
 
 
 ROOT = Path(__file__).resolve().parent
-HOST_REASONING_EFFORT = Path("/home/remus/.hermes/hermes-agent/agent/reasoning_effort.py")
+
+
+def _host_reasoning_effort_path():
+    """The host's effort module, found through the Hermes checkout on ``sys.path``."""
+    for entry in sys.path:
+        candidate = Path(entry or ".") / "agent" / "reasoning_effort.py"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+HOST_REASONING_EFFORT = _host_reasoning_effort_path()
 
 FALLBACK_TIER_LEVELS = {
     "luna": ("low", "medium", "high", "xhigh", "max"),
@@ -74,6 +85,8 @@ def plugin_without_reasoning_effort():
 
 
 def host_effort_module():
+    if HOST_REASONING_EFFORT is None:
+        raise unittest.SkipTest("Hermes agent/reasoning_effort.py is not on sys.path")
     spec = importlib.util.spec_from_file_location("f09_host_reasoning_effort", HOST_REASONING_EFFORT)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
