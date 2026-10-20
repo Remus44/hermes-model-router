@@ -20,7 +20,10 @@ from urllib.parse import parse_qs, urlparse
 try:
     import yaml
 except ImportError:
-    yaml = None
+    try:
+        import hermes_yaml as yaml
+    except ImportError:
+        yaml = None
 
 # Hermes can launch this file through runpy, which does not add its directory
 # to sys.path as a normal script launch does.
@@ -117,7 +120,7 @@ def _write_hermes_config(config: dict, stamp=None) -> None:
     if HERMES_CONFIG_PATH.exists():
         stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
         shutil.copy2(HERMES_CONFIG_PATH, HERMES_CONFIG_PATH.with_name(f"config.yaml.bak-router-{stamp}"))
-    _atomic_write(HERMES_CONFIG_PATH, yaml.dump(
+    _atomic_write(HERMES_CONFIG_PATH, yaml.safe_dump(
         config, default_flow_style=False, allow_unicode=True, sort_keys=False).encode("utf-8"))
 
 
@@ -1022,6 +1025,8 @@ def _overlay(base: dict, target: dict) -> dict:
 def _load_yaml_mapping(path: Path) -> dict:
     if not path.exists():
         return {}
+    if yaml is None:
+        raise RuntimeError("YAML parser unavailable; install PyYAML or run through Hermes")
     loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return loaded if isinstance(loaded, dict) else {}
 
@@ -1112,7 +1117,7 @@ def _read_router_config_for_update(path: Path | None = None):
         return config, dump
 
     def dump(data, handle):
-        yaml.dump(data, handle, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(data, handle, default_flow_style=False, allow_unicode=True, sort_keys=False)
     return yaml.safe_load(text) or {}, dump
 
 

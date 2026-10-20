@@ -23,8 +23,11 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 try:
     import yaml
-except ImportError:  # pragma: no cover - Hermes includes PyYAML
-    yaml = None
+except ImportError:
+    try:
+        import hermes_yaml as yaml
+    except ImportError:
+        yaml = None
 
 from . import claude_delegation
 from . import runtime_capabilities

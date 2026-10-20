@@ -603,6 +603,41 @@ class RouterModuleImportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "OK")
 
+    def test_runpy_launcher_reads_config_without_pyyaml(self):
+        import hermes_yaml
+        import sys
+
+        viewer_path = str(Path(web_viewer.__file__).resolve())
+        host_dir = str(Path(hermes_yaml.__file__).resolve().parent)
+        probe = (
+            "import builtins, runpy, shutil, sys\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {host_dir!r})\n"
+            "original_import = builtins.__import__\n"
+            "def without_pyyaml(name, *args, **kwargs):\n"
+            "    if name == 'yaml':\n"
+            "        raise ImportError('PyYAML unavailable in this runtime')\n"
+            "    return original_import(name, *args, **kwargs)\n"
+            "builtins.__import__ = without_pyyaml\n"
+            f"viewer = runpy.run_path({viewer_path!r}, run_name='viewer_probe')\n"
+            f"shutil.copyfile(Path({viewer_path!r}).with_name('router_config.yaml'), Path.cwd() / 'router_config.yaml')\n"
+            "viewer['_read_router_config'].__globals__['CONFIG_PATH'] = Path.cwd() / 'router_config.yaml'\n"
+            "config = viewer['_read_router_config']()\n"
+            "assert 'openai-codex' in config['tier_providers'].values()\n"
+            "router = viewer['_router_module']()\n"
+            "assert router is not None and router.yaml is not None\n"
+            "print('OK')\n"
+        )
+        with tempfile.TemporaryDirectory() as cwd:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", probe],
+                cwd=cwd,
+                env={"HOME": cwd, "PATH": os.environ.get("PATH", "")},
+                text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
     def test_router_module_imports_without_a_parent_named_model_router(self):
         import subprocess
         import sys
