@@ -584,6 +584,25 @@ class RouterModuleImportTests(unittest.TestCase):
     ``model-router`` (hyphenated). _router_module() must still find the router
     by loading it from its own script directory."""
 
+    def test_runpy_launcher_imports_viewer_siblings(self):
+        import sys
+
+        viewer_path = str(Path(web_viewer.__file__).resolve())
+        probe = (
+            "import runpy\n"
+            f"runpy.run_path({viewer_path!r}, run_name='viewer_probe')\n"
+            "print('OK')\n"
+        )
+        with tempfile.TemporaryDirectory() as cwd:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", probe],
+                cwd=cwd,
+                env={"HOME": cwd, "PATH": os.environ.get("PATH", "")},
+                text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
     def test_router_module_imports_without_a_parent_named_model_router(self):
         import subprocess
         import sys

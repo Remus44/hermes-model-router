@@ -11,6 +11,7 @@ import threading
 import traceback
 import json
 import os
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +21,12 @@ try:
     import yaml
 except ImportError:
     yaml = None
+
+# Hermes can launch this file through runpy, which does not add its directory
+# to sys.path as a normal script launch does.
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
 from agent_activity import load_agent_activity
 from hermes_paths import hermes_path
