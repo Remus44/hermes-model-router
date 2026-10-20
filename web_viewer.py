@@ -17,6 +17,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+if __name__ == "__main__":
+    # Codex usage can import Hermes's runtime bootstrap from an HTTP thread.
+    # Let it activate dependencies or re-exec before imports and server startup.
+    try:
+        import hermes_bootstrap
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_bootstrap":
+            raise
+
 try:
     import yaml
 except ImportError:
